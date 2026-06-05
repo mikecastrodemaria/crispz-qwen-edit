@@ -137,6 +137,17 @@ _ESRGAN_CACHE = {}
 OFFLOAD_MODE = "none"
 OFFLOAD_CHOICES = ("none", "model", "sequential")
 
+# CFG. Z-Image *Turbo* = distille -> guidance 0 (defaut). Z-Image *Base* (non Turbo,
+# ex. checkpoint Civitai "Z-Image Base") a besoin d'une vraie guidance (~3.5-5) et de
+# plus de steps (~20-28). Reglable par run (CLI --guidance, sliders UI).
+GUIDANCE = 0.0
+
+
+def set_guidance(g):
+    global GUIDANCE
+    GUIDANCE = float(g)
+
+
 # Logs d'etape sur stderr (chargement modeles, etages, tuiles). Coupes par --quiet.
 # stderr donc ne pollue pas le stdout de --print-output.
 VERBOSE = True
@@ -360,18 +371,19 @@ def load_pipe():
 
 
 def generate(prompt, width, height, steps, seed, negative_prompt=""):
-    """txt2img Z-Image: genere une image depuis un prompt. Turbo -> guidance 0."""
+    """txt2img Z-Image: genere une image depuis un prompt.
+    Turbo -> GUIDANCE 0. Base -> GUIDANCE ~3.5-5 + plus de steps."""
     pipe = get_pipe("txt2img")
     w = round_to_multiple(int(width))
     h = round_to_multiple(int(height))
-    _log(f"txt2img: {w}x{h}, {int(steps)} steps ...")
+    _log(f"txt2img: {w}x{h}, {int(steps)} steps, guidance {GUIDANCE:.1f} ...")
     t0 = time.time()
     img = pipe(
         prompt=prompt or "",
         negative_prompt=(negative_prompt or None),
         width=w, height=h,
         num_inference_steps=int(steps),
-        guidance_scale=0.0,
+        guidance_scale=GUIDANCE,
         generator=_make_generator(seed),
     ).images[0]
     _log(f"txt2img done in {time.time() - t0:.1f}s")
@@ -396,7 +408,7 @@ def _refine_whole(pipe, image, denoise, steps, prompt, seed):
         image=image,
         strength=float(denoise),
         num_inference_steps=int(steps),
-        guidance_scale=0.0,
+        guidance_scale=GUIDANCE,
         generator=_make_generator(seed),
     ).images[0]
 
@@ -461,26 +473,34 @@ def _refine_tiled(pipe, image, denoise, steps, prompt, seed, tile, overlap):
 # Orchestration : process_one, save, batch, run (UI/CLI commun)
 # ----------------------------------------------------------------------------
 def process_one(image, esrgan_model, factor, denoise, steps, prompt, seed, tile, overlap,
-                refine_tile=DEFAULT_REFINE_TILE, refine_overlap=DEFAULT_REFINE_OVERLAP):
-    """Pipeline complet sur une PIL Image, renvoie (refined_image, timings_dict)."""
+                refine_tile=DEFAULT_REFINE_TILE, refine_overlap=DEFAULT_REFINE_OVERLAP,
+                do_esrgan=True):
+    """Pipeline sur une PIL Image, renvoie (image, timings_dict).
+    do_esrgan=False -> img2img pur (saute l'etage ESRGAN, refine sur l'image native)."""
     timings = {}
     image = image.convert("RGB")
     w0, h0 = image.size
 
-    # Etage 1 : ESRGAN
-    t0 = time.time()
-    model = load_esrgan(esrgan_model)
-    _log(f"stage 1/2 ESRGAN upscale: {w0}x{h0} (tile {int(tile)}) ...")
-    upscaled = esrgan_upscale(image, model, int(tile), int(overlap))
-    target_w = round_to_multiple(w0 * factor)
-    target_h = round_to_multiple(h0 * factor)
-    upscaled = upscaled.resize((target_w, target_h), Image.LANCZOS)
-    timings["esrgan"] = time.time() - t0
-    _log(f"stage 1/2 done in {timings['esrgan']:.1f}s -> {target_w}x{target_h}")
+    # Etage 1 : ESRGAN (saute si do_esrgan=False -> img2img pur)
+    if do_esrgan and esrgan_model:
+        t0 = time.time()
+        model = load_esrgan(esrgan_model)
+        _log(f"stage 1/2 ESRGAN upscale: {w0}x{h0} (tile {int(tile)}) ...")
+        upscaled = esrgan_upscale(image, model, int(tile), int(overlap))
+        target_w = round_to_multiple(w0 * factor)
+        target_h = round_to_multiple(h0 * factor)
+        upscaled = upscaled.resize((target_w, target_h), Image.LANCZOS)
+        timings["esrgan"] = time.time() - t0
+        _log(f"stage 1/2 done in {timings['esrgan']:.1f}s -> {target_w}x{target_h}")
+    else:
+        upscaled = image
+        target_w, target_h = w0, h0
+        timings["esrgan"] = 0.0
+        _log(f"ESRGAN skipped (img2img only) on {w0}x{h0}")
 
     if denoise <= 0.001:
         timings["refine"] = 0.0
-        _log("stage 2/2 skipped (denoise = 0, ESRGAN only)")
+        _log("refine skipped (denoise = 0)")
         return upscaled, timings
 
     # Etage 2 : Z-Image img2img (image entiere, ou tuiles si refine_tile > 0)
@@ -614,16 +634,17 @@ def _report_vram():
 def run(image, source_folder, esrgan_model, factor, denoise, steps, prompt, seed,
         tile, overlap, save_mode=DEFAULT_SAVE_MODE, output_dir=DEFAULT_OUTPUT_DIR,
         output_format=DEFAULT_OUTPUT_FORMAT, time_log_path=None, print_output=False,
-        refine_tile=DEFAULT_REFINE_TILE, refine_overlap=DEFAULT_REFINE_OVERLAP):
+        refine_tile=DEFAULT_REFINE_TILE, refine_overlap=DEFAULT_REFINE_OVERLAP,
+        do_esrgan=True):
     """Point d'entree commun UI / CLI.
     Renvoie (last_result_PIL, last_source_PIL, report_markdown).
     - Si source_folder est un dossier existant -> batch sur ses images.
     - Sinon, image est utilisee (PIL ou chemin str).
-    - print_output: imprime le chemin absolu de chaque image sauvee sur stdout
-      (contrat machine-parsable pour l'integration externe).
+    - print_output: imprime le chemin absolu de chaque image sauvee sur stdout.
     - refine_tile > 0: passe Z-Image en tuiles (4K+, plafonne le pic VRAM).
+    - do_esrgan=False: img2img pur (pas d'ESRGAN, juste le refine Z-Image).
     """
-    if not esrgan_model:
+    if do_esrgan and not esrgan_model:
         raise gr.Error(f"No ESRGAN model found in {ESRGAN_DIR}.")
 
     # Mode batch
@@ -639,7 +660,8 @@ def run(image, source_folder, esrgan_model, factor, denoise, steps, prompt, seed
                 src = Image.open(p)
                 result, t = process_one(src, esrgan_model, factor, denoise, steps,
                                         prompt, seed, tile, overlap,
-                                        refine_tile=refine_tile, refine_overlap=refine_overlap)
+                                        refine_tile=refine_tile, refine_overlap=refine_overlap,
+                                        do_esrgan=do_esrgan)
                 dst = build_output_path(p, save_mode, output_dir, output_format)
                 if dst:
                     save_image(result, dst, output_format)
@@ -667,7 +689,8 @@ def run(image, source_folder, esrgan_model, factor, denoise, steps, prompt, seed
 
     result, t = process_one(src_img, esrgan_model, factor, denoise, steps,
                             prompt, seed, tile, overlap,
-                            refine_tile=refine_tile, refine_overlap=refine_overlap)
+                            refine_tile=refine_tile, refine_overlap=refine_overlap,
+                            do_esrgan=do_esrgan)
     dst = None
     try:
         dst = build_output_path(source_path, save_mode, output_dir, output_format)
@@ -785,23 +808,26 @@ def _make_compare_html(src_img, result_img):
 
 
 def _ui_run(image, source_folder, esrgan_model, factor, denoise, steps, prompt, seed,
-            tile, overlap, offload_mode, refine_tile, refine_overlap,
+            tile, overlap, offload_mode, refine_tile, refine_overlap, do_esrgan, guidance,
             save_mode, output_dir, output_format):
     """Adaptateur UI: appelle run() et renvoie (result_image, html_slider, report_markdown)."""
     set_offload_mode(offload_mode)
+    set_guidance(guidance)
     last_result, last_source, report = run(
         image, source_folder, esrgan_model, factor, denoise, steps, prompt, seed,
         tile, overlap, save_mode=save_mode, output_dir=output_dir,
         output_format=output_format, refine_tile=refine_tile, refine_overlap=refine_overlap,
+        do_esrgan=bool(do_esrgan),
     )
     html = _make_compare_html(last_source, last_result)
     return last_result, html, report
 
 
-def _ui_txt2img(prompt, negative, width, height, gen_steps, seed, upscale,
+def _ui_txt2img(prompt, negative, width, height, gen_steps, seed, guidance, upscale,
                 esrgan_model, factor, denoise, offload_mode):
     """Adaptateur UI txt2img: genere puis (optionnel) upscale. Renvoie (image, report)."""
     set_offload_mode(offload_mode)
+    set_guidance(guidance)
     result, t = txt2img_run(prompt, width, height, gen_steps, seed, negative,
                             upscale=bool(upscale), esrgan_model=esrgan_model,
                             factor=factor, denoise=denoise, steps=DEFAULT_STEPS)
@@ -821,7 +847,10 @@ def build_ui():
 
         with gr.Accordion("Paths / models (configuration)", open=False):
             esrgan_dir_tb = gr.Textbox(value=ESRGAN_DIR, label="ESRGAN_DIR (.pth / .safetensors folder)")
-            zimage_model_tb = gr.Textbox(value=BASE_REPO, label="Z-Image (HF repo or local path)")
+            zimage_model_tb = gr.Textbox(value=BASE_REPO,
+                                         label="Z-Image (HF repo, diffusers folder, or .safetensors file)",
+                                         info="A .safetensors (Civitai) is used as the transformer; "
+                                              "VAE+encoder stay from the base repo. Click 'Apply Z-Image'.")
             with gr.Row():
                 refresh_btn = gr.Button("Refresh ESRGAN list", size="sm")
                 apply_zimage_btn = gr.Button("Apply Z-Image", size="sm")
@@ -838,6 +867,9 @@ def build_ui():
                             label="OR source folder (batch mode, takes priority if filled)",
                             placeholder="e.g. D:/images/series_a",
                         )
+                        do_esrgan_cb = gr.Checkbox(value=True, label="ESRGAN upscale",
+                                                   info="Uncheck for img2img only (Z-Image refine on "
+                                                        "the input at native size, no enlargement).")
                         esrgan = gr.Dropdown(models, value=default_model, label="ESRGAN model")
                         preset = gr.Dropdown(list(PRESETS), value="Custom",
                                              label="Use case (auto settings)",
@@ -846,6 +878,8 @@ def build_ui():
                         denoise = gr.Slider(0.0, 0.8, value=DEFAULT_DENOISE, step=0.01,
                                             label="Denoise (strength) - 0.2-0.4 recommended")
                         steps = gr.Slider(4, 30, value=DEFAULT_STEPS, step=1, label="Steps (diffusion pass)")
+                        guidance = gr.Slider(0.0, 8.0, value=0.0, step=0.5, label="CFG guidance",
+                                             info="0 for Z-Image Turbo. Z-Image Base needs ~3.5-5.")
                         prompt = gr.Textbox(label="Optional prompt", placeholder="leaving it empty works very well")
                         seed = gr.Number(value=-1, label="Seed (-1 = random)", precision=0)
                         with gr.Accordion("ESRGAN tiling (VRAM)", open=False):
@@ -896,7 +930,9 @@ def build_ui():
                         with gr.Row():
                             t2i_width = gr.Slider(256, 2048, value=1024, step=16, label="Width")
                             t2i_height = gr.Slider(256, 2048, value=1024, step=16, label="Height")
-                        t2i_steps = gr.Slider(2, 30, value=8, step=1, label="Generation steps (Turbo)")
+                        t2i_steps = gr.Slider(2, 40, value=8, step=1, label="Generation steps")
+                        t2i_guidance = gr.Slider(0.0, 8.0, value=0.0, step=0.5, label="CFG guidance",
+                                                 info="0 = Z-Image Turbo. Z-Image Base: ~3.5-5 + 20-28 steps.")
                         t2i_seed = gr.Number(value=-1, label="Seed (-1 = random)", precision=0)
                         t2i_upscale = gr.Checkbox(value=False,
                                                   label="Upscale after generation (ESRGAN + refine)")
@@ -917,14 +953,14 @@ def build_ui():
         btn.click(
             _ui_run,
             inputs=[inp, source_folder_tb, esrgan, factor, denoise, steps, prompt, seed,
-                    tile, overlap, offload, refine_tile, refine_overlap,
+                    tile, overlap, offload, refine_tile, refine_overlap, do_esrgan_cb, guidance,
                     save_mode, output_dir, output_format],
             outputs=[out, out_slider, report],
         )
         t2i_btn.click(
             _ui_txt2img,
             inputs=[t2i_prompt, t2i_negative, t2i_width, t2i_height, t2i_steps, t2i_seed,
-                    t2i_upscale, t2i_model, t2i_factor, t2i_denoise, t2i_offload],
+                    t2i_guidance, t2i_upscale, t2i_model, t2i_factor, t2i_denoise, t2i_offload],
             outputs=[t2i_out, t2i_report],
         )
     return demo
@@ -1081,6 +1117,12 @@ def cli_main(argv=None):
                         help="CPU offload of the diffusion pass (VRAM). none=all in VRAM | "
                              "model=offload per submodule (good tradeoff) | "
                              "sequential=more aggressive, slower. Requires accelerate.")
+    parser.add_argument("--guidance", type=float, default=0.0,
+                        help="CFG guidance scale. 0 for Z-Image Turbo (default). "
+                             "Z-Image Base needs ~3.5-5 (and ~20+ steps).")
+    parser.add_argument("--no-esrgan", action="store_true",
+                        help="img2img only: skip the ESRGAN upscale, just run the Z-Image refine "
+                             "on the input at native size (no enlargement).")
     parser.add_argument("--preset", choices=list(PRESETS), default="Custom",
                         help="Use-case preset (auto settings). Explicit flags override it.")
     # Text -> Image (txt2img)
@@ -1136,6 +1178,7 @@ def cli_main(argv=None):
     if args.zimage_transformer:
         set_zimage_transformer(args.zimage_transformer)
     set_offload_mode(args.cpu_offload)
+    set_guidance(args.guidance)
 
     if args.serve:
         return serve_main(args.host, args.port, args.idle_timeout)
@@ -1209,10 +1252,10 @@ def cli_main(argv=None):
         build_ui().launch()
         return 0
 
-    if not models:
-        parser.error(f"No ESRGAN model in {ESRGAN_DIR}")
+    if not models and not args.no_esrgan:
+        parser.error(f"No ESRGAN model in {ESRGAN_DIR} (or use --no-esrgan for img2img only)")
 
-    model_name = args.model if args.model in models else models[0]
+    model_name = (args.model if args.model in models else (models[0] if models else None))
 
     if args.report_vram:
         _reset_vram_peak()
@@ -1248,6 +1291,7 @@ def cli_main(argv=None):
             output_format=args.output_format, time_log_path=args.time_log,
             print_output=args.print_output,
             refine_tile=args.refine_tile, refine_overlap=args.refine_overlap,
+            do_esrgan=not args.no_esrgan,
         )
         if not quiet:
             print(report)
@@ -1270,7 +1314,8 @@ def cli_main(argv=None):
         if explicit_output_file and len(paths) == 1:
             result, t = process_one(img, model_name, args.factor, args.denoise, args.steps,
                                     args.prompt, args.seed, args.tile, args.overlap,
-                                    refine_tile=args.refine_tile, refine_overlap=args.refine_overlap)
+                                    refine_tile=args.refine_tile, refine_overlap=args.refine_overlap,
+                                    do_esrgan=not args.no_esrgan)
             os.makedirs(os.path.dirname(os.path.abspath(explicit_output_file)) or ".", exist_ok=True)
             save_image(result, explicit_output_file, args.output_format)
             if args.print_output:
@@ -1287,6 +1332,7 @@ def cli_main(argv=None):
                 output_format=args.output_format, time_log_path=args.time_log,
                 print_output=args.print_output,
                 refine_tile=args.refine_tile, refine_overlap=args.refine_overlap,
+                do_esrgan=not args.no_esrgan,
             )
             if not quiet:
                 print(report)
