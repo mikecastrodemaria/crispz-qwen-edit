@@ -35,7 +35,7 @@ if "%ESRGAN_DIR%"=="" (
     )
 )
 
-echo === crispz - run ===
+echo === crispz-studio - run ===
 echo Python     = !RUNPY!
 echo ESRGAN_DIR = !ESRGAN_DIR!
 echo.

@@ -17,7 +17,7 @@ shift
 goto argloop
 :argdone
 
-echo === crispz - install Windows ===
+echo === crispz-studio - install Windows ===
 echo.
 
 REM 1) Python de base

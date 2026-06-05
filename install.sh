@@ -14,7 +14,7 @@ for a in "$@"; do
     esac
 done
 
-echo "=== crispz - install ==="
+echo "=== crispz-studio - install ==="
 echo
 
 # 1) Python de base (doit deja avoir torch)

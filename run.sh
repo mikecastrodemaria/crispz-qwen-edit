@@ -32,7 +32,7 @@ if [ -z "$ESRGAN_DIR" ]; then
     export ESRGAN_DIR="$(pwd)/upscale_models"
 fi
 
-echo "=== crispz - run ==="
+echo "=== crispz-studio - run ==="
 echo "Python     = $RUNPY"
 echo "ESRGAN_DIR = $ESRGAN_DIR"
 echo
