@@ -49,6 +49,40 @@ The single-file is loaded as the **transformer**; the **VAE + Qwen3 text encoder
 still come from the base repo (`Tongyi-MAI/Z-Image-Turbo` by default). Use a
 **BF16/FP16** checkpoint - FP8/GGUF ComfyUI variants do not load cleanly in diffusers.
 
+### Turbo vs Base (`--guidance`)
+
+Z-Image comes in two flavors that need different inference settings:
+
+| Model | Guidance (CFG) | Steps |
+|---|---|---|
+| **Z-Image Turbo** (distilled) | `--guidance 0` (default) | ~8 |
+| **Z-Image Base** (full) | `--guidance 3.5-5` | ~20-28 |
+
+```bash
+# Turbo checkpoint
+python app.py --txt2img --prompt "..." --zimage-model "D:/models/z-image-turbo.safetensors" \
+    --gen-steps 8 --guidance 0 --save-mode local --output-dir out
+
+# Base checkpoint (needs real CFG + more steps)
+python app.py --txt2img --prompt "..." --zimage-model "D:/models/z-image-base.safetensors" \
+    --gen-steps 24 --guidance 4 --save-mode local --output-dir out
+```
+
+In the UI, both tabs have a **CFG guidance** slider.
+
+## Disabling the upscale (pure txt2img / pure img2img)
+
+- **txt2img only** (no upscale): the default. Don't pass `--upscale` (CLI), or leave
+  the "Upscale after generation" checkbox off (UI).
+- **img2img only** (refine without ESRGAN enlargement): `--no-esrgan` (CLI), or
+  uncheck **"ESRGAN upscale"** in the Image -> Upscale tab. The Z-Image refine runs
+  on the input at its native size.
+
+```bash
+# img2img only: Z-Image refine on the input, no enlargement
+python app.py --cli -i in.png --no-esrgan --denoise 0.30 --save-mode local --output-dir out
+```
+
 ---
 
 ## Installation
