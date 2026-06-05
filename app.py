@@ -899,8 +899,9 @@ def _ui_generate(prompt, negative, use_input, input_image,
 
 
 FOOOCUS_CSS = """
-.gradio-container { max-width: 1280px !important; margin: auto !important; }
-#cz_result { min-height: 420px; }
+.gradio-container { max-width: 100% !important; width: 100% !important; padding: 0 1.2rem !important; }
+#cz_result { min-height: 540px; }
+#cz_result img { max-height: 78vh; object-fit: contain; }
 #cz_prompt textarea { font-size: 1.05rem; }
 #cz_generate { height: 88px; font-size: 1.1rem; }
 """
@@ -915,7 +916,7 @@ def build_ui():
             # ----- Colonne principale (grand apercu + barre de prompt en bas) -----
             with gr.Column(scale=3):
                 out = gr.Image(type="pil", label="Result", elem_id="cz_result",
-                               height=460, show_download_button=True)
+                               height=560, show_download_button=True)
                 report = gr.Markdown(value="*Ready. Type a prompt and press Generate.*")
 
                 use_input = gr.Checkbox(value=False, label="Input Image (img2img / upscale)")
