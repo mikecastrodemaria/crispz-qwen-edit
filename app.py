@@ -104,6 +104,79 @@ def _apply_styles(prompt, style_names):
     suf = "".join(STYLES.get(n, ("", ""))[1] for n in style_names)
     return f"{pre}{prompt or ''}{suf}".strip()
 
+
+# ----------------------------------------------------------------------------
+# Ollama (Describe image -> prompt, Improve prompt). + fallback local BLIP.
+# ----------------------------------------------------------------------------
+def _ollama_http(path, payload=None, base=None, timeout=8):
+    import urllib.request
+    b = (base or OLLAMA_URL).rstrip("/")
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(b + path, data=data,
+                                 headers={"Content-Type": "application/json"} if data else {})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+
+def _ollama_vision_models(base=None):
+    """Modeles Ollama capables de vision (capabilities=vision via /api/show)."""
+    tags = _ollama_http("/api/tags", base=base, timeout=5)
+    names = [m.get("name") for m in tags.get("models", []) if m.get("name")]
+    vision = []
+    for n in names:
+        try:
+            info = _ollama_http("/api/show", {"model": n}, base=base, timeout=8)
+            caps = [c.lower() for c in (info.get("capabilities") or [])]
+            fams = [(f or "").lower() for f in ((info.get("details") or {}).get("families") or [])]
+            if "vision" in caps or any(("clip" in f or "mllama" in f) for f in fams):
+                vision.append(n)
+        except Exception:
+            if any(k in n.lower() for k in ("llava", "vision", "-vl", "vl:", "vl-",
+                                            "moondream", "minicpm-v", "bakllava", "lfm")):
+                vision.append(n)
+    return vision
+
+
+def _ollama_describe(image, model, base=None):
+    """Decrit l'image en un prompt text-to-image via un modele vision Ollama."""
+    b64 = _pil_to_b64_jpeg(image, max_side=1024)
+    instr = ("You are an expert text-to-image prompt writer. Look at the image and output ONE "
+             "detailed prompt as comma-separated visual tags (subject, clothing, setting, lighting, "
+             "style, quality). No preamble, no explanation, just the prompt.")
+    out = _ollama_http("/api/generate",
+                       {"model": model, "prompt": instr, "images": [b64], "stream": False},
+                       base=base, timeout=180)
+    return (out.get("response") or "").strip()
+
+
+def _ollama_improve(prompt_text, model, base=None):
+    """Reecrit un prompt pour le rendre plus riche, via Ollama (modele texte/vision)."""
+    instr = ("Rewrite the following text-to-image prompt to be more vivid and detailed while keeping "
+             "the same subject and intent. Output ONLY the improved prompt (comma-separated), no "
+             "preamble.\n\nPROMPT: " + (prompt_text or ""))
+    out = _ollama_http("/api/generate", {"model": model, "prompt": instr, "stream": False},
+                       base=base, timeout=120)
+    return (out.get("response") or "").strip()
+
+
+_BLIP = None
+
+
+def _local_caption(image):
+    """Fallback local (sans Ollama): petit captioneur BLIP via transformers (lazy)."""
+    global _BLIP
+    if _BLIP is None:
+        from transformers import BlipProcessor, BlipForConditionalGeneration
+        _log("loading local captioner BLIP base (first time downloads ~1GB)...")
+        proc = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+        mdl = BlipForConditionalGeneration.from_pretrained(
+            "Salesforce/blip-image-captioning-base").to(DEVICE)
+        _BLIP = (proc, mdl)
+    proc, mdl = _BLIP
+    inputs = proc(image.convert("RGB"), return_tensors="pt").to(DEVICE)
+    out = mdl.generate(**inputs, max_new_tokens=50)
+    return proc.decode(out[0], skip_special_tokens=True).strip()
+
 # ----------------------------------------------------------------------------
 # Config (persistance dans preferences.json a cote de app.py)
 # Ordre de priorite pour ESRGAN_DIR et BASE_REPO:
@@ -157,6 +230,8 @@ else:
     BASE_REPO = _zmodel
 
 ESRGAN_DIR = os.environ.get("ESRGAN_DIR") or _prefs.get("esrgan_dir") or DEFAULT_ESRGAN_DIR
+# Ollama (Describe image->prompt + Improve prompt). URL configurable, persistee.
+OLLAMA_URL = os.environ.get("OLLAMA_URL") or _prefs.get("ollama_url") or "http://localhost:11434"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16
 
@@ -825,6 +900,47 @@ def _set_performance(name):
     return steps, g
 
 
+def _ui_detect_ollama(url):
+    """Detecte Ollama et liste UNIQUEMENT les modeles vision pour le Describe."""
+    try:
+        models = _ollama_vision_models(base=url)
+    except Exception:
+        return (gr.update(choices=[], value=None),
+                "Ollama not reachable. Describe will use the local BLIP fallback. "
+                "Improve needs Ollama.")
+    if not models:
+        return (gr.update(choices=[], value=None),
+                "Ollama OK but no VISION model. Pull one, e.g. `ollama pull llava` or `moondream`.")
+    return gr.update(choices=models, value=models[0]), f"Ollama OK - {len(models)} vision model(s)."
+
+
+def _ui_describe(image, model, url):
+    """Decrit l'image -> remplit le prompt. Ollama si modele choisi, sinon BLIP local."""
+    if image is None:
+        return gr.update(), "Drop an image to describe first."
+    if model:
+        try:
+            return gr.update(value=_ollama_describe(image, model, base=url)), f"Described via {model}."
+        except Exception as e:
+            return gr.update(), f"Ollama describe failed: {e}"
+    try:
+        return gr.update(value=_local_caption(image)), "Described via local BLIP (no Ollama model)."
+    except Exception as e:
+        return gr.update(), f"No Ollama model selected and local captioner failed: {e}"
+
+
+def _ui_improve(prompt_text, model, url):
+    """Ameliore le prompt courant via Ollama (meme modele)."""
+    if not (prompt_text or "").strip():
+        return gr.update(), "Type a prompt first."
+    if not model:
+        return gr.update(), "Select a model in Advanced > Prompt AI (click Detect Ollama)."
+    try:
+        return gr.update(value=_ollama_improve(prompt_text, model, base=url)), f"Improved via {model}."
+    except Exception as e:
+        return gr.update(), f"Improve failed: {e}"
+
+
 def _pil_to_b64_jpeg(img, max_side=1600, quality=85):
     """Reduit + encode en JPEG base64 pour embarquer en HTML sans saturer la page."""
     if img is None:
@@ -1011,6 +1127,10 @@ def build_ui():
                                       placeholder="Negative prompt - what you do NOT want (needs guidance > 0)")
 
                 with gr.Row():
+                    improve_btn = gr.Button("Improve prompt (Ollama)", size="sm", scale=0, min_width=200)
+                    improve_status = gr.Markdown("")
+
+                with gr.Row():
                     use_input = gr.Checkbox(value=False, label="Input Image", min_width=160)
                     advanced_cb = gr.Checkbox(value=False, label="Advanced", min_width=160)
 
@@ -1037,6 +1157,13 @@ def build_ui():
                                 refine_overlap = gr.Slider(0, 256, value=DEFAULT_REFINE_OVERLAP, step=16,
                                                            label="Diffusion tile overlap")
 
+                        with gr.Tab("Describe"):
+                            describe_img = gr.Image(type="pil", label="Image to describe", height=280)
+                            describe_btn = gr.Button("Describe -> prompt", variant="primary", size="sm")
+                            describe_status = gr.Markdown(
+                                "*Uses the Ollama vision model selected in Advanced > Prompt AI "
+                                "(or the local BLIP fallback if Ollama is off).*")
+
             # ===== Colonne Advanced (a droite, masquee par defaut comme Fooocus) =====
             with gr.Column(scale=2, visible=False) as advanced_col:
                 with gr.Tabs():
@@ -1059,6 +1186,16 @@ def build_ui():
                     with gr.Tab("Styles"):
                         styles = gr.CheckboxGroup(list(STYLES), value=[], label="Styles",
                                                   info="Wraps your prompt with style words (combinable).")
+
+                    with gr.Tab("Prompt AI"):
+                        ollama_url = gr.Textbox(value=OLLAMA_URL, label="Ollama URL",
+                                                info="Local LLM server. Used for Describe (vision) "
+                                                     "and Improve prompt.")
+                        detect_btn = gr.Button("Detect Ollama (vision models)", size="sm", variant="primary")
+                        ollama_model = gr.Dropdown([], label="Vision model (Describe / Improve)",
+                                                   interactive=True)
+                        ollama_status = gr.Markdown("*Click Detect. If Ollama is off, Describe falls "
+                                                    "back to a local BLIP captioner.*")
 
                     with gr.Tab("Models"):
                         zimage_model_tb = gr.Textbox(
@@ -1092,6 +1229,9 @@ def build_ui():
         refresh_btn.click(_refresh_models, [esrgan_dir_tb], [esrgan, paths_status])
         apply_zimage_btn.click(_apply_zimage, [zimage_model_tb], [paths_status])
         save_paths_btn.click(_save_paths_to_prefs, [esrgan_dir_tb, zimage_model_tb], [paths_status])
+        detect_btn.click(_ui_detect_ollama, [ollama_url], [ollama_model, ollama_status])
+        describe_btn.click(_ui_describe, [describe_img, ollama_model, ollama_url], [prompt, describe_status])
+        improve_btn.click(_ui_improve, [prompt, ollama_model, ollama_url], [prompt, improve_status])
         preset.change(_apply_preset, [preset],
                       [factor, denoise, refine_steps, tile, overlap, refine_tile, refine_overlap, offload])
         btn.click(
