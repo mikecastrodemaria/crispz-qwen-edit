@@ -8,9 +8,13 @@ set -e
 cd "$(dirname "$0")"
 
 USE_VENV=1
+FACESWAP=1
+FACESWAP_MODEL=0
 for a in "$@"; do
     case "$a" in
         --no-venv|--system) USE_VENV=0 ;;
+        --no-faceswap) FACESWAP=0 ;;
+        --faceswap-model) FACESWAP_MODEL=1 ;;
     esac
 done
 
@@ -88,8 +92,36 @@ echo
 $RUNPY -c "from diffusers import ZImageImg2ImgPipeline; print('ZImageImg2ImgPipeline OK')"
 echo
 
-# 7) Dossier upscale_models
-mkdir -p upscale_models
-echo "Dossier upscale_models pret. Depose tes .pth dedans, ou pointe ESRGAN_DIR."
+# 7) Deps FaceSwap (optionnelles, par defaut ON ; --no-faceswap pour sauter)
+if [ "$FACESWAP" -eq 1 ]; then
+    echo "Installation des deps FaceSwap (insightface + onnxruntime-gpu)..."
+    $RUNPY -m pip install -r requirements-faceswap.txt || \
+        echo "[AVERT] echec install FaceSwap (non bloquant). La feature restera desactivee."
+    echo
+fi
+
+# 8) Dossiers de modeles
+mkdir -p upscale_models checkpoints loras faceswap
+echo "Dossiers prets: upscale_models (ESRGAN), checkpoints (Z-Image), loras, faceswap."
 echo
+
+# 9) Config locale: copie config-sample.txt -> config.txt si absent
+if [ ! -f config.txt ] && [ -f config-sample.txt ]; then
+    cp config-sample.txt config.txt
+    echo "config.txt cree depuis config-sample.txt (edite-le pour tes reglages)."
+fi
+echo
+
+# 10) Modele inswapper (FaceSwap) - opt-in (~528 Mo, licence): --faceswap-model
+if [ "$FACESWAP_MODEL" -eq 1 ]; then
+    if [ ! -f faceswap/inswapper_128.onnx ]; then
+        echo "Telechargement du modele inswapper_128.onnx (~528 Mo)..."
+        $RUNPY -c "import urllib.request; urllib.request.urlretrieve('https://huggingface.co/ezioruan/inswapper_128.onnx/resolve/main/inswapper_128.onnx', 'faceswap/inswapper_128.onnx'); print('inswapper OK')"
+    else
+        echo "Modele inswapper deja present."
+    fi
+    echo
+fi
+
 echo "=== Install OK. Lance: ./run.sh  (ou ./run.sh --no-venv) ==="
+echo "    Options: --no-faceswap (sauter insightface)  --faceswap-model (telecharger inswapper)"

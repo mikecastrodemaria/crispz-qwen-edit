@@ -62,7 +62,9 @@ Check **Input Image** → **Input mode = Reference (Omni)** → drop up to 4 ref
 ## Face Swap — post-process  *(Phase 3, optional)*
 
 Input Image → **Face Swap** tab: a source face + “Apply face swap to result”.
-Works on any mode (txt2img / img2img / omni). Requires:
+Works on any mode (txt2img / img2img / omni). The installer sets up the deps by
+default (`insightface` + `onnxruntime-gpu`); skip with `install.bat --no-faceswap`,
+or install manually:
 
 ```bash
 .venv/Scripts/python -m pip install -r requirements-faceswap.txt
