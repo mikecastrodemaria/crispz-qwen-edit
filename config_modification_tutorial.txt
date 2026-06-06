@@ -1,0 +1,65 @@
+crispz-studio - config tutorial
+================================
+
+HOW IT WORKS
+------------
+Settings live in a JSON file loaded at startup. Priority:
+  1) config.txt        -> your LOCAL copy (gitignored, never pushed). Edit this one.
+  2) config-sample.txt -> the generic template shipped in the repo (fallback).
+  3) built-in defaults -> used if a key (or both files) is missing.
+
+First time: copy config-sample.txt to config.txt, then edit config.txt.
+  Windows : copy config-sample.txt config.txt
+  Linux   : cp config-sample.txt config.txt
+Restart the app after editing. (config.txt is NOT version-controlled, so your
+local paths/tweaks stay private.)
+
+
+KEYS
+----
+ollama_url              Ollama server URL (Describe + Improve prompt).
+                        e.g. "http://localhost:11434"
+ollama_describe_prompt  Instruction sent to the vision model to caption an image
+                        into a prompt (Describe tab).
+ollama_improve_prompt   Instruction to rewrite/enrich the current prompt. Must
+                        contain {prompt} (replaced by your prompt). Edit the tone
+                        here (e.g. ask for photographic detail, a language, etc.).
+
+default_prompt          Prompt prefilled at startup.
+default_negative_prompt Negative prompt prefilled at startup.
+default_styles          List of style names checked by default, e.g.
+                        ["Fooocus Cinematic", "SAI Anime"].
+default_aspect_ratio    One of the Settings aspect labels, e.g. "1024 x 1024  (1:1)".
+default_performance     "Turbo (8 steps)" | "Quality (20 steps)" | "Base CFG (28 steps)".
+default_width/height    txt2img size (multiples of 16).
+default_gen_steps       txt2img steps.
+default_guidance        CFG. 0 = Z-Image Turbo. Z-Image Base: ~3.5-5.
+default_image_number    Batch size at startup (1-30).
+default_seed            -1 = random.
+
+default_factor          Upscale factor (img2img/upscale).
+default_denoise         Refine denoise strength (0..0.8).
+default_refine_steps    Z-Image refine steps.
+default_tile/overlap    ESRGAN tiling (0 = off) to cap VRAM.
+default_refine_tile/overlap   Z-Image diffusion tiling for 4K+ (0 = whole image).
+default_cpu_offload     "none" | "model" (~half VRAM) | "sequential" (~9GB, slower).
+
+zimage_omni_model       HF repo id OR local diffusers folder of a Z-Image Omni/Edit
+                        model (with a SigLIP encoder). REQUIRED for the Reference
+                        (Omni) multi-image mode. The Turbo model alone cannot do Omni.
+faceswap_model_path     Absolute path to an inswapper .onnx file. REQUIRED for the
+                        Face Swap tab (also needs: pip install insightface onnxruntime-gpu).
+
+default_save_mode       "display" (no save) | "local" | "alongside" | "custom".
+default_output_dir      Folder for "local"/"custom" save modes.
+default_output_format   "png" | "jpg" | "webp".
+filename_pattern        Output filename (no extension). Placeholders:
+                        {date}  YYYYMMDD-HHMMSS
+                        {tag}   upscaled / txt2img / img2img / omni / faceswap (+ source name)
+                        {seed}  the seed used (or "rand")
+                        {w} {h} output size
+                        {index} _1.._N for batches
+                        Files are made unique (_2, _3...) so nothing is overwritten.
+
+log_level               "quiet" | "info" | "debug". debug = full params/state/VRAM
+                        in the console (also: run.bat --debug, or --log-level debug).

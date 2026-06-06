@@ -292,19 +292,21 @@ STYLES = _load_styles() or _FALLBACK_STYLES
 
 
 CONFIG_PATH = os.path.join(HERE, "config.txt")
+CONFIG_SAMPLE_PATH = os.path.join(HERE, "config-sample.txt")
 
 
 def _load_config():
-    """Charge config.txt (JSON, facon Fooocus): defauts + strings d'instruction
-    Ollama (describe / improve). Absent ou invalide -> {} (les valeurs codees servent
-    de repli)."""
-    if not os.path.isfile(CONFIG_PATH):
-        return {}
-    try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            return json.load(f) or {}
-    except Exception:
-        return {}
+    """Charge la config (JSON, facon Fooocus): defauts + strings d'instruction
+    Ollama. Priorite: config.txt (local, gitignore) -> config-sample.txt (livre) ->
+    {} (les valeurs codees servent de repli)."""
+    for path in (CONFIG_PATH, CONFIG_SAMPLE_PATH):
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f) or {}
+            except Exception:
+                pass
+    return {}
 
 
 CONFIG = _load_config()

@@ -7,6 +7,10 @@ settings.local.json
 # --- Preferences locales (contiennent des chemins specifiques a la machine) ---
 preferences.json
 
+# --- Config locale (chemins modeles, reglages perso). On versionne UNIQUEMENT
+#     config-sample.txt ; config.txt reste local (copie/edite par l'utilisateur). ---
+config.txt
+
 # --- Docs internes / perso (gardes hors du repo, non transmis a GitHub) ---
 # Les fichiers vivent un niveau au-dessus (../). Ces patterns evitent une
 # re-inclusion accidentelle si un .md interne est recree dans le repo.

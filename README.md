@@ -11,11 +11,65 @@ SwarmUI. On top of crispz's upscaler it adds:
 - **Single-file `.safetensors` models** (Civitai): use a Z-Image transformer
   checkpoint via `from_single_file` (VAE + Qwen3 encoder kept from the base repo).
 - **Shared VRAM**: txt2img and img2img reuse the same loaded weights (`from_pipe`).
+- **Fooocus-style UI**: big preview, prompt + Generate + **Stop**, dark theme,
+  Settings (aspect ratios, performance presets, batch **1–30**), and a **Styles**
+  tab with **277 styles** (search box + thumbnail previews).
+- **Reference (Omni)** multi-image compose, **Face Swap** post-process,
+  **Describe** (image→prompt) and **Improve prompt** via a local **Ollama** model.
+- **Session history gallery** (accumulates renders; load from the output folder).
+- **Dated, unique filenames** (date + tag + seed + size) — no more overwriting.
+- **`config.txt`** for all defaults + the Ollama instruction strings.
 
 Tabbed Gradio UI + scriptable CLI + persistent server (`--serve`).
 
-> Roadmap: Phase 2 = ControlNet + Omni-edit (image mixing). Phase 3 = faceswap
-> (post-process). See the parent crispz repo for the upscale internals.
+> Roadmap status: **Phase 2** (Omni multi-reference) and **Phase 3** (FaceSwap)
+> are implemented (gated on the required model/deps — see below). ControlNet and
+> Inpaint are next. See the parent crispz repo for the upscale internals.
+
+## Configuration (`config.txt`)
+
+All defaults and the Ollama prompt strings live in a JSON config. The repo ships a
+generic **`config-sample.txt`**; copy it to **`config.txt`** (your local copy,
+gitignored) and edit that:
+
+```bash
+cp config-sample.txt config.txt    # Windows: copy config-sample.txt config.txt
+```
+
+Load order: `config.txt` → `config-sample.txt` → built-in defaults. See
+**`config_modification_tutorial.txt`** for every key (filename pattern, Ollama
+prompts, the Omni / FaceSwap model paths, etc.).
+
+## Styles, Describe & Improve (Ollama)
+
+- **Styles** tab (Advanced): 277 Fooocus/SDXL styles, a **search** box and a
+  **thumbnail preview** gallery. Selected styles wrap your prompt and merge their
+  negatives. (Sample thumbnails live in `styles/samples/`, local only.)
+- **Describe** (Input Image → Describe): caption an image into a prompt using an
+  Ollama **vision** model (auto-detected, vision-only list), or a local BLIP fallback.
+- **Improve prompt**: rewrites the current prompt via the same Ollama model. URL +
+  model in Advanced → **Prompt AI**. Tune the instructions in `config.txt`.
+
+## Reference (Omni) — multi-image compose  *(Phase 2)*
+
+Compose one image from several references + a prompt (e.g. a person + an outfit).
+Check **Input Image** → **Input mode = Reference (Omni)** → drop up to 4 refs.
+
+> Omni needs a **dedicated Z-Image Omni/Edit model** (it requires a SigLIP encoder
+> the Turbo model lacks). Set it in `config.txt`:
+> `"zimage_omni_model": "<HF repo or local diffusers folder>"`. Unset → clear message.
+
+## Face Swap — post-process  *(Phase 3, optional)*
+
+Input Image → **Face Swap** tab: a source face + “Apply face swap to result”.
+Works on any mode (txt2img / img2img / omni). Requires:
+
+```bash
+.venv/Scripts/python -m pip install insightface onnxruntime-gpu
+```
+
+and `"faceswap_model_path": "<path to inswapper .onnx>"` in `config.txt`. If the
+dep/model is missing, the run still succeeds and the report says `faceswap skipped`.
 
 ## Text -> Image
 
