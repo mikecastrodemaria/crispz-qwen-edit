@@ -132,6 +132,57 @@ python app.py --txt2img --prompt "..." --zimage-model "D:/models/z-image-base.sa
 
 In the UI, both tabs have a **CFG guidance** slider.
 
+## Switching models in the UI (Advanced → Models)
+
+crispz-studio keeps **two separate model fields** — this is the key thing to
+understand:
+
+| Field | What it provides |
+|---|---|
+| **Z-Image base** (textbox, default `Tongyi-MAI/Z-Image-Turbo`) | the **VAE + Qwen3 text encoder** (shared by all Z-Image variants) |
+| **Checkpoints** (folder + dropdown) | the **transformer** = the actual generation model |
+
+**To switch model, pick a checkpoint in the dropdown — you do NOT change the
+`Tongyi-MAI/Z-Image-Turbo` field.** That base field only supplies the VAE +
+encoder; the selected `.safetensors` becomes the transformer. The model reloads
+on the next **Generate**.
+
+Steps:
+
+1. **Models → Checkpoints**: set the folder (e.g.
+   `D:\…\Stable-diffusion\Z-Image`) → **Refresh**.
+2. Pick a `.safetensors` in the dropdown (status shows
+   *"Z-Image transformer: <file> (reload on next run)"*).
+3. **Generate** → it loads with your checkpoint.
+4. To go back to the original Turbo, pick **"(base repo)"** in the dropdown.
+
+Only edit the **Z-Image base** field if you have a full **diffusers folder**
+(then use **Apply Z-Image**).
+
+**Gotchas**
+
+- Checkpoints must be **BF16/FP16**. FP8 / GGUF / SVDQ (ComfyUI) variants do **not**
+  load in diffusers.
+- If the checkpoint is a **Z-Image Base** model (not Turbo), set **Performance →
+  "Base CFG (28 steps)"** (guidance ~4, more steps), otherwise the result is flat.
+- Verify what loaded with `run.bat --debug`:
+  `[crispz] loading Z-Image transformer (single-file): …`.
+
+**Persist the folders** (so you don't re-type them) in `config.txt`:
+
+```json
+"checkpoints_dir": "D:\\Github\\sdlibs\\models\\Stable-diffusion\\Z-Image",
+"loras_dir": "D:\\Github\\sdlibs\\models\\Lora"
+```
+
+### LoRA
+
+**Models → LoRA**: set the folder → **Refresh** → pick a LoRA + set its **weight**
+(single number, one LoRA at a time). Picking a LoRA auto-fills its
+**keywords / trigger words** (read from the file metadata); **Add to prompt**
+appends them. The LoRA is applied to the transformer (shared by txt2img/img2img)
+and reloads on the next run.
+
 ## Disabling the upscale (pure txt2img / pure img2img)
 
 - **txt2img only** (no upscale): the default. Don't pass `--upscale` (CLI), or leave
