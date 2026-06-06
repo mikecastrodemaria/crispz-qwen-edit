@@ -1615,7 +1615,11 @@ def _ui_generate(prompt, negative, styles, use_input, input_image,
              f"seed={int(seed)} guidance={float(guidance)} offload={offload_mode} styles={styles}")
         _dbg(f"prompt='{(full_prompt or '')[:160]}' | negative='{(negative or '')[:80]}'")
         # --- Omni multi-reference (compo a partir de plusieurs images) ---
-        if use_input and input_mode == "Reference (Omni)":
+        # Garde-fou: on ne route en Omni que si un modele Omni est configure. Sinon
+        # (UI obsolete dans le navigateur, mode reste sur Omni) on retombe en
+        # txt2img/img2img au lieu d'echouer.
+        omni_ready = bool((OMNI_MODEL or "").strip())
+        if use_input and input_mode == "Reference (Omni)" and omni_ready:
             refs = [r for r in [ref1, ref2, ref3, ref4] if r is not None]
             _dbg(f"omni: {len(refs)} ref(s), size={int(width)}x{int(height)}")
             if not refs:
