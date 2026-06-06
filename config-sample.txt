@@ -33,7 +33,7 @@
     "faceswap_model_path": "",
     "faceswap_model_url": "",
 
-    "default_save_mode": "display",
+    "default_save_mode": "local",
     "default_output_dir": "out",
     "default_output_format": "png",
     "filename_pattern": "{date}_{tag}_seed{seed}_{w}x{h}{index}",
