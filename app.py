@@ -31,6 +31,35 @@ import torch
 from PIL import Image
 import gradio as gr
 
+# Support AVIF/HEIC en entree (les .avif sinon: PIL.UnidentifiedImageError).
+try:
+    import pillow_avif  # noqa: F401  enregistre l'ouvreur AVIF dans PIL
+except Exception:
+    try:
+        from pillow_heif import register_heif_opener
+        register_heif_opener()
+    except Exception:
+        pass
+
+
+def _disable_brotli():
+    """Neutralise le brotli_middleware de Gradio (bug h11 'Content-Length' a l'envoi
+    de gros resultats). Patch sur le symbole importe par gradio.routes."""
+    class _Passthrough:
+        def __init__(self, app, *a, **k):
+            self.app = app
+
+        async def __call__(self, scope, receive, send):
+            await self.app(scope, receive, send)
+    import importlib
+    for modname in ("gradio.routes", "gradio.brotli_middleware"):
+        try:
+            m = importlib.import_module(modname)
+            if hasattr(m, "BrotliMiddleware"):
+                m.BrotliMiddleware = _Passthrough
+        except Exception:
+            pass
+
 # Defauts d'UI / CLI: reglages de reference (voir README)
 DEFAULT_MODEL = "4x-ClearRealityV1_Soft.safetensors"
 DEFAULT_FACTOR = 2.0
@@ -46,7 +75,7 @@ DEFAULT_SAVE_MODE = "display"        # display | local | alongside | custom
 DEFAULT_OUTPUT_DIR = "out"
 DEFAULT_OUTPUT_FORMAT = "png"        # png | webp | jpg
 SUPPORTED_FORMATS = ("png", "webp", "jpg")
-IMG_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
+IMG_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".avif", ".heic")
 
 # Presets "cas d'usage" -> reglages auto. Seules les cles presentes sont appliquees,
 # le reste est laisse tel quel. Utilise par l'UI (_apply_preset) et la CLI (--preset).
@@ -2684,6 +2713,7 @@ def cli_main(argv=None):
 
     # Pas de --cli et pas d'entree -> UI
     if not args.cli and not args.input and not args.input_folder:
+        _disable_brotli()  # evite le bug h11 'Content-Length' a l'envoi des resultats
         build_ui().launch(allowed_paths=[os.path.join(HERE, "styles", "samples")])
         return 0
 
