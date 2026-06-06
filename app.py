@@ -374,6 +374,17 @@ else:
     BASE_REPO = _zmodel
 
 ESRGAN_DIR = os.environ.get("ESRGAN_DIR") or _prefs.get("esrgan_dir") or DEFAULT_ESRGAN_DIR
+# Dossiers de modeles Z-Image (comme ESRGAN_DIR): checkpoints single-file a switcher
+# + LoRA a appliquer. Path config (checkpoints_dir / loras_dir) ou defaut local.
+CHECKPOINTS_DIR = (os.environ.get("CHECKPOINTS_DIR") or _prefs.get("checkpoints_dir")
+                   or CONFIG.get("checkpoints_dir") or os.path.join(HERE, "checkpoints"))
+LORAS_DIR = (os.environ.get("LORAS_DIR") or _prefs.get("loras_dir")
+             or CONFIG.get("loras_dir") or os.path.join(HERE, "loras"))
+# LoRA active (chemin .safetensors) + poids. Inclus dans la clef de cache du pipe.
+LORA_PATH = None
+LORA_WEIGHT = float(CONFIG.get("default_lora_weight", 1.0))
+# Modele Omni/Edit (multi-reference). Reglable via config.txt ou l'UI.
+OMNI_MODEL = (os.environ.get("ZIMAGE_OMNI_MODEL") or CONFIG.get("zimage_omni_model") or "").strip()
 # Ollama (Describe image->prompt + Improve prompt). URL configurable, persistee.
 OLLAMA_URL = (os.environ.get("OLLAMA_URL") or _prefs.get("ollama_url")
               or CONFIG.get("ollama_url") or "http://localhost:11434")
@@ -511,6 +522,79 @@ def set_zimage_transformer(path):
         _log(f"Z-Image transformer -> {path or '(repo de base)'} -> will reload")
 
 
+def list_checkpoints():
+    """Modeles Z-Image single-file (.safetensors) du dossier checkpoints."""
+    if not os.path.isdir(CHECKPOINTS_DIR):
+        return []
+    return sorted(f for f in os.listdir(CHECKPOINTS_DIR)
+                  if f.lower().endswith((".safetensors", ".ckpt", ".pt", ".sft")))
+
+
+def list_loras():
+    """LoRA (.safetensors) du dossier loras."""
+    if not os.path.isdir(LORAS_DIR):
+        return []
+    return sorted(f for f in os.listdir(LORAS_DIR)
+                  if f.lower().endswith((".safetensors", ".ckpt", ".pt")))
+
+
+def set_checkpoints_dir(path):
+    global CHECKPOINTS_DIR
+    if path:
+        CHECKPOINTS_DIR = path
+
+
+def set_loras_dir(path):
+    global LORAS_DIR
+    if path:
+        LORAS_DIR = path
+
+
+def set_lora(name, weight):
+    """Selectionne une LoRA (nom de fichier du dossier loras, ou '' / 'None' pour
+    aucune) + son poids. Invalide le pipe si change (re-application au chargement)."""
+    global LORA_PATH, LORA_WEIGHT
+    new_path = None
+    if name and name not in ("None", "none", ""):
+        new_path = name if os.path.isabs(name) else os.path.join(LORAS_DIR, name)
+    w = float(weight)
+    if new_path != LORA_PATH or w != LORA_WEIGHT:
+        LORA_PATH, LORA_WEIGHT = new_path, w
+        free_vram()
+        _log(f"LoRA -> {os.path.basename(new_path) if new_path else '(none)'} "
+             f"weight {w} -> will reload")
+
+
+def set_omni_model(repo):
+    """Definit le modele Omni/Edit (repo HF ou dossier). Invalide le pipe omni."""
+    global OMNI_MODEL
+    repo = (repo or "").strip()
+    if repo != OMNI_MODEL:
+        OMNI_MODEL = repo
+        _DERIVED.pop("omni", None)
+        _log(f"Omni model -> {repo or '(none)'}")
+
+
+def check_omni_available():
+    """Teste l'existence des repos Omni/Edit sur Hugging Face (API publique)."""
+    import urllib.request
+    found = []
+    for repo in ("Tongyi-MAI/Z-Image-Omni-Base", "Tongyi-MAI/Z-Image-Edit"):
+        try:
+            req = urllib.request.Request("https://huggingface.co/api/models/" + repo,
+                                         headers={"User-Agent": "crispz-studio"})
+            with urllib.request.urlopen(req, timeout=8) as r:
+                if r.status == 200:
+                    found.append(repo)
+        except Exception:
+            pass
+    if found:
+        return ("**Omni model available!** " + ", ".join(f"`{r}`" for r in found)
+                + " - set it in config.txt `zimage_omni_model` (or Models tab).")
+    return ("Not released yet. Z-Image-Omni-Base / Z-Image-Edit are still 'coming "
+            "soon'. The Omni tab will work once they ship.")
+
+
 def set_offload_mode(mode):
     """Change le mode d'offload CPU. Invalide le pipe (hooks poses au chargement)."""
     global OFFLOAD_MODE
@@ -633,7 +717,7 @@ def _ensure_base():
     """Charge (si besoin) le pipeline de base txt2img. Gere le transformer
     single-file (Civitai) et l'offload. Cache par (repo, transformer, offload)."""
     global _BASE_PIPE, _DERIVED, _LOADED_KEY
-    key = (BASE_REPO, ZIMAGE_TRANSFORMER, OFFLOAD_MODE)
+    key = (BASE_REPO, ZIMAGE_TRANSFORMER, OFFLOAD_MODE, LORA_PATH, LORA_WEIGHT)
     _dbg(f"_ensure_base key={key} cached={_LOADED_KEY}")
     if _BASE_PIPE is not None and _LOADED_KEY == key:
         _dbg("base pipeline: reusing cached (no reload)")
@@ -651,6 +735,14 @@ def _ensure_base():
     _log(f"loading Z-Image base: {BASE_REPO} (offload={OFFLOAD_MODE}, dtype=bf16) ... "
          "first time downloads from HF, then cached")
     pipe = ZImagePipeline.from_pretrained(BASE_REPO, torch_dtype=DTYPE, **kwargs)
+    # LoRA Z-Image (sur le transformer du base -> partage par les pipes derives).
+    if LORA_PATH and os.path.isfile(LORA_PATH):
+        try:
+            _log(f"applying LoRA: {os.path.basename(LORA_PATH)} (weight {LORA_WEIGHT})")
+            pipe.load_lora_weights(LORA_PATH, adapter_name="cz_lora")
+            pipe.set_adapters(["cz_lora"], [float(LORA_WEIGHT)])
+        except Exception as e:
+            _log(f"LoRA load failed ({e}); continuing without LoRA")
     try:
         pipe.enable_attention_slicing()
     except Exception:
@@ -695,7 +787,8 @@ def _load_omni():
     ZIMAGE_OMNI_MODEL. Pipeline separe (ne partage pas avec le base)."""
     global _DERIVED
     from diffusers import ZImageOmniPipeline
-    repo = (os.environ.get("ZIMAGE_OMNI_MODEL") or CONFIG.get("zimage_omni_model") or "").strip()
+    repo = (OMNI_MODEL or os.environ.get("ZIMAGE_OMNI_MODEL")
+            or CONFIG.get("zimage_omni_model") or "").strip()
     if not repo:
         raise RuntimeError(
             "Omni needs a dedicated Z-Image Omni/Edit model (with a SigLIP encoder that "
@@ -1171,6 +1264,40 @@ def _apply_zimage(repo):
     return f"Z-Image: {BASE_REPO} (will be (re)loaded on next run)"
 
 
+def _refresh_checkpoints(new_dir):
+    """Change le dossier checkpoints + liste les modeles Z-Image single-file."""
+    set_checkpoints_dir(new_dir)
+    cks = list_checkpoints()
+    return gr.update(choices=["(base repo)"] + cks), f"{len(cks)} checkpoint(s) in {CHECKPOINTS_DIR}"
+
+
+def _apply_checkpoint(name):
+    """Selectionne un checkpoint single-file comme transformer (ou revient au base repo)."""
+    if not name or name == "(base repo)":
+        set_zimage_transformer("")
+        return "Z-Image: base repo transformer (single-file cleared)."
+    path = name if os.path.isabs(name) else os.path.join(CHECKPOINTS_DIR, name)
+    set_zimage_transformer(path)
+    return f"Z-Image transformer: {os.path.basename(path)} (reload on next run)."
+
+
+def _refresh_loras(new_dir):
+    """Change le dossier loras + liste les LoRA."""
+    set_loras_dir(new_dir)
+    lr = list_loras()
+    return gr.update(choices=["None"] + lr), f"{len(lr)} LoRA(s) in {LORAS_DIR}"
+
+
+def _apply_lora(name, weight):
+    set_lora(name, weight)
+    return (f"LoRA: {os.path.basename(LORA_PATH)} weight {LORA_WEIGHT} (reload on next run)."
+            if LORA_PATH else "LoRA: none.")
+
+
+def _ui_check_omni():
+    return check_omni_available()
+
+
 def _save_paths_to_prefs(esrgan_dir, zimage_model):
     set_esrgan_dir(esrgan_dir)
     set_zimage_model(zimage_model)
@@ -1633,7 +1760,7 @@ def build_ui():
                     with gr.Tab("Models"):
                         zimage_model_tb = gr.Textbox(
                             value=BASE_REPO,
-                            label="Z-Image (HF repo, diffusers folder, or .safetensors file)",
+                            label="Z-Image base (HF repo, diffusers folder, or .safetensors file)",
                             info="A .safetensors (Civitai) = transformer; VAE+encoder from base repo.")
                         esrgan_dir_tb = gr.Textbox(value=ESRGAN_DIR, label="ESRGAN_DIR (.pth/.safetensors folder)")
                         offload = gr.Dropdown(choices=list(OFFLOAD_CHOICES), value="none",
@@ -1644,6 +1771,32 @@ def build_ui():
                             apply_zimage_btn = gr.Button("Apply Z-Image", size="sm", variant="primary")
                             save_paths_btn = gr.Button("Save paths", size="sm")
                         paths_status = gr.Markdown("")
+
+                        gr.Markdown("### Checkpoints (switch model, like ESRGAN)")
+                        ckpt_dir_tb = gr.Textbox(value=CHECKPOINTS_DIR, label="Checkpoints folder")
+                        with gr.Row():
+                            ckpt_dd = gr.Dropdown(choices=["(base repo)"] + list_checkpoints(),
+                                                  value="(base repo)", label="Z-Image checkpoint", scale=3)
+                            ckpt_refresh_btn = gr.Button("Refresh", size="sm", scale=1)
+                        ckpt_status = gr.Markdown("")
+
+                        gr.Markdown("### LoRA")
+                        lora_dir_tb = gr.Textbox(value=LORAS_DIR, label="LoRA folder")
+                        with gr.Row():
+                            lora_dd = gr.Dropdown(choices=["None"] + list_loras(), value="None",
+                                                  label="LoRA", scale=3)
+                            lora_refresh_btn = gr.Button("Refresh", size="sm", scale=1)
+                        lora_weight = gr.Slider(0.0, 2.0, value=float(LORA_WEIGHT), step=0.05,
+                                                label="LoRA weight")
+                        lora_status = gr.Markdown("")
+
+                        gr.Markdown("### Omni / Edit model (multi-reference)")
+                        omni_model_tb = gr.Textbox(value=CONFIG.get("zimage_omni_model", ""),
+                                                   label="Omni model (HF repo or local folder)",
+                                                   info="Needs SigLIP. Z-Image-Omni-Base / Z-Image-Edit "
+                                                        "(coming soon).")
+                        omni_check_btn = gr.Button("Check Omni availability (Hugging Face)", size="sm")
+                        omni_status = gr.Markdown("")
 
                     with gr.Tab("Save"):
                         save_mode = gr.Radio(choices=["display", "local", "alongside", "custom"],
@@ -1663,6 +1816,14 @@ def build_ui():
         refresh_btn.click(_refresh_models, [esrgan_dir_tb], [esrgan, paths_status])
         apply_zimage_btn.click(_apply_zimage, [zimage_model_tb], [paths_status])
         save_paths_btn.click(_save_paths_to_prefs, [esrgan_dir_tb, zimage_model_tb], [paths_status])
+        ckpt_refresh_btn.click(_refresh_checkpoints, [ckpt_dir_tb], [ckpt_dd, ckpt_status])
+        ckpt_dd.change(_apply_checkpoint, [ckpt_dd], [ckpt_status])
+        lora_refresh_btn.click(_refresh_loras, [lora_dir_tb], [lora_dd, lora_status])
+        lora_dd.change(_apply_lora, [lora_dd, lora_weight], [lora_status])
+        lora_weight.change(_apply_lora, [lora_dd, lora_weight], [lora_status])
+        omni_model_tb.change(lambda r: (set_omni_model(r), f"Omni model set: {r or '(none)'}")[1],
+                             [omni_model_tb], [omni_status])
+        omni_check_btn.click(_ui_check_omni, None, [omni_status])
         log_level_dd.change(set_log_level, [log_level_dd], [log_level_status])
         detect_btn.click(_ui_detect_ollama, [ollama_url], [ollama_model, ollama_status])
         describe_btn.click(_ui_describe, [describe_img, ollama_model, ollama_url], [prompt, describe_status])

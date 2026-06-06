@@ -24,6 +24,9 @@
     "default_refine_overlap": 64,
     "default_cpu_offload": "none",
 
+    "checkpoints_dir": "",
+    "loras_dir": "",
+    "default_lora_weight": 1.0,
     "zimage_omni_model": "",
     "faceswap_model_path": "",
 
