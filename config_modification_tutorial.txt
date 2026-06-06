@@ -24,6 +24,9 @@ ollama_describe_prompt  Instruction sent to the vision model to caption an image
 ollama_improve_prompt   Instruction to rewrite/enrich the current prompt. Must
                         contain {prompt} (replaced by your prompt). Edit the tone
                         here (e.g. ask for photographic detail, a language, etc.).
+ollama_compose_prompt   Instruction for the Compose (LLM) tab ("poor-man's Omni"):
+                        merges the per-image descriptions into ONE prompt. Should
+                        contain {descriptions} (replaced by the list of captions).
 
 default_prompt          Prompt prefilled at startup.
 default_negative_prompt Negative prompt prefilled at startup.

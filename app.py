@@ -189,6 +189,17 @@ def _ollama_improve(prompt_text, model, base=None):
     return (out.get("response") or "").strip()
 
 
+def _ollama_compose(captions, model, base=None):
+    """'Faux Omni': fusionne plusieurs descriptions d'images en UN seul prompt."""
+    listing = "\n".join(f"Image {i + 1}: {c}" for i, c in enumerate(captions) if c)
+    instr = (COMPOSE_INSTRUCTION.replace("{descriptions}", listing)
+             if "{descriptions}" in COMPOSE_INSTRUCTION
+             else f"{COMPOSE_INSTRUCTION}\n\n{listing}")
+    out = _ollama_http("/api/generate", {"model": model, "prompt": instr, "stream": False},
+                       base=base, timeout=120)
+    return (out.get("response") or "").strip()
+
+
 _BLIP = None
 
 
@@ -361,6 +372,12 @@ IMPROVE_INSTRUCTION = CONFIG.get(
     "Rewrite the following text-to-image prompt to be more vivid and detailed while keeping "
     "the same subject and intent. Output ONLY the improved prompt (comma-separated), no "
     "preamble.\n\nPROMPT: {prompt}")
+COMPOSE_INSTRUCTION = CONFIG.get(
+    "ollama_compose_prompt",
+    "You are an expert text-to-image prompt writer. Below are descriptions of several "
+    "reference images. Merge their key elements (subject, clothing, pose, setting, style) "
+    "into ONE single coherent, detailed image prompt. Output ONLY the prompt (comma-"
+    "separated), no preamble.\n\n{descriptions}")
 
 
 def _load_prefs_raw():
@@ -1471,6 +1488,25 @@ def _ui_improve(prompt_text, model, url):
         return gr.update(), f"Improve failed: {e}"
 
 
+def _ui_compose(r1, r2, r3, r4, model, url):
+    """'Faux Omni': decrit chaque image de reference (vision) puis fusionne en UN
+    prompt via le LLM. Remplit la zone de prompt."""
+    refs = [r for r in [r1, r2, r3, r4] if r is not None]
+    if not refs:
+        return gr.update(), "Add at least one reference image."
+    if not model:
+        return gr.update(), "Select an Ollama vision model in Advanced > Prompt AI (Detect)."
+    try:
+        caps = [_ollama_describe(im, model, base=url) for im in refs]
+    except Exception as e:
+        return gr.update(), f"Describe failed: {e}"
+    try:
+        merged = _ollama_compose(caps, model, base=url)
+    except Exception as e:
+        return gr.update(), f"Compose failed: {e}"
+    return gr.update(value=merged), f"Composed one prompt from {len(refs)} image(s) via {model}."
+
+
 def _ui_clear_history():
     """Vide l'historique de session (state + galerie)."""
     return [], []
@@ -1858,6 +1894,20 @@ def build_ui():
                                 "*Uses the Ollama vision model selected in Advanced > Prompt AI "
                                 "(or the local BLIP fallback if Ollama is off).*")
 
+                        with gr.Tab("Compose (LLM)"):
+                            gr.Markdown("*\"Poor-man's Omni\": describe each reference with the "
+                                        "vision model, then merge them into ONE prompt (Ollama, set "
+                                        "in Advanced > Prompt AI). Then press **Generate**.*")
+                            with gr.Row():
+                                cref1 = gr.Image(type="pil", label="Ref 1", height=180)
+                                cref2 = gr.Image(type="pil", label="Ref 2", height=180)
+                            with gr.Row():
+                                cref3 = gr.Image(type="pil", label="Ref 3", height=180)
+                                cref4 = gr.Image(type="pil", label="Ref 4", height=180)
+                            compose_btn = gr.Button("Describe + combine -> prompt",
+                                                    variant="primary", size="sm")
+                            compose_status = gr.Markdown("")
+
                         with gr.Tab("Reference (Omni)", visible=omni_on):
                             gr.Markdown("*Compose from up to 4 reference images + a prompt. "
                                         "Set **Input mode = Reference (Omni)** above. "
@@ -2013,6 +2063,8 @@ def build_ui():
         detect_btn.click(_ui_detect_ollama, [ollama_url], [ollama_model, ollama_status])
         describe_btn.click(_ui_describe, [describe_img, ollama_model, ollama_url], [prompt, describe_status])
         improve_btn.click(_ui_improve, [prompt, ollama_model, ollama_url], [prompt, improve_status])
+        compose_btn.click(_ui_compose, [cref1, cref2, cref3, cref4, ollama_model, ollama_url],
+                          [prompt, compose_status])
         # Stop facon Fooocus: tourne en parallele du Generate (thread separe) et pose
         # le flag d'arret + interrompt la boucle de debruitage en cours.
         stop_btn.click(request_stop, None, [report])

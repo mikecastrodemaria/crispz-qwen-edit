@@ -58,6 +58,15 @@ prompts, the Omni / FaceSwap model paths, etc.).
 **Input Image → Upscale or img2img** (uncheck "ESRGAN upscale" for a pure
 img2img refine). One reference image + your prompt.
 
+**Available now — Compose (LLM), a "poor-man's Omni".** Input Image →
+**Compose (LLM)** tab: drop up to 4 references, click *"Describe + combine →
+prompt"*. Each image is captioned by your Ollama **vision** model, then the LLM
+merges the captions into ONE prompt (e.g. person + outfit + setting). Press
+**Generate**. Needs Ollama with a real vision model (llava, qwen-vl, …) set in
+Advanced → Prompt AI. The merge instruction is `ollama_compose_prompt` in
+`config.txt`. It's not pixel-faithful like a true Omni model, but it composes
+several references into one image today.
+
 **Multi-reference compose (person + outfit, etc.)** needs a model that can read
 several reference images. The options and their status for Z-Image:
 
