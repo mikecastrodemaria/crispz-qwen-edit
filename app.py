@@ -83,26 +83,37 @@ PERFORMANCE = {
     "Quality (20 steps)": (20, 0.0),
     "Base CFG (28 steps)": (28, 4.0),
 }
-# Styles (wrappers de prompt). nom -> (prefixe, suffixe).
-STYLES = {
-    "Cinematic":     ("cinematic film still of ", ", shallow depth of field, dramatic lighting, film grain, highly detailed"),
-    "Photographic":  ("professional photograph of ", ", 50mm, f1.8, natural lighting, sharp focus, realistic"),
-    "Anime":         ("anime artwork of ", ", anime style, key visual, vibrant, studio anime"),
-    "Digital Art":   ("concept art of ", ", digital painting, illustrative, painterly, artstation, highly detailed"),
-    "Fantasy":       ("", ", fantasy art, magical atmosphere, intricate, epic, ethereal light"),
-    "Cyberpunk":     ("", ", cyberpunk, neon lights, futuristic, high tech, dystopian"),
-    "3D Render":     ("", ", 3d render, octane render, volumetric lighting, highly detailed"),
-    "Sharp / 8K":    ("", ", extremely detailed, ultra sharp, high resolution, 8k"),
+# Styles. Format Fooocus: nom -> {"prompt": template avec {prompt} (ou None),
+# "negative_prompt": str}. La vraie biblio est chargee depuis styles/*.json (cf.
+# _load_styles plus bas). Ceci n'est qu'un fallback si le dossier est absent.
+_FALLBACK_STYLES = {
+    "Fooocus Cinematic": {"prompt": "cinematic still {prompt} . emotional, harmonious, vignette, highly detailed, high budget, bokeh, cinemascope, moody, epic, gorgeous, film grain, grainy",
+                          "negative_prompt": "anime, cartoon, graphic, text, painting, crayon, graphite, abstract, glitch, deformed, mutated, ugly, disfigured"},
+    "SAI Photographic": {"prompt": "cinematic photo {prompt} . 35mm photograph, film, bokeh, professional, 4k, highly detailed",
+                         "negative_prompt": "drawing, painting, crayon, sketch, graphite, impressionist, noisy, blurry, soft, deformed, ugly"},
+    "SAI Anime": {"prompt": "anime artwork {prompt} . anime style, key visual, vibrant, studio anime, highly detailed",
+                  "negative_prompt": "photo, deformed, black and white, realism, disfigured, low contrast"},
 }
 
 
-def _apply_styles(prompt, style_names):
-    """Enrobe le prompt avec les styles selectionnes (prefixes + suffixes)."""
-    if not style_names:
-        return prompt or ""
-    pre = "".join(STYLES.get(n, ("", ""))[0] for n in style_names)
-    suf = "".join(STYLES.get(n, ("", ""))[1] for n in style_names)
-    return f"{pre}{prompt or ''}{suf}".strip()
+def _apply_styles(prompt, negative, style_names):
+    """Applique les styles Fooocus: enchaine les templates {prompt} et cumule les
+    negative_prompt. Renvoie (prompt_final, negative_final)."""
+    cur = (prompt or "").strip()
+    negs = [(negative or "").strip()] if (negative or "").strip() else []
+    for n in (style_names or []):
+        s = STYLES.get(n)
+        if not s:
+            continue
+        tmpl = s.get("prompt")
+        if tmpl and "{prompt}" in tmpl:
+            cur = tmpl.replace("{prompt}", cur).strip()
+        elif tmpl:
+            cur = f"{cur}, {tmpl}".strip(" ,")
+        neg = s.get("negative_prompt")
+        if neg:
+            negs.append(neg)
+    return cur.strip(" ,"), ", ".join(negs)
 
 
 # ----------------------------------------------------------------------------
@@ -191,6 +202,30 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PREFS_PATH = os.path.join(HERE, "preferences.json")
 DEFAULT_BASE_REPO = "Tongyi-MAI/Z-Image-Turbo"
 DEFAULT_ESRGAN_DIR = os.path.join(HERE, "upscale_models")
+
+
+def _load_styles():
+    """Charge la biblio de styles depuis styles/*.json (format Fooocus:
+    {name, prompt avec {prompt}, negative_prompt}). Vide -> fallback."""
+    out = {}
+    sdir = os.path.join(HERE, "styles")
+    if os.path.isdir(sdir):
+        for fn in sorted(os.listdir(sdir)):
+            if not fn.lower().endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(sdir, fn), "r", encoding="utf-8") as f:
+                    for s in (json.load(f) or []):
+                        name = s.get("name")
+                        if name:
+                            out[name] = {"prompt": s.get("prompt"),
+                                         "negative_prompt": s.get("negative_prompt", "")}
+            except Exception:
+                pass
+    return out
+
+
+STYLES = _load_styles() or _FALLBACK_STYLES
 
 
 def _load_prefs_raw():
@@ -1101,7 +1136,7 @@ def _ui_generate(prompt, negative, styles, use_input, input_image,
     try:
         set_offload_mode(offload_mode)
         set_guidance(guidance)
-        full_prompt = _apply_styles(prompt, styles)
+        full_prompt, full_negative = _apply_styles(prompt, negative, styles)
         mode = "img2img/upscale" if (use_input and input_image is not None) else "txt2img"
         _log(f"Generate ({mode})")
         _dbg(f"params: mode={mode} use_input={use_input} has_img={input_image is not None} "
@@ -1127,7 +1162,7 @@ def _ui_generate(prompt, negative, styles, use_input, input_image,
                 break
             s = (int(seed) + i) if int(seed) >= 0 else -1
             progress(i / n, desc=f"Image {i + 1}/{n}")
-            img, t = txt2img_run(full_prompt, width, height, gen_steps, s, negative,
+            img, t = txt2img_run(full_prompt, width, height, gen_steps, s, full_negative,
                                  upscale=False, steps=refine_steps)
             images.append(img)
             total_t += t["txt2img"]
