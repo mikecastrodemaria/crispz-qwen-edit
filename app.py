@@ -1856,6 +1856,12 @@ def build_ui():
                             gr.Markdown("*Compose from up to 4 reference images + a prompt. "
                                         "Set **Input mode = Reference (Omni)** above. "
                                         "Uses width/height/steps/guidance from Settings.*")
+                            gr.Markdown("> Needs a Z-Image Omni/Edit model (with SigLIP). Not yet "
+                                        "released by Tongyi - check below; set it in Models > Omni "
+                                        "once available.")
+                            with gr.Row():
+                                omni_check_btn2 = gr.Button("Check Omni model availability", size="sm")
+                                omni_status2 = gr.Markdown("")
                             with gr.Row():
                                 ref1 = gr.Image(type="pil", label="Ref 1", height=220)
                                 ref2 = gr.Image(type="pil", label="Ref 2", height=220)
@@ -1996,6 +2002,7 @@ def build_ui():
         omni_model_tb.change(lambda r: (set_omni_model(r), f"Omni model set: {r or '(none)'}")[1],
                              [omni_model_tb], [omni_status])
         omni_check_btn.click(_ui_check_omni, None, [omni_status])
+        omni_check_btn2.click(_ui_check_omni, None, [omni_status2])
         log_level_dd.change(set_log_level, [log_level_dd], [log_level_status])
         detect_btn.click(_ui_detect_ollama, [ollama_url], [ollama_model, ollama_status])
         describe_btn.click(_ui_describe, [describe_img, ollama_model, ollama_url], [prompt, describe_status])
