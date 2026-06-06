@@ -843,9 +843,17 @@ def _ensure_base():
     t0 = time.time()
     kwargs = {}
     if ZIMAGE_TRANSFORMER:
-        _log(f"loading Z-Image transformer (single-file): {ZIMAGE_TRANSFORMER} ...")
-        kwargs["transformer"] = ZImageTransformer2DModel.from_single_file(
-            ZIMAGE_TRANSFORMER, torch_dtype=DTYPE)
+        if _is_single_file(ZIMAGE_TRANSFORMER):
+            _log(f"loading Z-Image transformer (single-file): {ZIMAGE_TRANSFORMER} ...")
+            kwargs["transformer"] = ZImageTransformer2DModel.from_single_file(
+                ZIMAGE_TRANSFORMER, torch_dtype=DTYPE)
+        else:
+            # repo HF / dossier diffusers -> charge le sous-dossier 'transformer'
+            # (utile pour les modeles comme Juggernaut-Z dont le tokenizer est
+            # incomplet: on garde VAE + encodeur + tokenizer du repo de base).
+            _log(f"loading Z-Image transformer (repo subfolder): {ZIMAGE_TRANSFORMER} ...")
+            kwargs["transformer"] = ZImageTransformer2DModel.from_pretrained(
+                ZIMAGE_TRANSFORMER, subfolder="transformer", torch_dtype=DTYPE)
     _log(f"loading Z-Image base: {BASE_REPO} (offload={OFFLOAD_MODE}, dtype=bf16) ... "
          "first time downloads from HF, then cached")
     pipe = ZImagePipeline.from_pretrained(BASE_REPO, torch_dtype=DTYPE, **kwargs)
@@ -1443,6 +1451,17 @@ def _apply_checkpoint(name):
     path = name if os.path.isabs(name) else os.path.join(CHECKPOINTS_DIR, name)
     set_zimage_transformer(path)
     return f"Z-Image transformer: {os.path.basename(path)} (reload on next run)."
+
+
+def _apply_transformer_repo(repo):
+    """Definit le transformer depuis un repo HF / dossier diffusers (sous-dossier
+    'transformer') OU un .safetensors. Vide -> revient au transformer du base repo.
+    Utile pour Juggernaut-Z (garde VAE/encodeur/tokenizer du base = Turbo)."""
+    repo = (repo or "").strip()
+    set_zimage_transformer(repo)
+    if not repo:
+        return "Transformer: from base repo."
+    return f"Transformer override: {repo} (keeps base VAE/encoder/tokenizer; reload on next run)."
 
 
 def _refresh_loras(new_dir):
@@ -2174,6 +2193,14 @@ def build_ui():
                                                   value="(base repo)", label="Z-Image checkpoint", scale=3)
                             ckpt_refresh_btn = gr.Button("Refresh", size="sm", scale=1)
                         ckpt_status = gr.Markdown("")
+                        with gr.Row():
+                            transformer_tb = gr.Textbox(
+                                value="", scale=3,
+                                label="Transformer override (HF repo / diffusers folder)",
+                                placeholder="e.g. RunDiffusion/Juggernaut-Z-Image",
+                                info="For community models with an incomplete tokenizer (Juggernaut-Z): "
+                                     "loads only the transformer, keeps base VAE/encoder. Set base = Turbo.")
+                            transformer_apply_btn = gr.Button("Apply", size="sm", scale=1, variant="primary")
 
                         gr.Markdown("### LoRA (up to 3, combinable)")
                         lora_dir_tb = gr.Textbox(value=LORAS_DIR, label="LoRA folder")
@@ -2229,6 +2256,7 @@ def build_ui():
         save_paths_btn.click(_save_paths_to_prefs, [esrgan_dir_tb, zimage_model_tb], [paths_status])
         ckpt_refresh_btn.click(_refresh_checkpoints, [ckpt_dir_tb], [ckpt_dd, ckpt_status])
         ckpt_dd.change(_apply_checkpoint, [ckpt_dd], [ckpt_status])
+        transformer_apply_btn.click(_apply_transformer_repo, [transformer_tb], [ckpt_status])
         lora_refresh_btn.click(_refresh_loras, [lora_dir_tb],
                                [lora_dd1, lora_dd2, lora_dd3, lora_status])
         _lora_slots = [lora_dd1, lw1, lora_dd2, lw2, lora_dd3, lw3]

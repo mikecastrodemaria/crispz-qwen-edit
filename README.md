@@ -190,6 +190,23 @@ Steps:
 Only edit the **Z-Image base** field if you have a full **diffusers folder**
 (then use **Apply Z-Image**).
 
+### Community full-repo models (e.g. Juggernaut-Z-Image)
+
+Some community models ship as a **full diffusers repo** but with an **incomplete
+tokenizer** (only `tokenizer.json`), so loading them as the **base** fails. Load
+just their **transformer** instead and keep the base components from Turbo:
+
+1. **Models → "Transformer override (HF repo / diffusers folder)"** = e.g.
+   `RunDiffusion/Juggernaut-Z-Image` → **Apply**.
+2. Leave **Z-Image base** = `Tongyi-MAI/Z-Image-Turbo` (provides VAE + Qwen3
+   encoder + tokenizer).
+3. **Generate** (downloads the transformer once, ~12 GB).
+
+CLI equivalent: `--zimage-transformer RunDiffusion/Juggernaut-Z-Image`.
+
+Juggernaut-Z is a **Z-Image Base** fine-tune → set **Performance = "Base CFG"**
+(guidance ~6, 25-45 steps). Tested working.
+
 **Gotchas**
 
 - Checkpoints must be **BF16/FP16**. FP8 / GGUF / SVDQ (ComfyUI) variants do **not**
