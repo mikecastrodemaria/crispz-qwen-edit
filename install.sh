@@ -92,11 +92,14 @@ echo
 $RUNPY -c "from diffusers import ZImageImg2ImgPipeline; print('ZImageImg2ImgPipeline OK')"
 echo
 
-# 7) Deps FaceSwap (optionnelles, par defaut ON ; --no-faceswap pour sauter)
+# 7) Deps optionnelles (par defaut ON ; --no-faceswap pour sauter): FaceSwap + extras
 if [ "$FACESWAP" -eq 1 ]; then
     echo "Installation des deps FaceSwap (insightface + onnxruntime-gpu)..."
     $RUNPY -m pip install -r requirements-faceswap.txt || \
         echo "[AVERT] echec install FaceSwap (non bloquant). La feature restera desactivee."
+    echo "Installation des extras (rembg pour Remove BG)..."
+    $RUNPY -m pip install -r requirements-extra.txt || \
+        echo "[AVERT] echec install extras (non bloquant)."
     echo
 fi
 

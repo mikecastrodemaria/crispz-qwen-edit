@@ -108,11 +108,14 @@ if errorlevel 1 (
 )
 echo.
 
-REM 7) Deps FaceSwap (optionnelles, par defaut ON ; --no-faceswap pour sauter)
+REM 7) Deps optionnelles (par defaut ON ; --no-faceswap pour sauter): FaceSwap + extras
 if "!FACESWAP!"=="1" (
     echo Installation des deps FaceSwap ^(insightface + onnxruntime-gpu^)...
     !RUNPY! -m pip install -r requirements-faceswap.txt
     if errorlevel 1 echo [AVERT] echec install FaceSwap ^(non bloquant^). La feature restera desactivee.
+    echo Installation des extras ^(rembg pour Remove BG^)...
+    !RUNPY! -m pip install -r requirements-extra.txt
+    if errorlevel 1 echo [AVERT] echec install extras ^(non bloquant^).
     echo.
 )
 

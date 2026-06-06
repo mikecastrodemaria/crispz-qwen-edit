@@ -1,0 +1,3 @@
+# Optional extras (local tools that don't need a Z-Image model).
+# Install:  .venv/Scripts/python -m pip install -r requirements-extra.txt
+rembg          # Remove BG tab (downloads the u2net model on first use)

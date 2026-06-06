@@ -290,6 +290,16 @@ def _faceswap(target_img, source_img):
         res = _FACE_SWAPPER.get(res, f, src_face, paste_back=True)
     return Image.fromarray(res[:, :, ::-1])  # BGR -> RGB
 
+
+def _remove_bg(image):
+    """Detoure le sujet (fond transparent). Local via rembg (telecharge u2net au
+    1er usage). Renvoie une image RGBA."""
+    try:
+        from rembg import remove
+    except Exception:
+        raise RuntimeError("rembg not installed. pip install rembg (or requirements-faceswap.txt).")
+    return remove(image.convert("RGBA"))
+
 # ----------------------------------------------------------------------------
 # Config (persistance dans preferences.json a cote de app.py)
 # Ordre de priorite pour ESRGAN_DIR et BASE_REPO:
@@ -1507,6 +1517,25 @@ def _ui_compose(r1, r2, r3, r4, model, url):
     return gr.update(value=merged), f"Composed one prompt from {len(refs)} image(s) via {model}."
 
 
+def _ui_remove_bg(image, history, save_mode, output_dir):
+    """Remove background -> resultat (PNG transparent) dans la galerie + historique."""
+    if image is None:
+        return [], "Drop an image first.", history, history
+    try:
+        res = _remove_bg(image)
+    except Exception as e:
+        return [], f"Remove BG failed: {e}", history, history
+    if save_mode != "display":
+        try:
+            dst = build_output_path(None, save_mode, output_dir, "png", tag="nobg", size=res.size)
+            if dst:
+                save_image(res, dst, "png")
+        except Exception as e:
+            _dbg(f"save nobg failed: {e}")
+    new_hist = ([res] + list(history or []))[:200]
+    return [res], "Background removed (transparent PNG).", new_hist, new_hist
+
+
 def _ui_clear_history():
     """Vide l'historique de session (state + galerie)."""
     return [], []
@@ -1908,6 +1937,12 @@ def build_ui():
                                                     variant="primary", size="sm")
                             compose_status = gr.Markdown("")
 
+                        with gr.Tab("Remove BG"):
+                            rembg_img = gr.Image(type="pil", label="Image", height=280)
+                            rembg_btn = gr.Button("Remove background", variant="primary", size="sm")
+                            rembg_status = gr.Markdown("*Local (rembg). Output = transparent PNG. "
+                                                       "First use downloads the u2net model.*")
+
                         with gr.Tab("Reference (Omni)", visible=omni_on):
                             gr.Markdown("*Compose from up to 4 reference images + a prompt. "
                                         "Set **Input mode = Reference (Omni)** above. "
@@ -2065,6 +2100,8 @@ def build_ui():
         improve_btn.click(_ui_improve, [prompt, ollama_model, ollama_url], [prompt, improve_status])
         compose_btn.click(_ui_compose, [cref1, cref2, cref3, cref4, ollama_model, ollama_url],
                           [prompt, compose_status])
+        rembg_btn.click(_ui_remove_bg, [rembg_img, history, save_mode, output_dir],
+                        [out, report, history, history_gallery])
         # Stop facon Fooocus: tourne en parallele du Generate (thread separe) et pose
         # le flag d'arret + interrompt la boucle de debruitage en cours.
         stop_btn.click(request_stop, None, [report])
