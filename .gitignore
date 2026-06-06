@@ -45,6 +45,9 @@ output/
 # --- Images de test locales (essais, non versionnees) ---
 tests/
 
+# --- Vignettes de styles (samples Fooocus, locales, ~8 Mo, non versionnees) ---
+styles/samples/
+
 # --- OS / editeurs ---
 .DS_Store
 Thumbs.db

@@ -96,6 +96,28 @@ _FALLBACK_STYLES = {
 }
 
 
+def _style_sample(name):
+    """Chemin de la vignette d'un style (styles/samples/<nom>.jpg) ou None."""
+    try:
+        fn = name.lower().replace(" ", "_").replace("-", "_") + ".jpg"
+        p = os.path.join(HERE, "styles", "samples", fn)
+        return p if os.path.isfile(p) else None
+    except Exception:
+        return None
+
+
+def _filter_styles(query, selected):
+    """Filtre la liste des styles par recherche. Conserve les styles deja coches.
+    Renvoie (update CheckboxGroup, galerie de vignettes des resultats)."""
+    q = (query or "").strip().lower()
+    matches = [n for n in STYLES if q in n.lower()] if q else list(STYLES)
+    selected = [s for s in (selected or []) if s in STYLES]
+    # choices = resultats + styles coches (pour ne pas perdre la selection)
+    choices = list(dict.fromkeys(matches + selected))
+    gallery = [(_style_sample(n), n) for n in matches[:120] if _style_sample(n)]
+    return gr.update(choices=choices, value=selected), gallery
+
+
 def _apply_styles(prompt, negative, style_names):
     """Applique les styles Fooocus: enchaine les templates {prompt} et cumule les
     negative_prompt. Renvoie (prompt_final, negative_final)."""
@@ -1383,9 +1405,14 @@ def build_ui():
                                          label="Seed (-1 = random)", precision=0)
 
                     with gr.Tab("Styles"):
+                        style_search = gr.Textbox(show_label=False, container=False,
+                                                  placeholder="Search styles... (e.g. anime, cinematic, sai)")
                         styles = gr.CheckboxGroup(list(STYLES), value=CONFIG.get("default_styles", []),
-                                                  label="Styles",
-                                                  info="Wraps your prompt with style words (combinable).")
+                                                  label="Styles (combinable)")
+                        style_gallery = gr.Gallery(label="Previews (search to filter)", height=260,
+                                                   columns=4, object_fit="cover", show_download_button=False,
+                                                   value=[(_style_sample(n), n) for n in list(STYLES)[:40]
+                                                          if _style_sample(n)])
 
                     with gr.Tab("Prompt AI"):
                         ollama_url = gr.Textbox(value=OLLAMA_URL, label="Ollama URL",
@@ -1430,6 +1457,7 @@ def build_ui():
         use_input.change(lambda v: gr.update(visible=bool(v)), use_input, input_group)
         aspect.change(_set_aspect, [aspect], [width, height])
         performance.change(_set_performance, [performance], [gen_steps, guidance])
+        style_search.change(_filter_styles, [style_search, styles], [styles, style_gallery])
 
         # Actions
         refresh_btn.click(_refresh_models, [esrgan_dir_tb], [esrgan, paths_status])
