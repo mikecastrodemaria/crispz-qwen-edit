@@ -9,6 +9,7 @@ USE_VENV=1
 for a in "$@"; do
     case "$a" in
         --no-venv|--system) USE_VENV=0 ;;
+        --debug) export CRISPZ_LOG_LEVEL=debug ;;
     esac
 done
 
@@ -35,6 +36,7 @@ fi
 echo "=== crispz-studio - run ==="
 echo "Python     = $RUNPY"
 echo "ESRGAN_DIR = $ESRGAN_DIR"
+[ -n "$CRISPZ_LOG_LEVEL" ] && echo "Log level  = $CRISPZ_LOG_LEVEL  (run.sh --debug)"
 echo
 echo "--- Detection hardware ---"
 $RUNPY _hw_check.py

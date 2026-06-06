@@ -139,6 +139,7 @@ def _ollama_vision_models(base=None):
 
 def _ollama_describe(image, model, base=None):
     """Decrit l'image en un prompt text-to-image via un modele vision Ollama."""
+    _dbg(f"ollama describe: url={base or OLLAMA_URL} model={model}")
     b64 = _pil_to_b64_jpeg(image, max_side=1024)
     instr = ("You are an expert text-to-image prompt writer. Look at the image and output ONE "
              "detailed prompt as comma-separated visual tags (subject, clothing, setting, lighting, "
@@ -261,14 +262,39 @@ def set_guidance(g):
     GUIDANCE = float(g)
 
 
-# Logs d'etape sur stderr (chargement modeles, etages, tuiles). Coupes par --quiet.
+# Niveau de log sur stderr. 0 = quiet, 1 = info (etapes), 2 = debug (params, etat
+# pipe, timings detailles -> aide au dev). Source: env CRISPZ_LOG_LEVEL, sinon 1.
 # stderr donc ne pollue pas le stdout de --print-output.
-VERBOSE = True
+_LOG_NAMES = {"quiet": 0, "info": 1, "debug": 2, "0": 0, "1": 1, "2": 2}
 
 
-def _log(msg):
-    if VERBOSE:
+def _parse_log_level(v, default=1):
+    if v is None:
+        return default
+    return _LOG_NAMES.get(str(v).strip().lower(), default)
+
+
+LOG_LEVEL = _parse_log_level(os.environ.get("CRISPZ_LOG_LEVEL"), 1)
+VERBOSE = True  # back-compat (non utilise pour le gating)
+
+
+def set_log_level(level):
+    """Regle le niveau de log (quiet/info/debug ou 0/1/2). Renvoie un libelle."""
+    global LOG_LEVEL
+    LOG_LEVEL = _parse_log_level(level, LOG_LEVEL)
+    name = {0: "quiet", 1: "info", 2: "debug"}.get(LOG_LEVEL, str(LOG_LEVEL))
+    return f"Log level: {name}"
+
+
+def _log(msg, level=1):
+    if LOG_LEVEL >= level:
         print(f"[crispz] {msg}", file=sys.stderr, flush=True)
+
+
+def _dbg(msg):
+    """Log niveau debug (visible seulement en LOG_LEVEL >= 2)."""
+    if LOG_LEVEL >= 2:
+        print(f"[crispz][dbg] {msg}", file=sys.stderr, flush=True)
 
 
 # Hook de progression UI (gradio gr.Progress). None hors UI (CLI/serveur). Permet
@@ -293,12 +319,15 @@ def request_stop():
     les boucles batch/tuiles (_STOP). Quasi-immediat (s'arrete au pas suivant)."""
     global _STOP
     _STOP = True
+    n = 0
     for p in [_BASE_PIPE] + list(_DERIVED.values()):
         if p is not None:
             try:
                 p._interrupt = True
+                n += 1
             except Exception:
                 pass
+    _log(f"STOP requested (interrupt set on {n} pipeline(s))")
     return "Stopping..."
 
 
@@ -461,9 +490,12 @@ def _ensure_base():
     single-file (Civitai) et l'offload. Cache par (repo, transformer, offload)."""
     global _BASE_PIPE, _DERIVED, _LOADED_KEY
     key = (BASE_REPO, ZIMAGE_TRANSFORMER, OFFLOAD_MODE)
+    _dbg(f"_ensure_base key={key} cached={_LOADED_KEY}")
     if _BASE_PIPE is not None and _LOADED_KEY == key:
+        _dbg("base pipeline: reusing cached (no reload)")
         return _BASE_PIPE
     if _BASE_PIPE is not None:
+        _dbg("base pipeline: key changed -> free + reload")
         free_vram()
     from diffusers import ZImagePipeline, ZImageTransformer2DModel
     t0 = time.time()
@@ -498,6 +530,7 @@ def get_pipe(kind="img2img"):
     via from_pipe (composants partages, aucune VRAM en double)."""
     base = _ensure_base()
     if kind in _DERIVED:
+        _dbg(f"get_pipe('{kind}'): reuse derived")
         return _DERIVED[kind]
     from diffusers import ZImageImg2ImgPipeline, ZImageInpaintPipeline
     cls = {"img2img": ZImageImg2ImgPipeline, "inpaint": ZImageInpaintPipeline}.get(kind)
@@ -521,6 +554,10 @@ def generate(prompt, width, height, steps, seed, negative_prompt=""):
     w = round_to_multiple(int(width))
     h = round_to_multiple(int(height))
     _log(f"txt2img: {w}x{h}, {int(steps)} steps, guidance {GUIDANCE:.1f} ...")
+    _dbg(f"txt2img seed={seed} dtype=bf16 device={DEVICE} offload={OFFLOAD_MODE} "
+         f"transformer={'single-file' if ZIMAGE_TRANSFORMER else 'repo'}")
+    if DEVICE == "cuda":
+        _dbg(f"VRAM before: alloc={torch.cuda.memory_allocated()/1024**3:.2f} Go")
     _progress(0.1, f"Generating {w}x{h} ({int(steps)} steps)...")
     t0 = time.time()
     img = pipe(
@@ -532,6 +569,9 @@ def generate(prompt, width, height, steps, seed, negative_prompt=""):
         generator=_make_generator(seed),
     ).images[0]
     _log(f"txt2img done in {time.time() - t0:.1f}s")
+    if DEVICE == "cuda":
+        _dbg(f"VRAM peak: alloc={torch.cuda.max_memory_allocated()/1024**3:.2f} Go | "
+             f"reserved={torch.cuda.max_memory_reserved()/1024**3:.2f} Go")
     gc.collect()
     if DEVICE == "cuda":
         torch.cuda.empty_cache()
@@ -629,6 +669,8 @@ def process_one(image, esrgan_model, factor, denoise, steps, prompt, seed, tile,
     timings = {}
     image = image.convert("RGB")
     w0, h0 = image.size
+    _dbg(f"process_one in={w0}x{h0} factor={factor} denoise={denoise} steps={int(steps)} "
+         f"do_esrgan={do_esrgan} esrgan={esrgan_model} refine_tile={int(refine_tile)}")
 
     # Etage 1 : ESRGAN (saute si do_esrgan=False -> img2img pur)
     if do_esrgan and esrgan_model:
@@ -1060,7 +1102,16 @@ def _ui_generate(prompt, negative, styles, use_input, input_image,
         set_offload_mode(offload_mode)
         set_guidance(guidance)
         full_prompt = _apply_styles(prompt, styles)
+        mode = "img2img/upscale" if (use_input and input_image is not None) else "txt2img"
+        _log(f"Generate ({mode})")
+        _dbg(f"params: mode={mode} use_input={use_input} has_img={input_image is not None} "
+             f"size={int(width)}x{int(height)} gen_steps={int(gen_steps)} n={int(image_number)} "
+             f"seed={int(seed)} guidance={float(guidance)} offload={offload_mode} styles={styles}")
+        _dbg(f"prompt='{(full_prompt or '')[:160]}' | negative='{(negative or '')[:80]}'")
         if use_input and input_image is not None:
+            _dbg(f"img2img: esrgan={esrgan_model} do_esrgan={do_esrgan} factor={factor} "
+                 f"denoise={denoise} refine_steps={int(refine_steps)} tile={int(tile)} "
+                 f"refine_tile={int(refine_tile)} model={BASE_REPO} transformer={ZIMAGE_TRANSFORMER}")
             last_result, last_source, report = run(
                 input_image, None, esrgan_model, factor, denoise, refine_steps, full_prompt, seed,
                 tile, overlap, save_mode=save_mode, output_dir=output_dir,
@@ -1226,6 +1277,12 @@ def build_ui():
                                                    interactive=True)
                         ollama_status = gr.Markdown("*Click Detect. If Ollama is off, Describe falls "
                                                     "back to a local BLIP captioner.*")
+                        gr.Markdown("---")
+                        log_level_dd = gr.Dropdown(["quiet", "info", "debug"],
+                                                   value={0: "quiet", 1: "info", 2: "debug"}.get(LOG_LEVEL, "info"),
+                                                   label="Console log level (dev)",
+                                                   info="debug = full params, pipe state, VRAM in the .bat console.")
+                        log_level_status = gr.Markdown("")
 
                     with gr.Tab("Models"):
                         zimage_model_tb = gr.Textbox(
@@ -1259,6 +1316,7 @@ def build_ui():
         refresh_btn.click(_refresh_models, [esrgan_dir_tb], [esrgan, paths_status])
         apply_zimage_btn.click(_apply_zimage, [zimage_model_tb], [paths_status])
         save_paths_btn.click(_save_paths_to_prefs, [esrgan_dir_tb, zimage_model_tb], [paths_status])
+        log_level_dd.change(set_log_level, [log_level_dd], [log_level_status])
         detect_btn.click(_ui_detect_ollama, [ollama_url], [ollama_model, ollama_status])
         describe_btn.click(_ui_describe, [describe_img, ollama_model, ollama_url], [prompt, describe_status])
         improve_btn.click(_ui_improve, [prompt, ollama_model, ollama_url], [prompt, improve_status])
@@ -1469,6 +1527,9 @@ def cli_main(argv=None):
     parser.add_argument("--time-log", default=None,
                         help="If set, append the time of each run to this file (TSV)")
     parser.add_argument("--quiet", action="store_true", help="Reduce stdout verbosity")
+    parser.add_argument("--log-level", choices=["quiet", "info", "debug"], default=None,
+                        help="Console log level on stderr. debug = full params/state (dev). "
+                             "Default from env CRISPZ_LOG_LEVEL or 'info'.")
     parser.add_argument("--report-vram", action="store_true",
                         help="Print the run VRAM peak on stderr (line '[VRAM] ...'). "
                              "Used to size coexistence with Fooocus.")
@@ -1479,8 +1540,12 @@ def cli_main(argv=None):
     args = parser.parse_args(argv)
     apply_preset_to_args(args, argv if argv is not None else sys.argv[1:])
 
-    global VERBOSE
-    VERBOSE = not args.quiet
+    global LOG_LEVEL
+    if args.log_level:
+        LOG_LEVEL = _parse_log_level(args.log_level)
+    elif args.quiet:
+        LOG_LEVEL = 0
+    _log(f"log level = {LOG_LEVEL} (0=quiet 1=info 2=debug)")
 
     if args.esrgan_dir:
         set_esrgan_dir(args.esrgan_dir)

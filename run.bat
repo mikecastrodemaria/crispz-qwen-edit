@@ -10,6 +10,7 @@ set USE_VENV=1
 if "%~1"=="" goto argdone
 if /I "%~1"=="--no-venv" set USE_VENV=0
 if /I "%~1"=="--system" set USE_VENV=0
+if /I "%~1"=="--debug" set CRISPZ_LOG_LEVEL=debug
 shift
 goto argloop
 :argdone
@@ -38,6 +39,7 @@ if "%ESRGAN_DIR%"=="" (
 echo === crispz-studio - run ===
 echo Python     = !RUNPY!
 echo ESRGAN_DIR = !ESRGAN_DIR!
+if defined CRISPZ_LOG_LEVEL echo Log level  = !CRISPZ_LOG_LEVEL!  (run.bat --debug)
 echo.
 echo --- Detection hardware ---
 !RUNPY! _hw_check.py
