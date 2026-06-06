@@ -550,6 +550,52 @@ def set_loras_dir(path):
         LORAS_DIR = path
 
 
+def _read_safetensors_metadata(path):
+    """Lit le header JSON (__metadata__) d'un .safetensors SANS charger les poids."""
+    import struct
+    with open(path, "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        header = f.read(n)
+    return (json.loads(header.decode("utf-8")) or {}).get("__metadata__", {}) or {}
+
+
+def lora_keywords(path):
+    """Extrait les mots-cles / trigger words d'une LoRA depuis ses metadonnees:
+    champs trigger explicites + top tags d'entrainement (ss_tag_frequency)."""
+    if not path or not os.path.isfile(path):
+        return ""
+    try:
+        meta = _read_safetensors_metadata(path)
+    except Exception as e:
+        _dbg(f"lora metadata read failed: {e}")
+        return ""
+    words = []
+    for k in ("ss_trigger_words", "modelspec.trigger_phrase", "trigger_words",
+              "activation text", "ss_activation_text"):
+        v = meta.get(k)
+        if v:
+            words.append(v if isinstance(v, str) else ", ".join(map(str, v)))
+    tf = meta.get("ss_tag_frequency")
+    if tf:
+        try:
+            d = json.loads(tf) if isinstance(tf, str) else tf
+            counts = {}
+            for ds in d.values():
+                for tag, c in ds.items():
+                    counts[tag] = counts.get(tag, 0) + int(c)
+            words.extend(sorted(counts, key=counts.get, reverse=True)[:15])
+        except Exception:
+            pass
+    seen, out = set(), []
+    for w in words:
+        for part in str(w).split(","):
+            part = part.strip()
+            if part and part.lower() not in seen:
+                seen.add(part.lower())
+                out.append(part)
+    return ", ".join(out)
+
+
 def set_lora(name, weight):
     """Selectionne une LoRA (nom de fichier du dossier loras, ou '' / 'None' pour
     aucune) + son poids. Invalide le pipe si change (re-application au chargement)."""
@@ -1294,6 +1340,34 @@ def _apply_lora(name, weight):
             if LORA_PATH else "LoRA: none.")
 
 
+def _ui_lora_select(name, weight):
+    """Selectionne la LoRA + extrait ses mots-cles (trigger words / top tags)."""
+    status = _apply_lora(name, weight)
+    kw = lora_keywords(LORA_PATH) if LORA_PATH else ""
+    return status, kw
+
+
+def _ui_lora_keywords(name):
+    """Recupere les mots-cles de la LoRA selectionnee (bouton)."""
+    if not name or name in ("None", "none", ""):
+        return "", "Select a LoRA first."
+    path = name if os.path.isabs(name) else os.path.join(LORAS_DIR, name)
+    kw = lora_keywords(path)
+    return kw, (f"{len(kw.split(','))} keyword(s) found." if kw
+                else "No keywords in this LoRA's metadata.")
+
+
+def _ui_kw_to_prompt(prompt_text, keywords):
+    """Ajoute les mots-cles a la fin du prompt courant."""
+    kw = (keywords or "").strip().strip(",").strip()
+    if not kw:
+        return gr.update()
+    base = (prompt_text or "").strip()
+    if base and not base.endswith(","):
+        base += ", "
+    return gr.update(value=base + kw)
+
+
 def _ui_check_omni():
     return check_omni_available()
 
@@ -1788,6 +1862,12 @@ def build_ui():
                             lora_refresh_btn = gr.Button("Refresh", size="sm", scale=1)
                         lora_weight = gr.Slider(0.0, 2.0, value=float(LORA_WEIGHT), step=0.05,
                                                 label="LoRA weight")
+                        lora_keywords_tb = gr.Textbox(label="Keywords / trigger words", lines=2,
+                                                      placeholder="Auto-filled from the LoRA metadata "
+                                                                  "when you pick one.")
+                        with gr.Row():
+                            lora_kw_btn = gr.Button("Get keywords", size="sm")
+                            lora_kw_to_prompt_btn = gr.Button("Add to prompt", size="sm", variant="primary")
                         lora_status = gr.Markdown("")
 
                         gr.Markdown("### Omni / Edit model (multi-reference)")
@@ -1819,8 +1899,10 @@ def build_ui():
         ckpt_refresh_btn.click(_refresh_checkpoints, [ckpt_dir_tb], [ckpt_dd, ckpt_status])
         ckpt_dd.change(_apply_checkpoint, [ckpt_dd], [ckpt_status])
         lora_refresh_btn.click(_refresh_loras, [lora_dir_tb], [lora_dd, lora_status])
-        lora_dd.change(_apply_lora, [lora_dd, lora_weight], [lora_status])
+        lora_dd.change(_ui_lora_select, [lora_dd, lora_weight], [lora_status, lora_keywords_tb])
         lora_weight.change(_apply_lora, [lora_dd, lora_weight], [lora_status])
+        lora_kw_btn.click(_ui_lora_keywords, [lora_dd], [lora_keywords_tb, lora_status])
+        lora_kw_to_prompt_btn.click(_ui_kw_to_prompt, [prompt, lora_keywords_tb], [prompt])
         omni_model_tb.change(lambda r: (set_omni_model(r), f"Omni model set: {r or '(none)'}")[1],
                              [omni_model_tb], [omni_status])
         omni_check_btn.click(_ui_check_omni, None, [omni_status])
