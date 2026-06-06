@@ -1,0 +1,7 @@
+# Optional dependencies for the Face Swap tab (Phase 3).
+# Install into the same venv:  .venv/Scripts/python -m pip install -r requirements-faceswap.txt
+# You also need an inswapper model (inswapper_128.onnx): drop it in the 'faceswap'
+# folder, or set faceswap_model_path / faceswap_model_url in config.txt.
+insightface>=0.7
+onnxruntime-gpu
+# CPU-only machines: use onnxruntime instead of onnxruntime-gpu

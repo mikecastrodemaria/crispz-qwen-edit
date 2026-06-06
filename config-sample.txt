@@ -29,6 +29,7 @@
     "default_lora_weight": 1.0,
     "zimage_omni_model": "",
     "faceswap_model_path": "",
+    "faceswap_model_url": "",
 
     "default_save_mode": "display",
     "default_output_dir": "out",

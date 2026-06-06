@@ -219,6 +219,32 @@ _FACE_APP = None
 _FACE_SWAPPER = None
 
 
+def _resolve_faceswap_model():
+    """Trouve le modele inswapper: faceswap_model_path, sinon recherche dans des
+    emplacements usuels, sinon telechargement si faceswap_model_url est defini."""
+    cfg = (os.environ.get("FACESWAP_MODEL") or CONFIG.get("faceswap_model_path") or "").strip()
+    cands = [cfg] if cfg else []
+    search_dirs = [os.path.join(HERE, "faceswap"), os.path.join(HERE, "models"),
+                   CHECKPOINTS_DIR, os.path.join(os.path.expanduser("~"), ".insightface", "models")]
+    for d in search_dirs:
+        cands += [os.path.join(d, "inswapper_128.onnx"),
+                  os.path.join(d, "inswapper_128_fp16.onnx")]
+    for p in cands:
+        if p and os.path.isfile(p):
+            return p
+    # Telechargement optionnel (URL fournie par l'utilisateur dans config.txt).
+    url = (CONFIG.get("faceswap_model_url") or "").strip()
+    if url:
+        import urllib.request
+        dst_dir = os.path.join(HERE, "faceswap")
+        os.makedirs(dst_dir, exist_ok=True)
+        dst = os.path.join(dst_dir, "inswapper_128.onnx")
+        _log(f"downloading inswapper model from {url} ...")
+        urllib.request.urlretrieve(url, dst)
+        return dst
+    return None
+
+
 def _faceswap(target_img, source_img):
     """Remplace le(s) visage(s) de target_img par celui de source_img."""
     global _FACE_APP, _FACE_SWAPPER
@@ -227,9 +253,12 @@ def _faceswap(target_img, source_img):
         from insightface.app import FaceAnalysis
     except Exception:
         raise RuntimeError("insightface not installed (pip install insightface onnxruntime-gpu).")
-    model_path = (os.environ.get("FACESWAP_MODEL") or CONFIG.get("faceswap_model_path") or "").strip()
-    if not model_path or not os.path.isfile(model_path):
-        raise RuntimeError("Set 'faceswap_model_path' in config.txt to an inswapper .onnx file.")
+    model_path = _resolve_faceswap_model()
+    if not model_path:
+        raise RuntimeError(
+            "inswapper model not found. Put 'inswapper_128.onnx' in the 'faceswap' folder "
+            "(next to app.py), or set 'faceswap_model_path' in config.txt, or set "
+            "'faceswap_model_url' to download it once.")
     if _FACE_APP is None:
         _log("loading insightface buffalo_l (face detection) ...")
         app = FaceAnalysis(name="buffalo_l")

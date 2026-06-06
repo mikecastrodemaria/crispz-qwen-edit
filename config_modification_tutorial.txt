@@ -58,8 +58,12 @@ zimage_omni_model       HF repo id OR local diffusers folder of a Z-Image Omni/E
                         Z-Image-Base. 'Z-Image-Omni-Base' and 'Z-Image-Edit' are still
                         "coming soon". Leave this empty until they ship, then set it
                         (likely "Tongyi-MAI/Z-Image-Omni-Base" or "Tongyi-MAI/Z-Image-Edit").
-faceswap_model_path     Absolute path to an inswapper .onnx file. REQUIRED for the
-                        Face Swap tab (also needs: pip install insightface onnxruntime-gpu).
+faceswap_model_path     Absolute path to an inswapper .onnx file (Face Swap tab). If
+                        empty, the app also looks for inswapper_128.onnx in the
+                        'faceswap' folder (next to app.py), 'models', checkpoints_dir,
+                        and ~/.insightface/models. Needs: pip install insightface onnxruntime-gpu.
+faceswap_model_url      Optional URL to auto-download inswapper_128.onnx once (into the
+                        'faceswap' folder) if the model is not found locally.
 
 default_save_mode       "display" (no save) | "local" | "alongside" | "custom".
 default_output_dir      Folder for "local"/"custom" save modes.

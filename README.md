@@ -65,11 +65,17 @@ Input Image → **Face Swap** tab: a source face + “Apply face swap to result�
 Works on any mode (txt2img / img2img / omni). Requires:
 
 ```bash
-.venv/Scripts/python -m pip install insightface onnxruntime-gpu
+.venv/Scripts/python -m pip install -r requirements-faceswap.txt
 ```
 
-and `"faceswap_model_path": "<path to inswapper .onnx>"` in `config.txt`. If the
+and an **inswapper model**: drop `inswapper_128.onnx` in the `faceswap/` folder
+(auto-detected), or set `faceswap_model_path` / `faceswap_model_url` in `config.txt`.
+The face-detection model (buffalo_l) downloads automatically on first use. If the
 dep/model is missing, the run still succeeds and the report says `faceswap skipped`.
+
+> The inswapper weights are not redistributed here (license). Get them from a
+> Hugging Face mirror, e.g. `ezioruan/inswapper_128.onnx`. Local model files
+> (`faceswap/`, `*.onnx`) are gitignored.
 
 ## Text -> Image
 

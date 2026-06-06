@@ -36,8 +36,10 @@ upscale_models/*
 !upscale_models/.gitkeep
 checkpoints/
 loras/
+faceswap/
 *.pth
 *.safetensors
+*.onnx
 *.pt
 *.ckpt
 *.onnx
