@@ -983,6 +983,49 @@ def round_to_multiple(x, m=16):
     return max(m, int(round(x / m) * m))
 
 
+def _reframe_canvas(image, ratio_w, ratio_h, overlap=8):
+    """Place l'image dans un canevas plus grand au ratio cible (expansion sur 1 axe),
+    + un masque (blanc = a remplir, noir = a garder, avec un petit overlap)."""
+    from PIL import ImageDraw
+    image = image.convert("RGB")
+    w, h = image.size
+    r = ratio_w / ratio_h
+    # Alignement sur 32 (patch 2 x VAE 16): evite les erreurs de conv (no engine).
+    if w / h < r:  # trop etroit -> elargir
+        nw, nh = round_to_multiple(int(round(h * r)), 32), round_to_multiple(h, 32)
+    else:          # trop large -> agrandir en hauteur
+        nw, nh = round_to_multiple(w, 32), round_to_multiple(int(round(w / r)), 32)
+    nw, nh = max(nw, round_to_multiple(w, 32)), max(nh, round_to_multiple(h, 32))
+    ox, oy = (nw - w) // 2, (nh - h) // 2
+    canvas = Image.new("RGB", (nw, nh), (127, 127, 127))
+    canvas.paste(image, (ox, oy))
+    mask = Image.new("L", (nw, nh), 255)
+    ImageDraw.Draw(mask).rectangle(
+        [ox + overlap, oy + overlap, ox + w - overlap, oy + h - overlap], fill=0)
+    return canvas, mask, nw, nh
+
+
+def outpaint(image, ratio_w, ratio_h, prompt, steps, seed):
+    """Reframe / outpainting: agrandit l'image au ratio cible et fait remplir les
+    bords par Z-Image (ZImageInpaintPipeline)."""
+    canvas, mask, nw, nh = _reframe_canvas(image, ratio_w, ratio_h)
+    pipe = get_pipe("inpaint")
+    _log(f"outpaint: {image.size[0]}x{image.size[1]} -> {nw}x{nh}, {int(steps)} steps, "
+         f"guidance {GUIDANCE:.1f} ...")
+    _progress(0.1, f"Outpaint -> {nw}x{nh}...")
+    t0 = time.time()
+    out = pipe(prompt=prompt or "", image=canvas, mask_image=mask, strength=1.0,
+               num_inference_steps=int(steps), guidance_scale=GUIDANCE,
+               generator=_make_generator(seed)).images[0]
+    if out.size != (nw, nh):
+        out = out.resize((nw, nh), Image.LANCZOS)
+    _log(f"outpaint done in {time.time() - t0:.1f}s")
+    gc.collect()
+    if DEVICE == "cuda":
+        torch.cuda.empty_cache()
+    return out
+
+
 def _make_generator(seed):
     return torch.Generator(DEVICE).manual_seed(int(seed)) if int(seed) >= 0 else None
 
@@ -1536,6 +1579,40 @@ def _ui_remove_bg(image, history, save_mode, output_dir):
     return [res], "Background removed (transparent PNG).", new_hist, new_hist
 
 
+def _ui_reframe(image, ratio, steps, prompt, guidance, offload_mode, seed,
+                save_mode, output_dir, output_format, history,
+                progress=gr.Progress(track_tqdm=True)):
+    """Reframe / outpaint -> resultat dans la galerie + historique."""
+    if image is None:
+        return [], "Drop an image first.", history, history
+    global _PROGRESS
+    _PROGRESS = lambda f, d: progress(f, desc=d)
+    try:
+        set_offload_mode(offload_mode)
+        set_guidance(guidance)
+        try:
+            rw, rh = [int(x) for x in str(ratio).split(":")]
+        except Exception:
+            rw, rh = 16, 9
+        try:
+            res = outpaint(image, rw, rh, prompt, steps, seed)
+        except Exception as e:
+            _log(f"outpaint error: {e}")
+            return [], f"Reframe failed: {e}", history, history
+        if save_mode != "display":
+            try:
+                dst = build_output_path(None, save_mode, output_dir, output_format,
+                                        tag="reframe", seed=seed, size=res.size)
+                if dst:
+                    save_image(res, dst, output_format)
+            except Exception as e:
+                _dbg(f"save reframe failed: {e}")
+        new_hist = ([res] + list(history or []))[:200]
+        return [res], f"Reframed to {res.size[0]}x{res.size[1]} ({ratio}).", new_hist, new_hist
+    finally:
+        _PROGRESS = None
+
+
 def _ui_clear_history():
     """Vide l'historique de session (state + galerie)."""
     return [], []
@@ -1943,6 +2020,18 @@ def build_ui():
                             rembg_status = gr.Markdown("*Local (rembg). Output = transparent PNG. "
                                                        "First use downloads the u2net model.*")
 
+                        with gr.Tab("Reframe (outpaint)"):
+                            gr.Markdown("*Expand the image to a new aspect ratio; Z-Image fills "
+                                        "the new borders (inpaint). The prompt guides the fill.*")
+                            reframe_img = gr.Image(type="pil", label="Image", height=260)
+                            with gr.Row():
+                                reframe_ratio = gr.Dropdown(
+                                    ["16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "1:1", "21:9"],
+                                    value="16:9", label="Target ratio")
+                                reframe_steps = gr.Slider(4, 30, value=12, step=1, label="Fill steps")
+                            reframe_btn = gr.Button("Reframe / Outpaint", variant="primary", size="sm")
+                            reframe_status = gr.Markdown("")
+
                         with gr.Tab("Reference (Omni)", visible=omni_on):
                             gr.Markdown("*Compose from up to 4 reference images + a prompt. "
                                         "Set **Input mode = Reference (Omni)** above. "
@@ -2102,6 +2191,10 @@ def build_ui():
                           [prompt, compose_status])
         rembg_btn.click(_ui_remove_bg, [rembg_img, history, save_mode, output_dir],
                         [out, report, history, history_gallery])
+        reframe_btn.click(_ui_reframe,
+                          [reframe_img, reframe_ratio, reframe_steps, prompt, guidance, offload,
+                           seed, save_mode, output_dir, output_format, history],
+                          [out, report, history, history_gallery])
         # Stop facon Fooocus: tourne en parallele du Generate (thread separe) et pose
         # le flag d'arret + interrompt la boucle de debruitage en cours.
         stop_btn.click(request_stop, None, [report])
