@@ -698,9 +698,12 @@ def _load_omni():
     repo = (os.environ.get("ZIMAGE_OMNI_MODEL") or CONFIG.get("zimage_omni_model") or "").strip()
     if not repo:
         raise RuntimeError(
-            "Omni needs a dedicated Z-Image Omni/Edit model (it requires a SigLIP encoder "
-            "that the Turbo model does not ship). Set 'zimage_omni_model' in config.txt "
-            "(HF repo id or local diffusers folder).")
+            "Omni needs a dedicated Z-Image Omni/Edit model (with a SigLIP encoder that "
+            "the Turbo/Base text-to-image models do not ship). As of now Tongyi has only "
+            "released Z-Image-Turbo and Z-Image-Base; 'Z-Image-Omni-Base' and 'Z-Image-Edit' "
+            "are still 'coming soon'. Once published, set 'zimage_omni_model' in config.txt "
+            "to its HF repo id (likely 'Tongyi-MAI/Z-Image-Omni-Base' or 'Tongyi-MAI/"
+            "Z-Image-Edit') or a local diffusers folder.")
     _log(f"loading Z-Image Omni: {repo} (offload={OFFLOAD_MODE}) ...")
     t0 = time.time()
     pipe = ZImageOmniPipeline.from_pretrained(repo, torch_dtype=DTYPE)

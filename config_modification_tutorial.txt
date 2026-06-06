@@ -46,7 +46,12 @@ default_cpu_offload     "none" | "model" (~half VRAM) | "sequential" (~9GB, slow
 
 zimage_omni_model       HF repo id OR local diffusers folder of a Z-Image Omni/Edit
                         model (with a SigLIP encoder). REQUIRED for the Reference
-                        (Omni) multi-image mode. The Turbo model alone cannot do Omni.
+                        (Omni) multi-image mode. The Turbo/Base text-to-image models
+                        cannot do Omni (no SigLIP).
+                        NOTE: as of now Tongyi has released only Z-Image-Turbo and
+                        Z-Image-Base. 'Z-Image-Omni-Base' and 'Z-Image-Edit' are still
+                        "coming soon". Leave this empty until they ship, then set it
+                        (likely "Tongyi-MAI/Z-Image-Omni-Base" or "Tongyi-MAI/Z-Image-Edit").
 faceswap_model_path     Absolute path to an inswapper .onnx file. REQUIRED for the
                         Face Swap tab (also needs: pip install insightface onnxruntime-gpu).
 
