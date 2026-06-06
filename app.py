@@ -21,6 +21,14 @@ import os
 import sys
 import gc
 import io
+import warnings
+
+# Masque les DeprecationWarning Gradio "pass theme/css/js to launch() instead":
+# launch() ne les accepte PAS encore en Gradio 5.x (avertissement anticipe Gradio 6),
+# donc on les garde dans Blocks(...) et on coupe juste le bruit au demarrage.
+warnings.filterwarnings(
+    "ignore", category=DeprecationWarning,
+    message=r"The '(theme|css|js)' parameter in the Blocks constructor will be removed")
 import base64
 import glob
 import time
