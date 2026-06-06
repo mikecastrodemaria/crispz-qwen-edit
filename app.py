@@ -813,40 +813,65 @@ def txt2img_run(prompt, width, height, gen_steps, seed, negative_prompt="",
     return result, timings
 
 
-def build_output_path(source_path, save_mode, output_dir, output_format):
-    """Decide ou ecrire l'image upscale. Renvoie un chemin absolu ou None (display only).
-    - display    : pas de sauvegarde (None)
-    - local      : output_dir relatif au projet
-    - alongside  : dans le dossier de source_path
-    - custom     : output_dir tel quel (peut etre absolu)
-    """
+def _now_stamp():
+    return datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def _unique_path(path):
+    """Evite l'ecrasement: ajoute _2, _3... si le fichier existe deja."""
+    if not os.path.exists(path):
+        return path
+    base, ext = os.path.splitext(path)
+    i = 2
+    while os.path.exists(f"{base}_{i}{ext}"):
+        i += 1
+    return f"{base}_{i}{ext}"
+
+
+def _format_filename(tag, seed, w, h, index=0):
+    """Nom de fichier depuis CONFIG['filename_pattern']. Placeholders: {date} {tag}
+    {seed} {w} {h} {index} {name}. Defaut: date + tag + seed + dimensions + index."""
+    pat = CONFIG.get("filename_pattern", "{date}_{tag}_seed{seed}_{w}x{h}{index}")
+    seed_s = str(int(seed)) if (seed is not None and int(seed) >= 0) else "rand"
+    idx_s = f"_{int(index)}" if index else ""
+    try:
+        name = pat.format(date=_now_stamp(), tag=(tag or "image"), seed=seed_s,
+                          w=(w or 0), h=(h or 0), index=idx_s, name=(tag or "image"))
+    except Exception:
+        name = f"{_now_stamp()}_{tag or 'image'}_seed{seed_s}{idx_s}"
+    name = "".join(c for c in name if c.isalnum() or c in "-_.").strip("_")
+    return name or "image"
+
+
+def build_output_path(source_path, save_mode, output_dir, output_format,
+                      tag=None, seed=None, size=None, index=0):
+    """Chemin de sortie (ou None si display). Le nom suit CONFIG['filename_pattern']
+    (date + seed + tag + dimensions + index) et est rendu UNIQUE (pas d'ecrasement).
+    tag = 'upscaled' / 'txt2img' / 'img2img' (+ nom source si fourni)."""
     if save_mode == "display":
         return None
-
     ext = output_format.lower().lstrip(".")
     if ext not in SUPPORTED_FORMATS:
         ext = "png"
-
-    if source_path:
-        base = os.path.splitext(os.path.basename(source_path))[0]
-    else:
-        base = "image"
-    fname = f"{base}_upscaled.{ext}"
+    if not tag:
+        srcbase = os.path.splitext(os.path.basename(source_path))[0] if source_path else "image"
+        tag = f"{srcbase}_upscaled"
+    w = size[0] if size else 0
+    h = size[1] if size else 0
+    fname = f"{_format_filename(tag, seed, w, h, index)}.{ext}"
 
     if save_mode == "alongside":
         if not source_path:
             raise ValueError("save_mode=alongside requires a source path (CLI or batch folder).")
-        return os.path.join(os.path.dirname(os.path.abspath(source_path)), fname)
-
-    if save_mode == "custom":
+        target_dir = os.path.dirname(os.path.abspath(source_path))
+    elif save_mode == "custom":
         target_dir = output_dir or DEFAULT_OUTPUT_DIR
     else:  # local
         target_dir = output_dir or DEFAULT_OUTPUT_DIR
         if not os.path.isabs(target_dir):
             target_dir = os.path.join(HERE, target_dir)
-
     os.makedirs(target_dir, exist_ok=True)
-    return os.path.join(target_dir, fname)
+    return _unique_path(os.path.join(target_dir, fname))
 
 
 def save_image(img, dst_path, output_format):
@@ -933,7 +958,10 @@ def run(image, source_folder, esrgan_model, factor, denoise, steps, prompt, seed
                                         prompt, seed, tile, overlap,
                                         refine_tile=refine_tile, refine_overlap=refine_overlap,
                                         do_esrgan=do_esrgan)
-                dst = build_output_path(p, save_mode, output_dir, output_format)
+                _srcbase = os.path.splitext(os.path.basename(p))[0]
+                _tag = f"{_srcbase}_" + ("upscaled" if do_esrgan else "img2img")
+                dst = build_output_path(p, save_mode, output_dir, output_format,
+                                        tag=_tag, seed=seed, size=result.size)
                 if dst:
                     save_image(result, dst, output_format)
                     if print_output:
@@ -963,8 +991,11 @@ def run(image, source_folder, esrgan_model, factor, denoise, steps, prompt, seed
                             refine_tile=refine_tile, refine_overlap=refine_overlap,
                             do_esrgan=do_esrgan)
     dst = None
+    _srcbase = os.path.splitext(os.path.basename(source_path))[0] if source_path else None
+    _tag = (f"{_srcbase}_" if _srcbase else "") + ("upscaled" if do_esrgan else "img2img")
     try:
-        dst = build_output_path(source_path, save_mode, output_dir, output_format)
+        dst = build_output_path(source_path, save_mode, output_dir, output_format,
+                                tag=_tag, seed=seed, size=result.size)
     except ValueError as e:
         dst = None
         save_warning = f"  \n[WARN] {e}"
@@ -1210,14 +1241,14 @@ def _ui_generate(prompt, negative, styles, use_input, input_image,
             total_t += t["txt2img"]
             if save_mode != "display":
                 try:
-                    dst = build_output_path(None, save_mode, output_dir, output_format)
+                    dst = build_output_path(None, save_mode, output_dir, output_format,
+                                            tag="txt2img", seed=s, size=img.size,
+                                            index=(i + 1 if n > 1 else 0))
                     if dst:
-                        if n > 1:
-                            base, ext = os.path.splitext(dst)
-                            dst = f"{base}_{i + 1}{ext}"
                         save_image(img, dst, output_format)
-                except Exception:
-                    pass
+                        _dbg(f"saved: {dst}")
+                except Exception as e:
+                    _dbg(f"save failed: {e}")
         progress(1.0, desc="Done")
         if not images:
             return [], "Stopped before any image."
@@ -1502,7 +1533,9 @@ def serve_main(host="127.0.0.1", port=7861, idle_timeout=300):
                 refine_tile=pick("refine_tile", req.refine_tile),
                 refine_overlap=pick("refine_overlap", req.refine_overlap),
             )
-            dst = build_output_path(req.input, req.save_mode, req.output_dir, req.output_format)
+            _srcbase = os.path.splitext(os.path.basename(req.input))[0]
+            dst = build_output_path(req.input, req.save_mode, req.output_dir, req.output_format,
+                                    tag=f"{_srcbase}_upscaled", seed=req.seed, size=result.size)
             if dst:
                 save_image(result, dst, req.output_format)
             state["last"] = time.time()
