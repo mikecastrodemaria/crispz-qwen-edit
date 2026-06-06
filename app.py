@@ -435,8 +435,9 @@ CHECKPOINTS_DIR = (os.environ.get("CHECKPOINTS_DIR") or _prefs.get("checkpoints_
 LORAS_DIR = (os.environ.get("LORAS_DIR") or _prefs.get("loras_dir")
              or CONFIG.get("loras_dir") or os.path.join(HERE, "loras"))
 # LoRA active (chemin .safetensors) + poids. Inclus dans la clef de cache du pipe.
-LORA_PATH = None
-LORA_WEIGHT = float(CONFIG.get("default_lora_weight", 1.0))
+# LoRA actives: liste de (chemin, poids). Plusieurs LoRA combinables (multi-slots).
+LORAS = []
+LORA_WEIGHT = float(CONFIG.get("default_lora_weight", 1.0))  # poids par defaut des slots
 # Modele Omni/Edit (multi-reference). Reglable via config.txt ou l'UI.
 OMNI_MODEL = (os.environ.get("ZIMAGE_OMNI_MODEL") or CONFIG.get("zimage_omni_model") or "").strip()
 # Ollama (Describe image->prompt + Improve prompt). URL configurable, persistee.
@@ -650,19 +651,20 @@ def lora_keywords(path):
     return ", ".join(out)
 
 
-def set_lora(name, weight):
-    """Selectionne une LoRA (nom de fichier du dossier loras, ou '' / 'None' pour
-    aucune) + son poids. Invalide le pipe si change (re-application au chargement)."""
-    global LORA_PATH, LORA_WEIGHT
-    new_path = None
-    if name and name not in ("None", "none", ""):
-        new_path = name if os.path.isabs(name) else os.path.join(LORAS_DIR, name)
-    w = float(weight)
-    if new_path != LORA_PATH or w != LORA_WEIGHT:
-        LORA_PATH, LORA_WEIGHT = new_path, w
+def set_loras(slots):
+    """Definit les LoRA actives. slots = liste de (nom_ou_None, poids). Resout les
+    noms en chemins, ignore les None. Invalide le pipe si la combinaison change."""
+    global LORAS
+    new = []
+    for name, weight in slots:
+        if name and name not in ("None", "none", ""):
+            p = name if os.path.isabs(name) else os.path.join(LORAS_DIR, name)
+            new.append((p, float(weight)))
+    if new != LORAS:
+        LORAS = new
         free_vram()
-        _log(f"LoRA -> {os.path.basename(new_path) if new_path else '(none)'} "
-             f"weight {w} -> will reload")
+        _log("LoRAs -> " + (", ".join(f"{os.path.basename(p)}@{w}" for p, w in new) or "(none)")
+             + " -> will reload")
 
 
 def set_omni_model(repo):
@@ -817,7 +819,7 @@ def _ensure_base():
     """Charge (si besoin) le pipeline de base txt2img. Gere le transformer
     single-file (Civitai) et l'offload. Cache par (repo, transformer, offload)."""
     global _BASE_PIPE, _DERIVED, _LOADED_KEY
-    key = (BASE_REPO, ZIMAGE_TRANSFORMER, OFFLOAD_MODE, LORA_PATH, LORA_WEIGHT)
+    key = (BASE_REPO, ZIMAGE_TRANSFORMER, OFFLOAD_MODE, tuple(LORAS))
     _dbg(f"_ensure_base key={key} cached={_LOADED_KEY}")
     if _BASE_PIPE is not None and _LOADED_KEY == key:
         _dbg("base pipeline: reusing cached (no reload)")
@@ -836,11 +838,18 @@ def _ensure_base():
          "first time downloads from HF, then cached")
     pipe = ZImagePipeline.from_pretrained(BASE_REPO, torch_dtype=DTYPE, **kwargs)
     # LoRA Z-Image (sur le transformer du base -> partage par les pipes derives).
-    if LORA_PATH and os.path.isfile(LORA_PATH):
+    if LORAS:
         try:
-            _log(f"applying LoRA: {os.path.basename(LORA_PATH)} (weight {LORA_WEIGHT})")
-            pipe.load_lora_weights(LORA_PATH, adapter_name="cz_lora")
-            pipe.set_adapters(["cz_lora"], [float(LORA_WEIGHT)])
+            names, weights = [], []
+            for i, (p, w) in enumerate(LORAS):
+                if os.path.isfile(p):
+                    an = f"cz_lora_{i}"
+                    _log(f"applying LoRA: {os.path.basename(p)} (weight {w})")
+                    pipe.load_lora_weights(p, adapter_name=an)
+                    names.append(an)
+                    weights.append(float(w))
+            if names:
+                pipe.set_adapters(names, weights)
         except Exception as e:
             _log(f"LoRA load failed ({e}); continuing without LoRA")
     try:
@@ -1425,33 +1434,52 @@ def _apply_checkpoint(name):
 
 
 def _refresh_loras(new_dir):
-    """Change le dossier loras + liste les LoRA."""
+    """Change le dossier loras + liste les LoRA (met a jour les 3 slots)."""
     set_loras_dir(new_dir)
-    lr = list_loras()
-    return gr.update(choices=["None"] + lr), f"{len(lr)} LoRA(s) in {LORAS_DIR}"
+    lr = ["None"] + list_loras()
+    return (gr.update(choices=lr), gr.update(choices=lr), gr.update(choices=lr),
+            f"{len(lr) - 1} LoRA(s) in {LORAS_DIR}")
 
 
-def _apply_lora(name, weight):
-    set_lora(name, weight)
-    return (f"LoRA: {os.path.basename(LORA_PATH)} weight {LORA_WEIGHT} (reload on next run)."
-            if LORA_PATH else "LoRA: none.")
+def _apply_loras(n1, w1, n2, w2, n3, w3):
+    """Applique la combinaison des 3 slots LoRA."""
+    set_loras([(n1, w1), (n2, w2), (n3, w3)])
+    if not LORAS:
+        return "LoRA: none."
+    return "LoRA: " + ", ".join(f"{os.path.basename(p)}@{w}" for p, w in LORAS) + " (reload on next run)."
 
 
-def _ui_lora_select(name, weight):
-    """Selectionne la LoRA + extrait ses mots-cles (trigger words / top tags)."""
-    status = _apply_lora(name, weight)
-    kw = lora_keywords(LORA_PATH) if LORA_PATH else ""
-    return status, kw
-
-
-def _ui_lora_keywords(name):
-    """Recupere les mots-cles de la LoRA selectionnee (bouton)."""
+def _path_for_lora(name):
     if not name or name in ("None", "none", ""):
-        return "", "Select a LoRA first."
-    path = name if os.path.isabs(name) else os.path.join(LORAS_DIR, name)
-    kw = lora_keywords(path)
-    return kw, (f"{len(kw.split(','))} keyword(s) found." if kw
-                else "No keywords in this LoRA's metadata.")
+        return None
+    return name if os.path.isabs(name) else os.path.join(LORAS_DIR, name)
+
+
+def _ui_loras_apply(n1, w1, n2, w2, n3, w3):
+    """Applique les slots + agrege les mots-cles des LoRA selectionnees."""
+    status = _apply_loras(n1, w1, n2, w2, n3, w3)
+    kws = []
+    for n in (n1, n2, n3):
+        p = _path_for_lora(n)
+        if p:
+            k = lora_keywords(p)
+            if k:
+                kws.append(k)
+    return status, ", ".join(kws)
+
+
+def _ui_loras_keywords(n1, n2, n3):
+    """Recupere les mots-cles de toutes les LoRA selectionnees (bouton)."""
+    kws = []
+    for n in (n1, n2, n3):
+        p = _path_for_lora(n)
+        if p:
+            k = lora_keywords(p)
+            if k:
+                kws.append(k)
+    merged = ", ".join(kws)
+    return merged, (f"{len(merged.split(','))} keyword(s)." if merged
+                    else "No keywords in the selected LoRA(s).")
 
 
 def _ui_kw_to_prompt(prompt_text, keywords):
@@ -2127,17 +2155,24 @@ def build_ui():
                             ckpt_refresh_btn = gr.Button("Refresh", size="sm", scale=1)
                         ckpt_status = gr.Markdown("")
 
-                        gr.Markdown("### LoRA")
+                        gr.Markdown("### LoRA (up to 3, combinable)")
                         lora_dir_tb = gr.Textbox(value=LORAS_DIR, label="LoRA folder")
+                        _lchoices = ["None"] + list_loras()
                         with gr.Row():
-                            lora_dd = gr.Dropdown(choices=["None"] + list_loras(), value="None",
-                                                  label="LoRA", scale=3)
-                            lora_refresh_btn = gr.Button("Refresh", size="sm", scale=1)
-                        lora_weight = gr.Slider(0.0, 2.0, value=float(LORA_WEIGHT), step=0.05,
-                                                label="LoRA weight")
+                            lora_dd1 = gr.Dropdown(choices=_lchoices, value="None", label="LoRA 1", scale=3)
+                            lw1 = gr.Slider(0.0, 2.0, value=float(LORA_WEIGHT), step=0.05,
+                                            label="Weight 1", scale=2)
+                        with gr.Row():
+                            lora_dd2 = gr.Dropdown(choices=_lchoices, value="None", label="LoRA 2", scale=3)
+                            lw2 = gr.Slider(0.0, 2.0, value=float(LORA_WEIGHT), step=0.05,
+                                            label="Weight 2", scale=2)
+                        with gr.Row():
+                            lora_dd3 = gr.Dropdown(choices=_lchoices, value="None", label="LoRA 3", scale=3)
+                            lw3 = gr.Slider(0.0, 2.0, value=float(LORA_WEIGHT), step=0.05,
+                                            label="Weight 3", scale=2)
+                        lora_refresh_btn = gr.Button("Refresh LoRA list", size="sm")
                         lora_keywords_tb = gr.Textbox(label="Keywords / trigger words", lines=2,
-                                                      placeholder="Auto-filled from the LoRA metadata "
-                                                                  "when you pick one.")
+                                                      placeholder="Auto-filled from the selected LoRA(s).")
                         with gr.Row():
                             lora_kw_btn = gr.Button("Get keywords", size="sm")
                             lora_kw_to_prompt_btn = gr.Button("Add to prompt", size="sm", variant="primary")
@@ -2174,10 +2209,15 @@ def build_ui():
         save_paths_btn.click(_save_paths_to_prefs, [esrgan_dir_tb, zimage_model_tb], [paths_status])
         ckpt_refresh_btn.click(_refresh_checkpoints, [ckpt_dir_tb], [ckpt_dd, ckpt_status])
         ckpt_dd.change(_apply_checkpoint, [ckpt_dd], [ckpt_status])
-        lora_refresh_btn.click(_refresh_loras, [lora_dir_tb], [lora_dd, lora_status])
-        lora_dd.change(_ui_lora_select, [lora_dd, lora_weight], [lora_status, lora_keywords_tb])
-        lora_weight.change(_apply_lora, [lora_dd, lora_weight], [lora_status])
-        lora_kw_btn.click(_ui_lora_keywords, [lora_dd], [lora_keywords_tb, lora_status])
+        lora_refresh_btn.click(_refresh_loras, [lora_dir_tb],
+                               [lora_dd1, lora_dd2, lora_dd3, lora_status])
+        _lora_slots = [lora_dd1, lw1, lora_dd2, lw2, lora_dd3, lw3]
+        for _c in (lora_dd1, lora_dd2, lora_dd3):
+            _c.change(_ui_loras_apply, _lora_slots, [lora_status, lora_keywords_tb])
+        for _c in (lw1, lw2, lw3):
+            _c.change(_apply_loras, _lora_slots, [lora_status])
+        lora_kw_btn.click(_ui_loras_keywords, [lora_dd1, lora_dd2, lora_dd3],
+                          [lora_keywords_tb, lora_status])
         lora_kw_to_prompt_btn.click(_ui_kw_to_prompt, [prompt, lora_keywords_tb], [prompt])
         omni_model_tb.change(lambda r: (set_omni_model(r), f"Omni model set: {r or '(none)'}")[1],
                              [omni_model_tb], [omni_status])

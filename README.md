@@ -205,13 +205,13 @@ Only edit the **Z-Image base** field if you have a full **diffusers folder**
 "loras_dir": "D:\\Github\\sdlibs\\models\\Lora"
 ```
 
-### LoRA
+### LoRA (up to 3, combinable)
 
-**Models → LoRA**: set the folder → **Refresh** → pick a LoRA + set its **weight**
-(single number, one LoRA at a time). Picking a LoRA auto-fills its
-**keywords / trigger words** (read from the file metadata); **Add to prompt**
-appends them. The LoRA is applied to the transformer (shared by txt2img/img2img)
-and reloads on the next run.
+**Models → LoRA**: set the folder → **Refresh** → pick **up to 3 LoRAs**, each with
+its own **weight**. They are combined (`set_adapters`) on the transformer (shared
+by txt2img/img2img) and reload on the next run. Selecting LoRAs auto-fills their
+merged **keywords / trigger words** (read from the file metadata); **Add to prompt**
+appends them.
 
 ## Disabling the upscale (pure txt2img / pure img2img)
 
