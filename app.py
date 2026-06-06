@@ -66,6 +66,44 @@ PRESET_FLAGMAP = {
     "cpu_offload": "--cpu-offload",
 }
 
+# Ratios d'aspect facon Fooocus. label -> (width, height) en multiples de 16.
+ASPECT_RATIOS = {
+    "1024 x 1024  (1:1)":  (1024, 1024),
+    "1152 x 896  (9:7)":   (1152, 896),
+    "896 x 1152  (7:9)":   (896, 1152),
+    "1216 x 832  (3:2)":   (1216, 832),
+    "832 x 1216  (2:3)":   (832, 1216),
+    "1344 x 768  (16:9)":  (1344, 768),
+    "768 x 1344  (9:16)":  (768, 1344),
+    "1536 x 640  (21:9)":  (1536, 640),
+}
+# Performance facon Fooocus -> (gen_steps, guidance) pour le modele charge.
+PERFORMANCE = {
+    "Turbo (8 steps)":    (8, 0.0),
+    "Quality (20 steps)": (20, 0.0),
+    "Base CFG (28 steps)": (28, 4.0),
+}
+# Styles (wrappers de prompt). nom -> (prefixe, suffixe).
+STYLES = {
+    "Cinematic":     ("cinematic film still of ", ", shallow depth of field, dramatic lighting, film grain, highly detailed"),
+    "Photographic":  ("professional photograph of ", ", 50mm, f1.8, natural lighting, sharp focus, realistic"),
+    "Anime":         ("anime artwork of ", ", anime style, key visual, vibrant, studio anime"),
+    "Digital Art":   ("concept art of ", ", digital painting, illustrative, painterly, artstation, highly detailed"),
+    "Fantasy":       ("", ", fantasy art, magical atmosphere, intricate, epic, ethereal light"),
+    "Cyberpunk":     ("", ", cyberpunk, neon lights, futuristic, high tech, dystopian"),
+    "3D Render":     ("", ", 3d render, octane render, volumetric lighting, highly detailed"),
+    "Sharp / 8K":    ("", ", extremely detailed, ultra sharp, high resolution, 8k"),
+}
+
+
+def _apply_styles(prompt, style_names):
+    """Enrobe le prompt avec les styles selectionnes (prefixes + suffixes)."""
+    if not style_names:
+        return prompt or ""
+    pre = "".join(STYLES.get(n, ("", ""))[0] for n in style_names)
+    suf = "".join(STYLES.get(n, ("", ""))[1] for n in style_names)
+    return f"{pre}{prompt or ''}{suf}".strip()
+
 # ----------------------------------------------------------------------------
 # Config (persistance dans preferences.json a cote de app.py)
 # Ordre de priorite pour ESRGAN_DIR et BASE_REPO:
@@ -775,6 +813,18 @@ def _apply_preset(name):
     return [gr.update(value=p[k]) if k in p else gr.update() for k in _PRESET_UI_ORDER]
 
 
+def _set_aspect(name):
+    """UI: applique un ratio d'aspect -> (width, height)."""
+    w, h = ASPECT_RATIOS.get(name, (1024, 1024))
+    return w, h
+
+
+def _set_performance(name):
+    """UI: applique un preset Performance -> (gen_steps, guidance)."""
+    steps, g = PERFORMANCE.get(name, (8, 0.0))
+    return steps, g
+
+
 def _pil_to_b64_jpeg(img, max_side=1600, quality=85):
     """Reduit + encode en JPEG base64 pour embarquer en HTML sans saturer la page."""
     if img is None:
@@ -856,44 +906,53 @@ def _ui_txt2img(prompt, negative, width, height, gen_steps, seed, guidance, upsc
     return result, rep
 
 
-def _ui_generate(prompt, negative, use_input, input_image,
-                 width, height, gen_steps, seed, guidance, offload_mode,
+def _ui_generate(prompt, negative, styles, use_input, input_image,
+                 width, height, gen_steps, image_number, seed, guidance, offload_mode,
                  esrgan_model, do_esrgan, factor, denoise, refine_steps,
                  tile, overlap, refine_tile, refine_overlap,
                  save_mode, output_dir, output_format,
                  progress=gr.Progress(track_tqdm=True)):
-    """Bouton Generate unifie facon Fooocus: si une image d'entree est fournie ->
-    img2img / upscale, sinon txt2img. Renvoie (image, report_markdown).
-    Affiche l'avancement des etapes (ESRGAN, refine, tuiles i/N) via gr.Progress."""
+    """Bouton Generate unifie facon Fooocus: image d'entree -> img2img/upscale,
+    sinon txt2img (eventuellement N images via image_number). Renvoie (liste d'images,
+    report). Styles = wrappers de prompt. Avancement via gr.Progress."""
     global _PROGRESS
     _PROGRESS = lambda f, d: progress(f, desc=d)
     progress(0.0, desc="Starting...")
     try:
         set_offload_mode(offload_mode)
         set_guidance(guidance)
+        full_prompt = _apply_styles(prompt, styles)
         if use_input and input_image is not None:
             last_result, last_source, report = run(
-                input_image, None, esrgan_model, factor, denoise, refine_steps, prompt, seed,
+                input_image, None, esrgan_model, factor, denoise, refine_steps, full_prompt, seed,
                 tile, overlap, save_mode=save_mode, output_dir=output_dir,
                 output_format=output_format, refine_tile=refine_tile, refine_overlap=refine_overlap,
                 do_esrgan=bool(do_esrgan))
-            return last_result, report
-        # txt2img
-        result, t = txt2img_run(prompt, width, height, gen_steps, seed, negative,
-                                upscale=False, steps=refine_steps)
+            return [last_result], report
+        # txt2img (batch image_number)
+        n = max(1, int(image_number))
+        images, total_t = [], 0.0
+        for i in range(n):
+            s = (int(seed) + i) if int(seed) >= 0 else -1
+            progress(i / n, desc=f"Image {i + 1}/{n}")
+            img, t = txt2img_run(full_prompt, width, height, gen_steps, s, negative,
+                                 upscale=False, steps=refine_steps)
+            images.append(img)
+            total_t += t["txt2img"]
+            if save_mode != "display":
+                try:
+                    dst = build_output_path(None, save_mode, output_dir, output_format)
+                    if dst:
+                        if n > 1:
+                            base, ext = os.path.splitext(dst)
+                            dst = f"{base}_{i + 1}{ext}"
+                        save_image(img, dst, output_format)
+                except Exception:
+                    pass
         progress(1.0, desc="Done")
-        dst = None
-        if save_mode != "display":
-            try:
-                dst = build_output_path(None, save_mode, output_dir, output_format)
-                if dst:
-                    save_image(result, dst, output_format)
-            except Exception as e:
-                dst = f"(save error: {e})"
-        rep = f"txt2img **{result.size[0]}x{result.size[1]}** in **{t['txt2img']:.1f}s**"
-        if dst:
-            rep += f"  \nSaved: `{dst}`"
-        return result, rep
+        rep = (f"txt2img x{n} - **{images[0].size[0]}x{images[0].size[1]}** "
+               f"in **{total_t:.1f}s**")
+        return images, rep
     finally:
         _PROGRESS = None
 
@@ -938,8 +997,9 @@ def build_ui():
         with gr.Row():
             # ===== Colonne principale (apercu en haut, prompt + Generate, negative, input) =====
             with gr.Column(scale=3):
-                out = gr.Image(type="pil", label="Result", elem_id="cz_result",
-                               height=620, show_download_button=True)
+                out = gr.Gallery(label="Result", elem_id="cz_result", height=620,
+                                 columns=2, object_fit="contain", preview=True,
+                                 show_download_button=True)
                 report = gr.Markdown(value="*Ready. Type a prompt and press Generate.*")
 
                 with gr.Row():
@@ -980,14 +1040,25 @@ def build_ui():
             # ===== Colonne Advanced (a droite, masquee par defaut comme Fooocus) =====
             with gr.Column(scale=2, visible=False) as advanced_col:
                 with gr.Tabs():
-                    with gr.Tab("Setting"):
+                    with gr.Tab("Settings"):
+                        performance = gr.Radio(list(PERFORMANCE), value="Turbo (8 steps)",
+                                               label="Performance",
+                                               info="Sets steps + guidance. Turbo = your Turbo model; "
+                                                    "Base CFG = for a Z-Image Base checkpoint.")
+                        aspect = gr.Dropdown(list(ASPECT_RATIOS), value="1024 x 1024  (1:1)",
+                                             label="Aspect ratio")
                         with gr.Row():
                             width = gr.Slider(256, 2048, value=1024, step=16, label="Width")
                             height = gr.Slider(256, 2048, value=1024, step=16, label="Height")
                         gen_steps = gr.Slider(2, 40, value=8, step=1, label="Generation steps (txt2img)")
                         guidance = gr.Slider(0.0, 8.0, value=0.0, step=0.5, label="CFG guidance",
                                              info="0 = Z-Image Turbo. Z-Image Base: ~3.5-5.")
+                        image_number = gr.Slider(1, 8, value=1, step=1, label="Image number (batch)")
                         seed = gr.Number(value=-1, label="Seed (-1 = random)", precision=0)
+
+                    with gr.Tab("Styles"):
+                        styles = gr.CheckboxGroup(list(STYLES), value=[], label="Styles",
+                                                  info="Wraps your prompt with style words (combinable).")
 
                     with gr.Tab("Models"):
                         zimage_model_tb = gr.Textbox(
@@ -1014,6 +1085,8 @@ def build_ui():
         # Toggles facon Fooocus
         advanced_cb.change(lambda v: gr.update(visible=bool(v)), advanced_cb, advanced_col)
         use_input.change(lambda v: gr.update(visible=bool(v)), use_input, input_group)
+        aspect.change(_set_aspect, [aspect], [width, height])
+        performance.change(_set_performance, [performance], [gen_steps, guidance])
 
         # Actions
         refresh_btn.click(_refresh_models, [esrgan_dir_tb], [esrgan, paths_status])
@@ -1023,8 +1096,8 @@ def build_ui():
                       [factor, denoise, refine_steps, tile, overlap, refine_tile, refine_overlap, offload])
         btn.click(
             _ui_generate,
-            inputs=[prompt, negative, use_input, inp, width, height, gen_steps, seed, guidance, offload,
-                    esrgan, do_esrgan_cb, factor, denoise, refine_steps,
+            inputs=[prompt, negative, styles, use_input, inp, width, height, gen_steps, image_number,
+                    seed, guidance, offload, esrgan, do_esrgan_cb, factor, denoise, refine_steps,
                     tile, overlap, refine_tile, refine_overlap, save_mode, output_dir, output_format],
             outputs=[out, report],
         )
