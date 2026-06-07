@@ -7,11 +7,28 @@ importing the moved names so nothing else changes, and each step is validated wi
 
 Do NOT do it all at once. One module per PR, smoke-green between each.
 
-## Progress
-- [x] **Step 0 — `cz_assets.py`** (zero-risk, no state): moved the big static strings
-  out of app.py (`ASSET_BROWSER_HTML`, `CZ_JS`, `FOOOCUS_CSS`). app.py imports them.
-  Validated: py_compile + `is`-identity asserts + build_ui + smoke 19/19. (~176 lines out)
-- [ ] Steps 1-8 below (touch mutable runtime state -> need an in-browser pass each).
+## Progress (app.py: 3601 -> 3115 lines so far)
+- [x] **Step 0 — `cz_assets.py`**: static strings (ASSET_BROWSER_HTML/CZ_JS/FOOOCUS_CSS).
+- [x] **Step 1 — `cz_core.py`**: CONFIG/paths/DEFAULT_*/profiles/instructions/prefs/
+  DEVICE/DTYPE/logging + `_pil_to_b64_jpeg`. LOG_LEVEL read via `cz_core.LOG_LEVEL`.
+- [x] **Step 2 — `cz_ollama.py`**: _ollama_* + OLLAMA_URL/KEEP_ALIVE/CPU + _ollama_gen_opts.
+- [x] **Step 3 — `cz_imageio.py`**: filenames/paths/save_image/_exif/_read_image_meta/
+  _list_output_files. (`_gen_meta` stays in app — reads model state.)
+- [x] **Step 4 — `cz_assetbrowser.py`**: ab_reindex + thumbs + delete_asset.
+  Each step validated: `is`-identity of moved names + build_ui + smoke 19/19.
+- [ ] **Step 5 — `cz_prompt.py`**: styles + wildcards. NOTE: `WILDCARDS_DIR` is mutable
+  (set_wildcards_dir) -> keep dir + setter + readers together in cz_prompt, and have
+  app read `cz_prompt.WILDCARDS_DIR` where the dir can change at runtime.
+- [ ] **Step 6 — `cz_esrgan.py` / `cz_face.py`**: leaf compute. Mutable caches
+  (_ESRGAN_CACHE / _FACE_APP/_FACE_SWAPPER/_FACE_RESTORE_SESSION/_BLIP) + setters must
+  move WITH the functions so bare refs stay valid.
+- [ ] **Step 7 — `cz_models.py` + `cz_generate.py`** (HIGH risk): BASE_REPO/
+  ZIMAGE_TRANSFORMER/LORAS/OFFLOAD_MODE/GUIDANCE + pipe caches + setters + generate.
+  Keep them in ONE module so the many bare refs stay intra-module.
+- [ ] **Step 8 — `cz_ui.py` + `cz_cli.py`** (HIGH risk): build_ui wiring + argparse/serve.
+
+Recommend: do steps 5-8 with an in-browser pass each (generate, switch model, LoRA,
+faceswap, wildcards) since smoke does not exercise the stateful generation/UI paths.
 
 ## Target layout
 ```
