@@ -1848,13 +1848,67 @@ def _apply_transformer_repo(repo):
             gr.update(value=st), gr.update(value=g))
 
 
-def _ui_list_wildcards(new_dir):
-    """Change le dossier wildcards + liste ce qui est disponible."""
+def _wild_sanitize(name):
+    return "".join(c for c in (name or "").strip() if c.isalnum() or c in "_-")[:64]
+
+
+def _ui_wild_refresh(new_dir):
+    """Change le dossier + rafraichit le dropdown de tous les wildcards."""
     set_wildcards_dir(new_dir)
     w = list_wildcards()
-    if not w:
-        return f"No .txt wildcard in {WILDCARDS_DIR}."
-    return f"{len(w)} wildcards in {WILDCARDS_DIR} -> e.g. " + ", ".join(f"__{n}__" for n in w[:15])
+    return gr.update(choices=["None"] + w, value="None"), f"{len(w)} wildcard file(s) in {WILDCARDS_DIR}."
+
+
+def _ui_wild_load(name):
+    """Charge le contenu du wildcard selectionne dans l'editeur."""
+    if not name or name == "None":
+        return "", ""
+    p = os.path.join(WILDCARDS_DIR, name + ".txt")
+    try:
+        with open(p, "r", encoding="utf-8", errors="ignore") as f:
+            txt = f.read()
+        nlines = len([ln for ln in txt.splitlines() if ln.strip() and not ln.lstrip().startswith("#")])
+        return txt, f"{name}: {nlines} option(s). Use __{name}__ in the prompt."
+    except Exception as e:
+        return "", f"Cannot read {name}: {e}"
+
+
+def _ui_wild_insert(name, prompt_text):
+    """Insere __name__ a la fin du prompt."""
+    if not name or name == "None":
+        return gr.update(), "Pick a wildcard file first."
+    tok = f"__{name}__"
+    base = (prompt_text or "").rstrip()
+    new = (base + (" " if base else "") + tok)
+    return gr.update(value=new), f"Inserted {tok}."
+
+
+def _ui_wild_save(name, content):
+    """Sauve le contenu de l'editeur dans le wildcard selectionne."""
+    n = _wild_sanitize(name if name and name != "None" else "")
+    if not n:
+        return "Pick a wildcard file (or use Create new)."
+    try:
+        os.makedirs(WILDCARDS_DIR, exist_ok=True)
+        with open(os.path.join(WILDCARDS_DIR, n + ".txt"), "w", encoding="utf-8") as f:
+            f.write(content or "")
+        return f"Saved {n}.txt."
+    except Exception as e:
+        return f"Save failed: {e}"
+
+
+def _ui_wild_create(newname, content):
+    """Cree un nouveau wildcard + rafraichit le dropdown."""
+    n = _wild_sanitize(newname)
+    if not n:
+        return gr.update(), "Enter a valid name (letters/digits/_/-).", newname
+    try:
+        os.makedirs(WILDCARDS_DIR, exist_ok=True)
+        with open(os.path.join(WILDCARDS_DIR, n + ".txt"), "w", encoding="utf-8") as f:
+            f.write(content or "")
+        return gr.update(choices=["None"] + list_wildcards(), value=n), f"Created {n}.txt.", ""
+    except Exception as e:
+        return gr.update(), f"Create failed: {e}", newname
 
 
 def _refresh_loras(new_dir):
@@ -2836,13 +2890,26 @@ def build_ui():
                             lora_kw_to_prompt_btn = gr.Button("Add to prompt", size="sm", variant="primary")
                         lora_status = gr.Markdown("")
 
-                        gr.Markdown("### Wildcards")
-                        gr.Markdown("*Use `__name__` in the prompt -> replaced by a random line "
-                                    "from `<folder>/name.txt` (e.g. `__color__`, `__artist-c__`). "
-                                    "Nested wildcards supported. Reproducible per seed.*")
+                        gr.Markdown("### \U0001F3B2 Wildcards")
+                        gr.Markdown("*`__name__` in the prompt -> a random line from name.txt "
+                                    "(nested, reproducible per seed). Pick a file to view/edit it, "
+                                    "Insert to add it to the prompt, or Create a new one.*")
                         wild_dir_tb = gr.Textbox(value=WILDCARDS_DIR, label="Wildcards folder")
+                        with gr.Row():
+                            wild_dd = gr.Dropdown(["None"] + list_wildcards(), value="None",
+                                                  label="Wildcard file", scale=3)
+                            wild_refresh_btn = gr.Button("Refresh", size="sm", scale=1, min_width=90)
+                            wild_insert_btn = gr.Button("Insert __name__", size="sm", scale=1,
+                                                        variant="primary", min_width=140)
+                        wild_editor = gr.Textbox(label="Contents (one option per line)", lines=8,
+                                                 placeholder="Select a file above to view/edit, "
+                                                             "or type lines for a new one.")
+                        with gr.Row():
+                            wild_save_btn = gr.Button("Save", size="sm")
+                            wild_new_name = gr.Textbox(show_label=False, scale=2, container=False,
+                                                       placeholder="new_wildcard_name (no extension)")
+                            wild_create_btn = gr.Button("Create new", size="sm", variant="primary")
                         wild_status = gr.Markdown("")
-                        wild_refresh_btn = gr.Button("List wildcards", size="sm")
 
                         gr.Markdown("### Omni / Edit model (multi-reference)")
                         gr.Markdown("*The Reference (Omni) tab stays hidden until a model is set "
@@ -2875,7 +2942,12 @@ def build_ui():
         save_paths_btn.click(_save_paths_to_prefs,
                              [esrgan_dir_tb, zimage_model_tb, ckpt_dir_tb, lora_dir_tb, wild_dir_tb],
                              [paths_status])
-        wild_refresh_btn.click(_ui_list_wildcards, [wild_dir_tb], [wild_status])
+        wild_refresh_btn.click(_ui_wild_refresh, [wild_dir_tb], [wild_dd, wild_status])
+        wild_dd.change(_ui_wild_load, [wild_dd], [wild_editor, wild_status])
+        wild_insert_btn.click(_ui_wild_insert, [wild_dd, prompt], [prompt, wild_status])
+        wild_save_btn.click(_ui_wild_save, [wild_dd, wild_editor], [wild_status])
+        wild_create_btn.click(_ui_wild_create, [wild_new_name, wild_editor],
+                              [wild_dd, wild_status, wild_new_name])
         ckpt_refresh_btn.click(_refresh_checkpoints, [ckpt_dir_tb], [ckpt_dd, ckpt_status])
         ckpt_dd.change(_apply_checkpoint, [ckpt_dd], [ckpt_status, gen_steps, guidance])
         transformer_apply_btn.click(_apply_transformer_repo, [transformer_tb],
