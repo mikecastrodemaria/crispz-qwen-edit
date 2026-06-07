@@ -1920,17 +1920,65 @@ def _ui_clear_history():
     return [], []
 
 
-def _ui_load_outputs(output_dir):
-    """Charge les images du dossier de sortie (plus recentes en tete) dans l'historique."""
+def _list_output_files(output_dir, limit=300):
+    """Liste les images du dossier de sortie (plus recentes en tete)."""
     d = output_dir or DEFAULT_OUTPUT_DIR
     if not os.path.isabs(d):
         d = os.path.join(HERE, d)
     if not os.path.isdir(d):
-        return [], []
+        return []
     files = [os.path.join(d, f) for f in os.listdir(d) if f.lower().endswith(IMG_EXTS)]
     files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    files = files[:200]
+    return files[:limit]
+
+
+def _ui_load_outputs(output_dir):
+    """Charge les images du dossier de sortie dans l'historique de session."""
+    files = _list_output_files(output_dir, 200)
     return files, files
+
+
+# ---- Galerie avancee (panneau dedie: meta, suppression, flou) ----
+def _gallery_load(output_dir):
+    files = _list_output_files(output_dir)
+    return files, files, f"{len(files)} image(s) in the output folder."
+
+
+def _gallery_selected(paths, evt: gr.SelectData):
+    """Affiche les metadonnees de l'image selectionnee + son chemin."""
+    if not paths or evt is None or evt.index is None or evt.index >= len(paths):
+        return "*No selection.*", ""
+    path = paths[evt.index]
+    info = [f"**File:** `{os.path.basename(path)}`"]
+    try:
+        with Image.open(path) as im:
+            info.append(f"**Size:** {im.size[0]}x{im.size[1]}")
+    except Exception:
+        pass
+    try:
+        st = os.stat(path)
+        info.append(f"**Weight:** {st.st_size / 1024:.0f} KB")
+        info.append(f"**Modified:** {datetime.datetime.fromtimestamp(st.st_mtime):%Y-%m-%d %H:%M}")
+    except Exception:
+        pass
+    for tok in os.path.splitext(os.path.basename(path))[0].split("_"):
+        if tok.startswith("seed"):
+            info.append(f"**Seed:** {tok[4:]}")
+    info.append(f"**Path:** `{path}`")
+    return "  \n".join(info), path
+
+
+def _gallery_delete(path, output_dir):
+    """Supprime le fichier selectionne puis recharge la galerie."""
+    msg = "Nothing to delete."
+    if path and os.path.isfile(path):
+        try:
+            os.remove(path)
+            msg = f"Deleted {os.path.basename(path)}."
+        except Exception as e:
+            msg = f"Delete failed: {e}"
+    files = _list_output_files(output_dir)
+    return files, files, msg, "*Select an image to see its info.*", ""
 
 
 def _pil_to_b64_jpeg(img, max_side=1600, quality=85):
@@ -2218,6 +2266,9 @@ FOOOCUS_CSS = """
   border: 1px solid #2a3346; border-radius: 8px; overflow: hidden;
   box-shadow: 0 6px 24px rgba(0,0,0,.6); background: #0b1018; }
 .cz-style-preview img { display: block; width: 110px; height: auto; }
+/* Galerie avancee: flou NSFW optionnel */
+#cz_gallery.cz-blur img { filter: blur(18px); transition: filter .15s; }
+#cz_gallery.cz-blur img:hover { filter: none; }
 /* Lightbox plein ecran */
 .cz-lightbox { position: fixed; inset: 0; background: rgba(0,0,0,.93); z-index: 10001;
   display: flex; align-items: center; justify-content: center; cursor: zoom-out; }
@@ -2242,6 +2293,21 @@ def build_ui():
     omni_on = bool((OMNI_MODEL or "").strip())
 
     with gr.Blocks(title="crispz-studio", theme=gr.themes.Default(), css=FOOOCUS_CSS, js=js_full) as demo:
+        # ===== Galerie avancee (panneau plein largeur: meta, suppression, flou) =====
+        with gr.Accordion("Gallery (output folder)", open=False):
+            with gr.Row():
+                g_refresh = gr.Button("Refresh", size="sm")
+                g_blur = gr.Checkbox(value=False, label="Blur thumbnails (NSFW)", min_width=200)
+                g_status = gr.Markdown("")
+            g_gallery = gr.Gallery(label=None, elem_id="cz_gallery", columns=5, height="62vh",
+                                   object_fit="contain", preview=True, allow_preview=True,
+                                   show_fullscreen_button=True, show_download_button=True)
+            g_state = gr.State([])
+            g_meta = gr.Markdown("*Select an image to see its info.*")
+            with gr.Row():
+                g_path = gr.Textbox(label="File path (select all to copy)", interactive=False, scale=4)
+                g_delete = gr.Button("Delete image", variant="stop", size="sm", scale=1, min_width=140)
+
         with gr.Row():
             # ===== Colonne principale (apercu en haut, prompt + Generate, negative, input) =====
             with gr.Column(scale=3):
@@ -2572,6 +2638,14 @@ def build_ui():
         stop_btn.click(request_stop, None, [report])
         clear_hist_btn.click(_ui_clear_history, None, [history, history_gallery])
         load_out_btn.click(_ui_load_outputs, [output_dir], [history, history_gallery])
+        # Galerie avancee (panneau Gallery)
+        g_refresh.click(_gallery_load, [output_dir], [g_gallery, g_state, g_status])
+        g_gallery.select(_gallery_selected, [g_state], [g_meta, g_path])
+        g_delete.click(_gallery_delete, [g_path, output_dir],
+                       [g_gallery, g_state, g_status, g_meta, g_path])
+        g_blur.change(None, [g_blur], None,
+                      js="(v) => { const el = document.getElementById('cz_gallery'); "
+                         "if (el) el.classList.toggle('cz-blur', v); }")
         preset.change(_apply_preset, [preset],
                       [factor, denoise, refine_steps, tile, overlap, refine_tile, refine_overlap, offload])
         _gen_inputs = [prompt, negative, styles, use_input, inp, input_mode, ref1, ref2, ref3, ref4,
