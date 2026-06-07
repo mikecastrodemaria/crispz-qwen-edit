@@ -36,7 +36,7 @@ import uuid
 import datetime
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageChops
 import gradio as gr
 
 # Support AVIF/HEIC en entree (les .avif sinon: PIL.UnidentifiedImageError).
@@ -1172,6 +1172,52 @@ def _reframe_canvas(image, ratio_w, ratio_h, overlap=8):
     return canvas, mask, nw, nh
 
 
+def inpaint_run(background, mask, prompt, steps, denoise, seed):
+    """Inpaint: regenere la zone blanche du masque selon le prompt
+    (ZImageInpaintPipeline). background + mask = PIL (L: blanc = a changer)."""
+    bg = background.convert("RGB")
+    w = round_to_multiple(bg.width, 32)
+    h = round_to_multiple(bg.height, 32)
+    if (w, h) != bg.size:
+        bg = bg.resize((w, h), Image.LANCZOS)
+        mask = mask.resize((w, h), Image.NEAREST)
+    pipe = get_pipe("inpaint")
+    _log(f"inpaint: {w}x{h}, {int(steps)} steps, strength {float(denoise):.2f}, "
+         f"guidance {GUIDANCE:.1f} ...")
+    _progress(0.1, "Inpainting...")
+    t0 = time.time()
+    out = pipe(prompt=prompt or "", image=bg, mask_image=mask, strength=float(denoise),
+               num_inference_steps=int(steps), guidance_scale=GUIDANCE,
+               generator=_make_generator(seed)).images[0]
+    _log(f"inpaint done in {time.time() - t0:.1f}s")
+    gc.collect()
+    if DEVICE == "cuda":
+        torch.cuda.empty_cache()
+    return out
+
+
+def _editor_to_image_mask(editor_value):
+    """Extrait (image, masque) d'un gr.ImageEditor. Masque = zone peinte (diff
+    composite/background), blanc = a regenerer."""
+    if not editor_value:
+        return None, None
+    bg = editor_value.get("background")
+    comp = editor_value.get("composite")
+    if bg is None:
+        return None, None
+    bg = bg.convert("RGB")
+    mask = Image.new("L", bg.size, 0)
+    if comp is not None:
+        diff = ImageChops.difference(comp.convert("RGB"), bg).convert("L")
+        mask = diff.point(lambda p: 255 if p > 8 else 0)
+    # fallback: alpha des layers peints
+    for ly in (editor_value.get("layers") or []):
+        if ly is not None:
+            a = ly.convert("RGBA").split()[-1]
+            mask = ImageChops.lighter(mask, a.point(lambda p: 255 if p > 8 else 0))
+    return bg, mask
+
+
 def outpaint(image, ratio_w, ratio_h, prompt, steps, seed):
     """Reframe / outpainting: agrandit l'image au ratio cible et fait remplir les
     bords par Z-Image (ZImageInpaintPipeline)."""
@@ -1817,6 +1863,40 @@ def _ui_reframe(image, ratio, steps, prompt, guidance, offload_mode, seed,
         _PROGRESS = None
 
 
+def _ui_inpaint(editor_value, prompt, negative, styles, guidance, offload_mode, steps, denoise,
+                seed, save_mode, output_dir, output_format, history,
+                progress=gr.Progress(track_tqdm=True)):
+    """Inpaint depuis l'editeur (image + masque peint) -> galerie + historique."""
+    global _PROGRESS
+    _PROGRESS = lambda f, d: progress(f, desc=d)
+    try:
+        bg, mask = _editor_to_image_mask(editor_value)
+        if bg is None:
+            return [], "Load an image in the Inpaint editor.", history, history
+        if mask is None or mask.getbbox() is None:
+            return [], "Paint the area to change (the mask is empty).", history, history
+        set_offload_mode(offload_mode)
+        set_guidance(guidance)
+        full_prompt, _ = _apply_styles(prompt, negative, styles)
+        try:
+            res = inpaint_run(bg, mask, full_prompt, steps, denoise, seed)
+        except Exception as e:
+            _log(f"inpaint error: {e}")
+            return [], f"Inpaint failed: {e}", history, history
+        if save_mode != "display":
+            try:
+                dst = build_output_path(None, save_mode, output_dir, output_format,
+                                        tag="inpaint", seed=seed, size=res.size)
+                if dst:
+                    save_image(res, dst, output_format)
+            except Exception as e:
+                _dbg(f"save inpaint failed: {e}")
+        new_hist = ([res] + list(history or []))[:200]
+        return [res], f"Inpaint -> {res.size[0]}x{res.size[1]}", new_hist, new_hist
+    finally:
+        _PROGRESS = None
+
+
 def _ui_clear_history():
     """Vide l'historique de session (state + galerie)."""
     return [], []
@@ -2069,19 +2149,8 @@ CZ_JS = """
     if (lbl && tip) tip.style.display = 'none';
   });
 
-  // --- Lightbox plein ecran au clic sur le rendu ---
-  document.addEventListener('click', (e) => {
-    const img = e.target.closest && e.target.closest('#cz_result img');
-    if (!img || e.target.closest('.cz-lightbox')) return;
-    const ov = document.createElement('div'); ov.className = 'cz-lightbox';
-    ov.innerHTML = '<span class="cz-close">&times;</span><img>';
-    ov.querySelector('img').src = img.src;
-    ov.addEventListener('click', () => ov.remove());
-    document.body.appendChild(ov);
-  });
-  document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') { const o = document.querySelector('.cz-lightbox'); if (o) o.remove(); }
-  });
+  // Le plein ecran + les fleches sont gerees nativement par la galerie Gradio
+  // (preview / fullscreen). Pas de lightbox custom (evite le doublon au clic).
 }
 """
 
@@ -2153,9 +2222,9 @@ def build_ui():
         with gr.Row():
             # ===== Colonne principale (apercu en haut, prompt + Generate, negative, input) =====
             with gr.Column(scale=3):
-                out = gr.Gallery(label="Result", elem_id="cz_result",
-                                 columns=1, object_fit="contain", preview=False,
-                                 allow_preview=False, show_download_button=True)
+                out = gr.Gallery(label="Result", elem_id="cz_result", columns=2,
+                                 object_fit="contain", preview=True, allow_preview=True,
+                                 show_fullscreen_button=True, show_download_button=True)
                 report = gr.Markdown(value="*Ready. Type a prompt and press Generate.*")
 
                 history = gr.State([])
@@ -2255,6 +2324,20 @@ def build_ui():
                                 reframe_steps = gr.Slider(4, 30, value=12, step=1, label="Fill steps")
                             reframe_btn = gr.Button("Reframe / Outpaint", variant="primary", size="sm")
                             reframe_status = gr.Markdown("")
+
+                        with gr.Tab("Inpaint"):
+                            gr.Markdown("*Paint the area to change (white brush), describe what "
+                                        "should appear in the prompt, then Inpaint.*")
+                            inpaint_editor = gr.ImageEditor(
+                                type="pil", label="Image + mask (paint the area)",
+                                brush=gr.Brush(colors=["#ffffff"], color_mode="fixed"),
+                                layers=False, transforms=[], height=380)
+                            with gr.Row():
+                                inpaint_steps = gr.Slider(4, 40, value=20, step=1, label="Steps")
+                                inpaint_denoise = gr.Slider(0.3, 1.0, value=0.85, step=0.05,
+                                                            label="Inpaint strength")
+                            inpaint_btn = gr.Button("Inpaint", variant="primary", size="sm")
+                            inpaint_status = gr.Markdown("")
 
                         with gr.Tab("Reference (Omni)", visible=omni_on):
                             gr.Markdown("*Compose from up to 4 reference images + a prompt. "
@@ -2455,6 +2538,11 @@ def build_ui():
         reframe_btn.click(_ui_reframe,
                           [reframe_img, reframe_ratio, reframe_steps, prompt, guidance, offload,
                            seed, save_mode, output_dir, output_format, history],
+                          [out, report, history, history_gallery])
+        inpaint_btn.click(_ui_inpaint,
+                          [inpaint_editor, prompt, negative, styles, guidance, offload,
+                           inpaint_steps, inpaint_denoise, seed, save_mode, output_dir,
+                           output_format, history],
                           [out, report, history, history_gallery])
         # Stop facon Fooocus: tourne en parallele du Generate (thread separe) et pose
         # le flag d'arret + interrompt la boucle de debruitage en cours.
