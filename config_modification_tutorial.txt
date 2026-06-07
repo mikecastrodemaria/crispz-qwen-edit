@@ -42,7 +42,15 @@ default_negative_prompt Negative prompt prefilled at startup.
 default_styles          List of style names checked by default, e.g.
                         ["Fooocus Cinematic", "SAI Anime"].
 default_aspect_ratio    One of the Settings aspect labels, e.g. "1024 x 1024  (1:1)".
-default_performance     "Turbo (8 steps)" | "Quality (20 steps)" | "Base CFG (28 steps)".
+default_performance     One of the performance_presets names below.
+performance_presets     Editable Performance presets: name -> [steps, guidance].
+                        Add/rename your own (e.g. "Juggernaut": [28, 6.0]).
+model_profiles          Per-model auto-tuning: a substring of the model name ->
+                        {steps, guidance}. When you pick a checkpoint / set a
+                        transformer override, steps + CFG auto-adjust to the first
+                        matching profile (e.g. "juggernaut" -> CFG 6). 0 guidance =
+                        Turbo-style; >0 = Base/CFG models.
+default_model_profile   {steps, guidance} used when no model_profiles key matches.
 default_width/height    txt2img size (multiples of 16).
 default_gen_steps       txt2img steps.
 default_guidance        CFG. 0 = Z-Image Turbo. Z-Image Base: ~3.5-5.

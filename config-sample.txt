@@ -6,6 +6,18 @@
     "ollama_vision_blocklist": [],
     "ollama_keep_alive": 0,
 
+    "performance_presets": {
+        "Turbo (8 steps)": [8, 0.0],
+        "Quality (20 steps)": [20, 0.0],
+        "Base CFG (28 steps)": [28, 4.0]
+    },
+    "model_profiles": {
+        "turbo": {"steps": 8, "guidance": 0.0},
+        "juggernaut": {"steps": 28, "guidance": 6.0},
+        "base": {"steps": 24, "guidance": 4.0}
+    },
+    "default_model_profile": {"steps": 8, "guidance": 0.0},
+
     "default_prompt": "",
     "default_negative_prompt": "",
     "default_styles": [],

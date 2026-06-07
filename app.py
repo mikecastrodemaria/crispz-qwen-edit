@@ -514,6 +514,34 @@ DEFAULT_SAVE_MODE = CONFIG.get("default_save_mode", DEFAULT_SAVE_MODE)
 DEFAULT_OUTPUT_DIR = CONFIG.get("default_output_dir", DEFAULT_OUTPUT_DIR)
 DEFAULT_OUTPUT_FORMAT = CONFIG.get("default_output_format", DEFAULT_OUTPUT_FORMAT)
 
+# Presets Performance editables via config.txt (performance_presets: nom -> [steps, guidance]).
+if isinstance(CONFIG.get("performance_presets"), dict) and CONFIG["performance_presets"]:
+    try:
+        PERFORMANCE = {k: (int(v[0]), float(v[1])) for k, v in CONFIG["performance_presets"].items()}
+    except Exception:
+        pass
+
+# Profils par modele: substring du nom -> reglages recommandes (steps/guidance).
+# Quand on choisit un modele, les sliders s'ajustent automatiquement (contextuel).
+MODEL_PROFILES = CONFIG.get("model_profiles") or {
+    "turbo": {"steps": 8, "guidance": 0.0},
+    "juggernaut": {"steps": 28, "guidance": 6.0},
+    "base": {"steps": 24, "guidance": 4.0},
+}
+DEFAULT_MODEL_PROFILE = CONFIG.get("default_model_profile") or {"steps": 8, "guidance": 0.0}
+
+
+def profile_for_model(name):
+    """Renvoie (steps, guidance) recommandes pour un modele d'apres son nom
+    (matching de substring dans model_profiles), sinon le profil par defaut."""
+    n = (name or "").lower()
+    for key, prof in MODEL_PROFILES.items():
+        if key.lower() in n:
+            return int(prof.get("steps", DEFAULT_MODEL_PROFILE.get("steps", 8))), \
+                float(prof.get("guidance", DEFAULT_MODEL_PROFILE.get("guidance", 0.0)))
+    return int(DEFAULT_MODEL_PROFILE.get("steps", 8)), float(DEFAULT_MODEL_PROFILE.get("guidance", 0.0))
+
+
 # Strings d'instruction Ollama (editable dans config.txt).
 DESCRIBE_INSTRUCTION = CONFIG.get(
     "ollama_describe_prompt",
@@ -1730,24 +1758,31 @@ def _refresh_checkpoints(new_dir):
 
 
 def _apply_checkpoint(name):
-    """Selectionne un checkpoint single-file comme transformer (ou revient au base repo)."""
+    """Selectionne un checkpoint single-file comme transformer (ou revient au base repo).
+    Ajuste aussi steps/guidance selon le profil du modele (contextuel)."""
     if not name or name == "(base repo)":
         set_zimage_transformer("")
-        return "Z-Image: base repo transformer (single-file cleared)."
+        st, g = profile_for_model(BASE_REPO)
+        return ("Z-Image: base repo transformer (single-file cleared).",
+                gr.update(value=st), gr.update(value=g))
     path = name if os.path.isabs(name) else os.path.join(CHECKPOINTS_DIR, name)
     set_zimage_transformer(path)
-    return f"Z-Image transformer: {os.path.basename(path)} (reload on next run)."
+    st, g = profile_for_model(os.path.basename(path))
+    return (f"Z-Image transformer: {os.path.basename(path)} -> auto steps={st}, CFG={g} "
+            f"(reload on next run).", gr.update(value=st), gr.update(value=g))
 
 
 def _apply_transformer_repo(repo):
-    """Definit le transformer depuis un repo HF / dossier diffusers (sous-dossier
-    'transformer') OU un .safetensors. Vide -> revient au transformer du base repo.
-    Utile pour Juggernaut-Z (garde VAE/encodeur/tokenizer du base = Turbo)."""
+    """Definit le transformer depuis un repo HF / dossier diffusers OU un .safetensors.
+    Ajuste steps/guidance selon le profil du modele."""
     repo = (repo or "").strip()
     set_zimage_transformer(repo)
     if not repo:
-        return "Transformer: from base repo."
-    return f"Transformer override: {repo} (keeps base VAE/encoder/tokenizer; reload on next run)."
+        return "Transformer: from base repo.", gr.update(), gr.update()
+    st, g = profile_for_model(repo)
+    return (f"Transformer override: {repo} -> auto steps={st}, CFG={g} "
+            f"(keeps base VAE/encoder; reload on next run).",
+            gr.update(value=st), gr.update(value=g))
 
 
 def _refresh_loras(new_dir):
@@ -2745,8 +2780,9 @@ def build_ui():
                              [esrgan_dir_tb, zimage_model_tb, ckpt_dir_tb, lora_dir_tb],
                              [paths_status])
         ckpt_refresh_btn.click(_refresh_checkpoints, [ckpt_dir_tb], [ckpt_dd, ckpt_status])
-        ckpt_dd.change(_apply_checkpoint, [ckpt_dd], [ckpt_status])
-        transformer_apply_btn.click(_apply_transformer_repo, [transformer_tb], [ckpt_status])
+        ckpt_dd.change(_apply_checkpoint, [ckpt_dd], [ckpt_status, gen_steps, guidance])
+        transformer_apply_btn.click(_apply_transformer_repo, [transformer_tb],
+                                    [ckpt_status, gen_steps, guidance])
         lora_refresh_btn.click(_refresh_loras, [lora_dir_tb],
                                [lora_dd1, lora_dd2, lora_dd3, lora_status])
         _lora_slots = [lora_dd1, lw1, lora_dd2, lw2, lora_dd3, lw3]
