@@ -2471,6 +2471,17 @@ def _ui_ab_reindex(output_dir, thumb_size, quality, blur, gen_thumbs):
     return link, f"Indexed {n} image(s) -> {os.path.dirname(idx)}"
 
 
+def _ui_gallery_open(output_dir):
+    """(Re)construit l'Asset Browser du dossier de sortie + renvoie l'URL a ouvrir."""
+    try:
+        n, idx = ab_reindex(output_dir, _ab_get("thumbnail_size"), _ab_get("thumbnail_quality"),
+                            bool(_ab_get("blur_thumbnails")), bool(_ab_get("generate_thumbnails")))
+    except Exception as e:
+        return f"Gallery build failed: {e}", ""
+    url = "/gradio_api/file=" + os.path.abspath(idx).replace("\\", "/")
+    return f"Gallery ready ({n} images) - opening in a new tab...", url
+
+
 def _pil_to_b64_jpeg(img, max_side=1600, quality=85):
     """Reduit + encode en JPEG base64 pour embarquer en HTML sans saturer la page."""
     if img is None:
@@ -2795,27 +2806,9 @@ def build_ui():
     omni_on = bool((OMNI_MODEL or "").strip())
 
     with gr.Blocks(title="crispz-studio", theme=gr.themes.Default(), css=FOOOCUS_CSS, js=js_full) as demo:
-        # ===== Galerie avancee (panneau plein largeur: meta, suppression, flou) =====
-        with gr.Accordion("Gallery (output folder)", open=False):
-            gr.Markdown("*Saved images on disk (manage: sort/filter/copy/delete/blur). "
-                        "For a full standalone page, use Models > Asset Browser.*")
-            with gr.Row():
-                g_refresh = gr.Button("Refresh", size="sm", scale=0, min_width=110)
-                g_sort = gr.Dropdown(["Newest", "Oldest", "Name"], value="Newest",
-                                     label="Sort", scale=1, min_width=120)
-                g_filter = gr.Textbox(label="Filter (name contains)", scale=2,
-                                      placeholder="txt2img, upscaled, inpaint, seed42...")
-                g_copy = gr.Button("Copy image", size="sm", scale=0, min_width=120)
-                g_blur = gr.Checkbox(value=False, label="Blur (NSFW)", min_width=120)
-            g_status = gr.Markdown("")
-            g_gallery = gr.Gallery(label=None, elem_id="cz_gallery", columns=5, height="62vh",
-                                   object_fit="contain", preview=True, allow_preview=True,
-                                   show_fullscreen_button=True, show_download_button=True)
-            g_state = gr.State([])
-            g_meta = gr.Markdown("*Select an image to see its info.*")
-            with gr.Row():
-                g_path = gr.Textbox(label="File path (select all to copy)", interactive=False, scale=4)
-                g_delete = gr.Button("Delete image", variant="stop", size="sm", scale=1, min_width=140)
+        # La galerie du dossier de sortie s'ouvre dans un nouvel onglet (Asset Browser),
+        # via le bouton sous l'apercu. Pas de panneau galerie inline.
+        gallery_url = gr.Textbox(visible=False)
 
         with gr.Row():
             # ===== Colonne principale (apercu en haut, prompt + Generate, negative, input) =====
@@ -2834,6 +2827,9 @@ def build_ui():
                     with gr.Row():
                         load_out_btn = gr.Button("Load output folder", size="sm")
                         clear_hist_btn = gr.Button("Clear history", size="sm")
+                        gallery_btn = gr.Button("\U0001F5BC️ Open Output Gallery (new tab)",
+                                                size="sm", variant="primary")
+                gallery_status = gr.Markdown("")
 
                 with gr.Row():
                     prompt = gr.Textbox(show_label=False, value=CONFIG.get("default_prompt", ""),
@@ -3202,29 +3198,9 @@ def build_ui():
         stop_btn.click(request_stop, None, [report])
         clear_hist_btn.click(_ui_clear_history, None, [history, history_gallery])
         load_out_btn.click(_ui_load_outputs, [output_dir], [history, history_gallery])
-        # Galerie avancee (panneau Gallery)
-        g_refresh.click(_gallery_load, [output_dir, g_sort, g_filter], [g_gallery, g_state, g_status])
-        g_sort.change(_gallery_load, [output_dir, g_sort, g_filter], [g_gallery, g_state, g_status])
-        g_filter.submit(_gallery_load, [output_dir, g_sort, g_filter], [g_gallery, g_state, g_status])
-        g_gallery.select(_gallery_selected, [g_state], [g_meta, g_path])
-        g_delete.click(_gallery_delete, [g_path, output_dir, g_sort, g_filter],
-                       [g_gallery, g_state, g_status, g_meta, g_path])
-        g_blur.change(None, [g_blur], None,
-                      js="(v) => { const el = document.getElementById('cz_gallery'); "
-                         "if (el) el.classList.toggle('cz-blur', v); }")
-        g_copy.click(None, None, None, js="""async () => {
-  const root = document.getElementById('cz_gallery'); if (!root) return;
-  let img = root.querySelector('.preview img') || root.querySelector('button.selected img')
-         || root.querySelector('img');
-  if (!img) return;
-  try {
-    const c = document.createElement('canvas');
-    c.width = img.naturalWidth || img.width; c.height = img.naturalHeight || img.height;
-    c.getContext('2d').drawImage(img, 0, 0);
-    c.toBlob(async (b) => { try { await navigator.clipboard.write(
-      [new ClipboardItem({'image/png': b})]); } catch (e) { console.log('clipboard', e); } }, 'image/png');
-  } catch (e) { console.log('copy', e); }
-}""")
+        # Galerie du dossier de sortie -> Asset Browser dans un nouvel onglet
+        gallery_btn.click(_ui_gallery_open, [output_dir], [gallery_status, gallery_url]).then(
+            None, [gallery_url], None, js="(u) => { if (u) window.open(u, '_blank'); }")
         preset.change(_apply_preset, [preset],
                       [factor, denoise, refine_steps, tile, overlap, refine_tile, refine_overlap, offload])
         _gen_inputs = [prompt, negative, styles, style_random, use_input, inp, input_mode,
