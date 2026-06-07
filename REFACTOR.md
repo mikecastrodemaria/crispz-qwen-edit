@@ -7,6 +7,12 @@ importing the moved names so nothing else changes, and each step is validated wi
 
 Do NOT do it all at once. One module per PR, smoke-green between each.
 
+## Progress
+- [x] **Step 0 — `cz_assets.py`** (zero-risk, no state): moved the big static strings
+  out of app.py (`ASSET_BROWSER_HTML`, `CZ_JS`, `FOOOCUS_CSS`). app.py imports them.
+  Validated: py_compile + `is`-identity asserts + build_ui + smoke 19/19. (~176 lines out)
+- [ ] Steps 1-8 below (touch mutable runtime state -> need an in-browser pass each).
+
 ## Target layout
 ```
 crispz_studio/
