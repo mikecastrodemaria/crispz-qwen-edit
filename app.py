@@ -727,12 +727,37 @@ def set_zimage_transformer(path):
         _log(f"Z-Image transformer -> {path or '(repo de base)'} -> will reload")
 
 
+def _safetensors_is_fp8(path):
+    """Vrai si le .safetensors contient des tenseurs FP8 (F8_E4M3/E5M2) -> ne charge
+    pas dans diffusers. Lit juste l'en-tete (rapide)."""
+    try:
+        import struct
+        with open(path, "rb") as f:
+            n = struct.unpack("<Q", f.read(8))[0]
+            hdr = json.loads(f.read(min(n, 2_000_000)).decode("utf-8", "ignore"))
+        for k, v in hdr.items():
+            if k != "__metadata__" and isinstance(v, dict):
+                if str(v.get("dtype", "")).upper().startswith("F8"):
+                    return True
+    except Exception:
+        pass
+    return False
+
+
 def list_checkpoints():
-    """Modeles Z-Image single-file (.safetensors) du dossier checkpoints."""
+    """Modeles Z-Image single-file (.safetensors) du dossier checkpoints. Exclut les
+    checkpoints FP8 (non charges par diffusers; prendre la version BF16/FP16)."""
     if not os.path.isdir(CHECKPOINTS_DIR):
         return []
-    return sorted(f for f in os.listdir(CHECKPOINTS_DIR)
-                  if f.lower().endswith((".safetensors", ".ckpt", ".pt", ".sft")))
+    out = []
+    for f in sorted(os.listdir(CHECKPOINTS_DIR)):
+        if not f.lower().endswith((".safetensors", ".ckpt", ".pt", ".sft")):
+            continue
+        if f.lower().endswith(".safetensors") and _safetensors_is_fp8(os.path.join(CHECKPOINTS_DIR, f)):
+            _log(f"checkpoint skipped (FP8, not supported by diffusers): {f}")
+            continue
+        out.append(f)
+    return out
 
 
 def list_loras():
