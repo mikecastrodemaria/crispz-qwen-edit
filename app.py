@@ -2099,8 +2099,9 @@ FOOOCUS_CSS = """
 /* Rendu homothetique: image entierement visible (contain), centree, jamais plus
    grande que la zone -> pas de scroll, pas de cover. La galerie se dimensionne a
    l'image (plafond 78vh), donc plus de bande vide ni d'image coupee. */
-#cz_result { min-height: 0 !important; }
-#cz_result .grid-wrap, #cz_result .grid-container { max-height: 80vh !important; }
+#cz_result { min-height: 60vh !important; }
+#cz_result .grid-wrap, #cz_result .grid-container { min-height: 58vh !important; max-height: 82vh !important; }
+#cz_result .empty, #cz_result .image-container { min-height: 56vh !important; }
 #cz_result img {
   object-fit: contain !important;
   max-width: 100% !important;
