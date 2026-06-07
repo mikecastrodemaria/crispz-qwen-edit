@@ -340,7 +340,96 @@ def _faceswap(target_img, source_img):
     res = tgt
     for f in tgt_faces:
         res = _FACE_SWAPPER.get(res, f, src_face, paste_back=True)
-    return Image.fromarray(res[:, :, ::-1])  # BGR -> RGB
+    out_img = Image.fromarray(res[:, :, ::-1])  # BGR -> RGB
+    # Restauration optionnelle du visage (GFPGAN) -> nettete (inswapper sort en 128px).
+    if FACESWAP_RESTORE:
+        out_img = _face_restore(out_img, tgt_faces, FACESWAP_RESTORE_BLEND)
+    return out_img
+
+
+# FFHQ 5-point template (alignement attendu par GFPGAN), normalise -> x512.
+_FFHQ_512 = np.array([
+    [0.37691676, 0.46864664], [0.62285697, 0.46912813], [0.50123859, 0.61331904],
+    [0.39308822, 0.72541100], [0.61150205, 0.72490465]], dtype=np.float32) * 512.0
+_FACE_RESTORE_SESSION = None
+
+
+def _resolve_face_restore_model():
+    """Trouve le modele GFPGAN (.onnx): config, emplacements usuels, sinon download."""
+    cfg = (CONFIG.get("faceswap_restore_path") or "").strip()
+    cands = [cfg] if cfg else []
+    for d in (os.path.join(HERE, "faceswap"), os.path.join(HERE, "models")):
+        cands += [os.path.join(d, "gfpgan_1.4.onnx")]
+    for p in cands:
+        if p and os.path.isfile(p):
+            return p
+    url = (CONFIG.get("faceswap_restore_url") or "").strip()
+    if url:
+        import urllib.request
+        dst_dir = os.path.join(HERE, "faceswap")
+        os.makedirs(dst_dir, exist_ok=True)
+        dst = os.path.join(dst_dir, "gfpgan_1.4.onnx")
+        _log(f"downloading GFPGAN restore model from {url} ...")
+        urllib.request.urlretrieve(url, dst)
+        return dst
+    return None
+
+
+def _get_face_restore_session():
+    global _FACE_RESTORE_SESSION
+    if _FACE_RESTORE_SESSION is not None:
+        return _FACE_RESTORE_SESSION
+    path = _resolve_face_restore_model()
+    if not path:
+        _log("GFPGAN restore model not found -> skip restore "
+             "(set faceswap_restore_url/path or drop gfpgan_1.4.onnx in faceswap/).")
+        return None
+    import onnxruntime as ort
+    _log(f"loading GFPGAN restore: {path}")
+    _FACE_RESTORE_SESSION = ort.InferenceSession(path, providers=ort.get_available_providers())
+    return _FACE_RESTORE_SESSION
+
+
+def _face_restore(image, faces, blend=0.8):
+    """Restaure (GFPGAN ONNX) chaque visage detecte: aligne en 512 (template FFHQ),
+    debruite/affine, recolle avec un masque adouci. Renvoie l'image PIL."""
+    sess = _get_face_restore_session()
+    if sess is None:
+        return image
+    import cv2
+    arr = np.asarray(image.convert("RGB"))[:, :, ::-1].astype(np.uint8).copy()  # BGR
+    h, w = arr.shape[:2]
+    iname = sess.get_inputs()[0].name
+    for f in faces:
+        try:
+            M, _ = cv2.estimateAffinePartial2D(f.kps.astype(np.float32), _FFHQ_512,
+                                               method=cv2.LMEDS)
+            if M is None:
+                continue
+            aligned = cv2.warpAffine(arr, M, (512, 512), borderMode=cv2.BORDER_REPLICATE)
+            blob = cv2.cvtColor(aligned, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+            blob = ((blob - 0.5) / 0.5).transpose(2, 0, 1)[None].astype(np.float32)
+            out = sess.run(None, {iname: blob})[0][0]
+            out = np.clip(out.transpose(1, 2, 0) * 0.5 + 0.5, 0, 1)
+            out = cv2.cvtColor((out * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
+            IM = cv2.invertAffineTransform(M)
+            back = cv2.warpAffine(out, IM, (w, h))
+            mask = cv2.warpAffine(np.full((512, 512), 255, np.uint8), IM, (w, h))
+            mask = cv2.erode(mask, np.ones((12, 12), np.uint8))
+            mask = (cv2.GaussianBlur(mask, (0, 0), 8).astype(np.float32) / 255.0)
+            mask = (mask * float(blend))[:, :, None]
+            arr = (back * mask + arr * (1 - mask)).astype(np.uint8)
+        except Exception as e:
+            _log(f"face restore (one face) skipped: {e}")
+    return Image.fromarray(arr[:, :, ::-1])
+
+
+def set_faceswap_restore(enabled, blend):
+    """Active/desactive la restauration GFPGAN apres le swap + son intensite."""
+    global FACESWAP_RESTORE, FACESWAP_RESTORE_BLEND
+    FACESWAP_RESTORE = bool(enabled)
+    FACESWAP_RESTORE_BLEND = float(blend)
+    return f"Face restore (GFPGAN): {'on' if enabled else 'off'} (blend {blend})"
 
 
 def _remove_bg(image):
@@ -499,6 +588,9 @@ OLLAMA_URL = (os.environ.get("OLLAMA_URL") or _prefs.get("ollama_url")
 # decharge immediatement -> libere la VRAM avant la generation Z-Image (evite la
 # concurrence VRAM sur un seul GPU). Peut etre un nombre (s) ou "30s"/"5m"/-1.
 OLLAMA_KEEP_ALIVE = CONFIG.get("ollama_keep_alive", 0)
+# FaceSwap: restauration GFPGAN post-swap (nettete du visage). Reglable via l'UI.
+FACESWAP_RESTORE = bool(CONFIG.get("faceswap_restore", False))
+FACESWAP_RESTORE_BLEND = float(CONFIG.get("faceswap_restore_blend", 0.8))
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16
 
@@ -2182,6 +2274,14 @@ def build_ui():
                                         "`faceswap_model_path` (inswapper .onnx) set in config.txt.*")
                             faceswap_src = gr.Image(type="pil", label="Source face", height=240)
                             faceswap_enable = gr.Checkbox(value=False, label="Apply face swap to result")
+                            faceswap_restore_cb = gr.Checkbox(
+                                value=FACESWAP_RESTORE,
+                                label="Restore face (GFPGAN) - fixes the soft 128px swap",
+                                info="Sharpens the swapped face. Downloads gfpgan_1.4.onnx on first "
+                                     "use (faceswap_restore_url in config.txt).")
+                            faceswap_restore_blend = gr.Slider(0.0, 1.0, value=float(FACESWAP_RESTORE_BLEND),
+                                                               step=0.05, label="Restore strength")
+                            faceswap_restore_status = gr.Markdown("")
 
             # ===== Colonne Advanced (a droite, masquee par defaut comme Fooocus) =====
             with gr.Column(scale=2, visible=False) as advanced_col:
@@ -2343,6 +2443,12 @@ def build_ui():
                           [prompt, compose_status])
         rembg_btn.click(_ui_remove_bg, [rembg_img, history, save_mode, output_dir],
                         [out, report, history, history_gallery])
+        faceswap_restore_cb.change(set_faceswap_restore,
+                                   [faceswap_restore_cb, faceswap_restore_blend],
+                                   [faceswap_restore_status])
+        faceswap_restore_blend.change(set_faceswap_restore,
+                                      [faceswap_restore_cb, faceswap_restore_blend],
+                                      [faceswap_restore_status])
         reframe_btn.click(_ui_reframe,
                           [reframe_img, reframe_ratio, reframe_steps, prompt, guidance, offload,
                            seed, save_mode, output_dir, output_format, history],
