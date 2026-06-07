@@ -21,6 +21,7 @@ import os
 import sys
 import gc
 import io
+import random
 import warnings
 
 # Masque les DeprecationWarning Gradio "pass theme/css/js to launch() instead":
@@ -151,6 +152,15 @@ def _filter_styles(query, selected):
     # choices = resultats + styles coches (pour ne pas perdre la selection)
     choices = list(dict.fromkeys(matches + selected))
     return gr.update(choices=choices, value=selected)
+
+
+def _pick_styles(selected, randomize):
+    """Si randomize: tire 1 style au hasard dans la selection (ou dans TOUS les
+    styles si rien n'est selectionne). Sinon renvoie la selection telle quelle."""
+    if not randomize:
+        return list(selected or [])
+    pool = [s for s in (selected or []) if s in STYLES] or list(STYLES)
+    return [random.choice(pool)] if pool else []
 
 
 def _apply_styles(prompt, negative, style_names):
@@ -2242,7 +2252,7 @@ def _ui_txt2img(prompt, negative, width, height, gen_steps, seed, guidance, upsc
     return result, rep
 
 
-def _ui_generate(prompt, negative, styles, use_input, input_image,
+def _ui_generate(prompt, negative, styles, style_random, use_input, input_image,
                  input_mode, ref1, ref2, ref3, ref4, faceswap_enable, faceswap_src,
                  width, height, gen_steps, image_number, seed, guidance, offload_mode,
                  esrgan_model, do_esrgan, factor, denoise, refine_steps,
@@ -2284,7 +2294,7 @@ def _ui_generate(prompt, negative, styles, use_input, input_image,
     try:
         set_offload_mode(offload_mode)
         set_guidance(guidance)
-        full_prompt, full_negative = _apply_styles(prompt, negative, styles)
+        full_prompt, full_negative = _apply_styles(prompt, negative, _pick_styles(styles, style_random))
         mode = "img2img/upscale" if (use_input and input_image is not None) else "txt2img"
         _log(f"Generate ({mode})")
         _dbg(f"params: mode={mode} use_input={use_input} has_img={input_image is not None} "
@@ -2337,7 +2347,13 @@ def _ui_generate(prompt, negative, styles, use_input, input_image,
                 break
             s = (int(seed) + i) if int(seed) >= 0 else -1
             progress(i / n, desc=f"Image {i + 1}/{n}")
-            img, t = txt2img_run(full_prompt, width, height, gen_steps, s, full_negative,
+            # Style aleatoire par image si demande (sinon = la selection)
+            chosen = _pick_styles(styles, style_random)
+            fp, fn = (_apply_styles(prompt, negative, chosen) if style_random
+                      else (full_prompt, full_negative))
+            if style_random:
+                _log(f"random style #{i + 1}: {chosen}")
+            img, t = txt2img_run(fp, width, height, gen_steps, s, fn,
                                  upscale=False, steps=refine_steps)
             images.append(img)
             total_t += t["txt2img"]
@@ -2348,8 +2364,8 @@ def _ui_generate(prompt, negative, styles, use_input, input_image,
                                             index=(i + 1 if n > 1 else 0))
                     if dst:
                         save_image(img, dst, output_format, meta=_gen_meta(
-                            "txt2img", full_prompt, full_negative, s, gen_steps, GUIDANCE,
-                            img.size, extra={"styles": styles} if styles else None))
+                            "txt2img", fp, fn, s, gen_steps, GUIDANCE,
+                            img.size, extra={"styles": chosen} if chosen else None))
                         _dbg(f"saved: {dst}")
                 except Exception as e:
                     _dbg(f"save failed: {e}")
@@ -2677,6 +2693,10 @@ def build_ui():
                     with gr.Tab("Styles"):
                         style_search = gr.Textbox(show_label=False, container=False,
                                                   placeholder="Search styles... (e.g. anime, cinematic, sai)")
+                        style_random = gr.Checkbox(
+                            value=False, label="Random style each image",
+                            info="Each render picks a random style from the selected ones "
+                                 "(or from ALL styles if none selected).")
                         gr.Markdown("*Hover a style to preview it.*")
                         styles = gr.CheckboxGroup(list(STYLES), value=CONFIG.get("default_styles", []),
                                                   label="Styles (combinable)", elem_id="cz_styles")
@@ -2853,7 +2873,8 @@ def build_ui():
 }""")
         preset.change(_apply_preset, [preset],
                       [factor, denoise, refine_steps, tile, overlap, refine_tile, refine_overlap, offload])
-        _gen_inputs = [prompt, negative, styles, use_input, inp, input_mode, ref1, ref2, ref3, ref4,
+        _gen_inputs = [prompt, negative, styles, style_random, use_input, inp, input_mode,
+                       ref1, ref2, ref3, ref4,
                        faceswap_enable, faceswap_src,
                        width, height, gen_steps, image_number,
                        seed, guidance, offload, esrgan, do_esrgan_cb, factor, denoise, refine_steps,
