@@ -2827,8 +2827,8 @@ def build_ui():
                     with gr.Row():
                         load_out_btn = gr.Button("Load output folder", size="sm")
                         clear_hist_btn = gr.Button("Clear history", size="sm")
-                        gallery_btn = gr.Button("\U0001F5BC️ Open Output Gallery (new tab)",
-                                                size="sm", variant="primary")
+                        gallery_btn = gr.Button("\U0001F5BC️ Asset Browser", size="sm",
+                                                variant="primary")
                 gallery_status = gr.Markdown("")
 
                 with gr.Row():
