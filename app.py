@@ -123,14 +123,12 @@ PERFORMANCE = {
 # Styles. Format Fooocus: nom -> {"prompt": template avec {prompt} (ou None),
 # "negative_prompt": str}. La vraie biblio est chargee depuis styles/*.json (cf.
 # _load_styles plus bas). Ceci n'est qu'un fallback si le dossier est absent.
-_FALLBACK_STYLES = {
-    "Fooocus Cinematic": {"prompt": "cinematic still {prompt} . emotional, harmonious, vignette, highly detailed, high budget, bokeh, cinemascope, moody, epic, gorgeous, film grain, grainy",
-                          "negative_prompt": "anime, cartoon, graphic, text, painting, crayon, graphite, abstract, glitch, deformed, mutated, ugly, disfigured"},
-    "SAI Photographic": {"prompt": "cinematic photo {prompt} . 35mm photograph, film, bokeh, professional, 4k, highly detailed",
-                         "negative_prompt": "drawing, painting, crayon, sketch, graphite, impressionist, noisy, blurry, soft, deformed, ugly"},
-    "SAI Anime": {"prompt": "anime artwork {prompt} . anime style, key visual, vibrant, studio anime, highly detailed",
-                  "negative_prompt": "photo, deformed, black and white, realism, disfigured, low contrast"},
-}
+# Styles (Fooocus) + wildcards (__name__) -> cz_prompt.py. Les handlers UI restent ici.
+import cz_prompt
+from cz_prompt import (  # noqa: E402,F401
+    STYLES, _seed_rng, list_wildcards, _apply_wildcards, _pick_styles, _apply_styles,
+    set_wildcards_dir,
+)
 
 
 def _style_sample(name):
@@ -153,75 +151,7 @@ def _filter_styles(query, selected):
     return gr.update(choices=choices, value=selected)
 
 
-def _seed_rng(seed):
-    """RNG reproductible si seed>=0 (memes wildcards/styles pour une meme seed)."""
-    try:
-        s = int(seed)
-        return random.Random(s) if s >= 0 else random.Random()
-    except Exception:
-        return random.Random()
-
-
-def list_wildcards():
-    if not os.path.isdir(WILDCARDS_DIR):
-        return []
-    return sorted(f[:-4] for f in os.listdir(WILDCARDS_DIR) if f.lower().endswith(".txt"))
-
-
-def _apply_wildcards(text, rng=None):
-    """Remplace les __nom__ par une ligne aleatoire de wildcards/nom.txt (gere
-    l'imbrication: une ligne peut contenir d'autres __wildcards__)."""
-    if not text or "__" not in text:
-        return text
-    import re
-    rng = rng or random
-    for _ in range(64):  # garde-fou anti-boucle
-        m = re.search(r"__([A-Za-z0-9_\-/]+)__", text)
-        if not m:
-            break
-        name = m.group(1)
-        path = os.path.join(WILDCARDS_DIR, name + ".txt")
-        repl = ""
-        if os.path.isfile(path):
-            try:
-                with open(path, "r", encoding="utf-8", errors="ignore") as fh:
-                    lines = [ln.strip() for ln in fh
-                             if ln.strip() and not ln.lstrip().startswith("#")]
-                if lines:
-                    repl = rng.choice(lines)
-            except Exception:
-                pass
-        text = text[:m.start()] + repl + text[m.end():]
-    return text
-
-
-def _pick_styles(selected, randomize):
-    """Si randomize: tire 1 style au hasard dans la selection (ou dans TOUS les
-    styles si rien n'est selectionne). Sinon renvoie la selection telle quelle."""
-    if not randomize:
-        return list(selected or [])
-    pool = [s for s in (selected or []) if s in STYLES] or list(STYLES)
-    return [random.choice(pool)] if pool else []
-
-
-def _apply_styles(prompt, negative, style_names):
-    """Applique les styles Fooocus: enchaine les templates {prompt} et cumule les
-    negative_prompt. Renvoie (prompt_final, negative_final)."""
-    cur = (prompt or "").strip()
-    negs = [(negative or "").strip()] if (negative or "").strip() else []
-    for n in (style_names or []):
-        s = STYLES.get(n)
-        if not s:
-            continue
-        tmpl = s.get("prompt")
-        if tmpl and "{prompt}" in tmpl:
-            cur = tmpl.replace("{prompt}", cur).strip()
-        elif tmpl:
-            cur = f"{cur}, {tmpl}".strip(" ,")
-        neg = s.get("negative_prompt")
-        if neg:
-            negs.append(neg)
-    return cur.strip(" ,"), ", ".join(negs)
+# _seed_rng / list_wildcards / _apply_wildcards / _pick_styles / _apply_styles -> cz_prompt.py
 
 
 # ----------------------------------------------------------------------------
@@ -438,28 +368,7 @@ def _remove_bg(image):
 import json  # noqa: F811 (utilise par _load_styles ci-dessous)
 
 
-def _load_styles():
-    """Charge la biblio de styles depuis styles/*.json (format Fooocus:
-    {name, prompt avec {prompt}, negative_prompt}). Vide -> fallback."""
-    out = {}
-    sdir = os.path.join(HERE, "styles")
-    if os.path.isdir(sdir):
-        for fn in sorted(os.listdir(sdir)):
-            if not fn.lower().endswith(".json"):
-                continue
-            try:
-                with open(os.path.join(sdir, fn), "r", encoding="utf-8") as f:
-                    for s in (json.load(f) or []):
-                        name = s.get("name")
-                        if name:
-                            out[name] = {"prompt": s.get("prompt"),
-                                         "negative_prompt": s.get("negative_prompt", "")}
-            except Exception:
-                pass
-    return out
-
-
-STYLES = _load_styles() or _FALLBACK_STYLES
+# _load_styles / STYLES -> cz_prompt.py (importes en tete).
 
 
 # CONFIG + defauts pilotes par config.txt -> cz_core.py (importes en tete).
@@ -496,8 +405,7 @@ CHECKPOINTS_DIR = (os.environ.get("CHECKPOINTS_DIR") or _prefs.get("checkpoints_
                    or CONFIG.get("checkpoints_dir") or os.path.join(HERE, "checkpoints"))
 LORAS_DIR = (os.environ.get("LORAS_DIR") or _prefs.get("loras_dir")
              or CONFIG.get("loras_dir") or os.path.join(HERE, "loras"))
-WILDCARDS_DIR = (os.environ.get("WILDCARDS_DIR") or _prefs.get("wildcards_dir")
-                 or CONFIG.get("wildcards_dir") or os.path.join(HERE, "wildcards"))
+# Le dossier wildcards et son setter sont dans cz_prompt (lu via cz_prompt point dir).
 # LoRA active (chemin .safetensors) + poids. Inclus dans la clef de cache du pipe.
 # LoRA actives: liste de (chemin, poids). Plusieurs LoRA combinables (multi-slots).
 LORAS = []
@@ -661,12 +569,6 @@ def set_loras_dir(path):
     global LORAS_DIR
     if path:
         LORAS_DIR = path
-
-
-def set_wildcards_dir(path):
-    global WILDCARDS_DIR
-    if path:
-        WILDCARDS_DIR = path
 
 
 def _read_safetensors_metadata(path):
@@ -1560,19 +1462,19 @@ def _ui_wild_refresh(new_dir):
     """Change le dossier + rafraichit le dropdown de tous les wildcards + persiste."""
     set_wildcards_dir(new_dir)
     try:
-        _save_prefs_keys({"wildcards_dir": WILDCARDS_DIR})
+        _save_prefs_keys({"wildcards_dir": cz_prompt.WILDCARDS_DIR})
     except Exception:
         pass
     w = list_wildcards()
     return gr.update(choices=["None"] + w, value="None"), \
-        f"{len(w)} wildcard file(s) in {WILDCARDS_DIR} (saved)."
+        f"{len(w)} wildcard file(s) in {cz_prompt.WILDCARDS_DIR} (saved)."
 
 
 def _ui_wild_load(name):
     """Charge le contenu du wildcard selectionne dans l'editeur."""
     if not name or name == "None":
         return "", ""
-    p = os.path.join(WILDCARDS_DIR, name + ".txt")
+    p = os.path.join(cz_prompt.WILDCARDS_DIR, name + ".txt")
     try:
         with open(p, "r", encoding="utf-8", errors="ignore") as f:
             txt = f.read()
@@ -1598,8 +1500,8 @@ def _ui_wild_save(name, content):
     if not n:
         return "Pick a wildcard file (or use Create new)."
     try:
-        os.makedirs(WILDCARDS_DIR, exist_ok=True)
-        with open(os.path.join(WILDCARDS_DIR, n + ".txt"), "w", encoding="utf-8") as f:
+        os.makedirs(cz_prompt.WILDCARDS_DIR, exist_ok=True)
+        with open(os.path.join(cz_prompt.WILDCARDS_DIR, n + ".txt"), "w", encoding="utf-8") as f:
             f.write(content or "")
         return f"Saved {n}.txt."
     except Exception as e:
@@ -1612,8 +1514,8 @@ def _ui_wild_create(newname, content):
     if not n:
         return gr.update(), "Enter a valid name (letters/digits/_/-).", newname
     try:
-        os.makedirs(WILDCARDS_DIR, exist_ok=True)
-        with open(os.path.join(WILDCARDS_DIR, n + ".txt"), "w", encoding="utf-8") as f:
+        os.makedirs(cz_prompt.WILDCARDS_DIR, exist_ok=True)
+        with open(os.path.join(cz_prompt.WILDCARDS_DIR, n + ".txt"), "w", encoding="utf-8") as f:
             f.write(content or "")
         return gr.update(choices=["None"] + list_wildcards(), value=n), f"Created {n}.txt.", ""
     except Exception as e:
@@ -1701,9 +1603,9 @@ def _save_paths_to_prefs(esrgan_dir, zimage_model, checkpoints_dir=None, loras_d
         set_wildcards_dir(wildcards_dir)
     _save_prefs_keys({"esrgan_dir": ESRGAN_DIR, "zimage_model": BASE_REPO,
                       "checkpoints_dir": CHECKPOINTS_DIR, "loras_dir": LORAS_DIR,
-                      "wildcards_dir": WILDCARDS_DIR})
+                      "wildcards_dir": cz_prompt.WILDCARDS_DIR})
     return (f"Saved to {PREFS_PATH}: esrgan_dir, zimage_model, checkpoints_dir, "
-            f"loras_dir, wildcards_dir={WILDCARDS_DIR}")
+            f"loras_dir, wildcards_dir={cz_prompt.WILDCARDS_DIR}")
 
 
 # Ordre des composants mis a jour par le dropdown de presets (doit matcher l'UI).
@@ -2496,7 +2398,7 @@ def build_ui():
                         gr.Markdown("*`__name__` in the prompt -> a random line from name.txt "
                                     "(nested, reproducible per seed). Pick a file to view/edit it, "
                                     "Insert to add it to the prompt, or Create a new one.*")
-                        wild_dir_tb = gr.Textbox(value=WILDCARDS_DIR, label="Wildcards folder")
+                        wild_dir_tb = gr.Textbox(value=cz_prompt.WILDCARDS_DIR, label="Wildcards folder")
                         with gr.Row():
                             wild_dd = gr.Dropdown(["None"] + list_wildcards(), value="None",
                                                   label="Wildcard file", scale=3)
