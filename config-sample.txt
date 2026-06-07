@@ -5,6 +5,7 @@
     "ollama_compose_prompt": "You are an expert text-to-image prompt writer. Below are descriptions of several reference images. Merge their key elements (subject, clothing, pose, setting, style) into ONE single coherent, detailed image prompt. Output ONLY the prompt (comma-separated), no preamble.\n\n{descriptions}",
     "ollama_vision_blocklist": [],
     "ollama_keep_alive": 0,
+    "ollama_cpu": false,
 
     "performance_presets": {
         "Turbo (8 steps)": [8, 0.0],

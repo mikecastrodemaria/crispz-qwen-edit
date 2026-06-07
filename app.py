@@ -275,8 +275,7 @@ def _ollama_describe(image, model, base=None):
     b64 = _pil_to_b64_jpeg(image, max_side=1024)
     out = _ollama_http("/api/generate",
                        {"model": model, "prompt": DESCRIBE_INSTRUCTION, "images": [b64],
-                        "stream": False, "keep_alive": OLLAMA_KEEP_ALIVE},
-                       base=base, timeout=180)
+                        **_ollama_gen_opts()}, base=base, timeout=180)
     return (out.get("response") or "").strip()
 
 
@@ -286,8 +285,7 @@ def _ollama_improve(prompt_text, model, base=None):
     pt = prompt_text or ""
     instr = (IMPROVE_INSTRUCTION.replace("{prompt}", pt) if "{prompt}" in IMPROVE_INSTRUCTION
              else f"{IMPROVE_INSTRUCTION}\n\nPROMPT: {pt}")
-    out = _ollama_http("/api/generate", {"model": model, "prompt": instr, "stream": False,
-                                         "keep_alive": OLLAMA_KEEP_ALIVE},
+    out = _ollama_http("/api/generate", {"model": model, "prompt": instr, **_ollama_gen_opts()},
                        base=base, timeout=120)
     return (out.get("response") or "").strip()
 
@@ -298,8 +296,7 @@ def _ollama_compose(captions, model, base=None):
     instr = (COMPOSE_INSTRUCTION.replace("{descriptions}", listing)
              if "{descriptions}" in COMPOSE_INSTRUCTION
              else f"{COMPOSE_INSTRUCTION}\n\n{listing}")
-    out = _ollama_http("/api/generate", {"model": model, "prompt": instr, "stream": False,
-                                         "keep_alive": OLLAMA_KEEP_ALIVE},
+    out = _ollama_http("/api/generate", {"model": model, "prompt": instr, **_ollama_gen_opts()},
                        base=base, timeout=120)
     return (out.get("response") or "").strip()
 
@@ -675,6 +672,16 @@ OLLAMA_URL = (os.environ.get("OLLAMA_URL") or _prefs.get("ollama_url")
 # decharge immediatement -> libere la VRAM avant la generation Z-Image (evite la
 # concurrence VRAM sur un seul GPU). Peut etre un nombre (s) ou "30s"/"5m"/-1.
 OLLAMA_KEEP_ALIVE = CONFIG.get("ollama_keep_alive", 0)
+# Force Ollama sur CPU (num_gpu=0) -> 0 VRAM partagee avec Z-Image (plus lent).
+OLLAMA_CPU = bool(CONFIG.get("ollama_cpu", False))
+
+
+def _ollama_gen_opts():
+    """Options communes pour /api/generate (keep_alive + CPU optionnel)."""
+    p = {"stream": False, "keep_alive": OLLAMA_KEEP_ALIVE}
+    if OLLAMA_CPU:
+        p["options"] = {"num_gpu": 0}
+    return p
 # FaceSwap: restauration GFPGAN post-swap (nettete du visage). Reglable via l'UI.
 FACESWAP_RESTORE = bool(CONFIG.get("faceswap_restore", False))
 FACESWAP_RESTORE_BLEND = float(CONFIG.get("faceswap_restore_blend", 0.8))

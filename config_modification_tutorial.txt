@@ -31,6 +31,9 @@ ollama_vision_blocklist List of model-name substrings to EXCLUDE from the vision
                         model list (Describe / Vision Mix), even if Ollama reports
                         them as vision-capable. e.g. ["qwen3.6"] to hide a model
                         that claims vision but doesn't work well.
+ollama_cpu              true -> run the Ollama vision/LLM on CPU (num_gpu=0): zero
+                        VRAM shared with Z-Image (slower captions). Good if your GPU
+                        is tight when using Describe / Vision Mix during generation.
 ollama_keep_alive       How long Ollama keeps the model in VRAM after a call.
                         0 (default) = unload immediately so the VRAM is freed
                         before Z-Image generates (avoids GPU competition on one
