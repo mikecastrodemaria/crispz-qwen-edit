@@ -1572,11 +1572,18 @@ def _ui_check_omni():
     return check_omni_available()
 
 
-def _save_paths_to_prefs(esrgan_dir, zimage_model):
+def _save_paths_to_prefs(esrgan_dir, zimage_model, checkpoints_dir=None, loras_dir=None):
+    """Persiste les chemins dans preferences.json (local) -> charges au prochain boot."""
     set_esrgan_dir(esrgan_dir)
     set_zimage_model(zimage_model)
-    _save_prefs_keys({"esrgan_dir": ESRGAN_DIR, "zimage_model": BASE_REPO})
-    return f"Saved to {PREFS_PATH}: esrgan_dir={ESRGAN_DIR}, zimage_model={BASE_REPO}"
+    if checkpoints_dir:
+        set_checkpoints_dir(checkpoints_dir)
+    if loras_dir:
+        set_loras_dir(loras_dir)
+    _save_prefs_keys({"esrgan_dir": ESRGAN_DIR, "zimage_model": BASE_REPO,
+                      "checkpoints_dir": CHECKPOINTS_DIR, "loras_dir": LORAS_DIR})
+    return (f"Saved to {PREFS_PATH}: esrgan_dir, zimage_model, "
+            f"checkpoints_dir={CHECKPOINTS_DIR}, loras_dir={LORAS_DIR}")
 
 
 # Ordre des composants mis a jour par le dropdown de presets (doit matcher l'UI).
@@ -2308,7 +2315,9 @@ def build_ui():
         # Actions
         refresh_btn.click(_refresh_models, [esrgan_dir_tb], [esrgan, paths_status])
         apply_zimage_btn.click(_apply_zimage, [zimage_model_tb], [paths_status])
-        save_paths_btn.click(_save_paths_to_prefs, [esrgan_dir_tb, zimage_model_tb], [paths_status])
+        save_paths_btn.click(_save_paths_to_prefs,
+                             [esrgan_dir_tb, zimage_model_tb, ckpt_dir_tb, lora_dir_tb],
+                             [paths_status])
         ckpt_refresh_btn.click(_refresh_checkpoints, [ckpt_dir_tb], [ckpt_dd, ckpt_status])
         ckpt_dd.change(_apply_checkpoint, [ckpt_dd], [ckpt_status])
         transformer_apply_btn.click(_apply_transformer_repo, [transformer_tb], [ckpt_status])
