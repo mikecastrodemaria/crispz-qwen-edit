@@ -2005,9 +2005,23 @@ def _ui_load_outputs(output_dir):
 
 
 # ---- Galerie avancee (panneau dedie: meta, suppression, flou) ----
-def _gallery_load(output_dir):
-    files = _list_output_files(output_dir)
-    return files, files, f"{len(files)} image(s) in the output folder."
+def _gallery_filtered(output_dir, sort="Newest", filt=""):
+    files = _list_output_files(output_dir, 4000)
+    if filt:
+        f = filt.lower()
+        files = [p for p in files if f in os.path.basename(p).lower()]
+    if sort == "Oldest":
+        files.sort(key=os.path.getmtime)
+    elif sort == "Name":
+        files.sort(key=lambda p: os.path.basename(p).lower())
+    else:  # Newest
+        files.sort(key=os.path.getmtime, reverse=True)
+    return files[:300]
+
+
+def _gallery_load(output_dir, sort="Newest", filt=""):
+    files = _gallery_filtered(output_dir, sort, filt)
+    return files, files, f"{len(files)} image(s)."
 
 
 def _read_image_meta(path):
@@ -2069,8 +2083,8 @@ def _gallery_selected(paths, evt: gr.SelectData):
     return "  \n".join(info), path
 
 
-def _gallery_delete(path, output_dir):
-    """Supprime le fichier selectionne puis recharge la galerie."""
+def _gallery_delete(path, output_dir, sort="Newest", filt=""):
+    """Supprime le fichier selectionne (+ sidecar) puis recharge la galerie."""
     msg = "Nothing to delete."
     if path and os.path.isfile(path):
         try:
@@ -2080,7 +2094,7 @@ def _gallery_delete(path, output_dir):
             msg = f"Deleted {os.path.basename(path)}."
         except Exception as e:
             msg = f"Delete failed: {e}"
-    files = _list_output_files(output_dir)
+    files = _gallery_filtered(output_dir, sort, filt)
     return files, files, msg, "*Select an image to see its info.*", ""
 
 
@@ -2403,9 +2417,14 @@ def build_ui():
         # ===== Galerie avancee (panneau plein largeur: meta, suppression, flou) =====
         with gr.Accordion("Gallery (output folder)", open=False):
             with gr.Row():
-                g_refresh = gr.Button("Refresh", size="sm")
-                g_blur = gr.Checkbox(value=False, label="Blur thumbnails (NSFW)", min_width=200)
-                g_status = gr.Markdown("")
+                g_refresh = gr.Button("Refresh", size="sm", scale=0, min_width=110)
+                g_sort = gr.Dropdown(["Newest", "Oldest", "Name"], value="Newest",
+                                     label="Sort", scale=1, min_width=120)
+                g_filter = gr.Textbox(label="Filter (name contains)", scale=2,
+                                      placeholder="txt2img, upscaled, inpaint, seed42...")
+                g_copy = gr.Button("Copy image", size="sm", scale=0, min_width=120)
+                g_blur = gr.Checkbox(value=False, label="Blur (NSFW)", min_width=120)
+            g_status = gr.Markdown("")
             g_gallery = gr.Gallery(label=None, elem_id="cz_gallery", columns=5, height="62vh",
                                    object_fit="contain", preview=True, allow_preview=True,
                                    show_fullscreen_button=True, show_download_button=True)
@@ -2746,13 +2765,28 @@ def build_ui():
         clear_hist_btn.click(_ui_clear_history, None, [history, history_gallery])
         load_out_btn.click(_ui_load_outputs, [output_dir], [history, history_gallery])
         # Galerie avancee (panneau Gallery)
-        g_refresh.click(_gallery_load, [output_dir], [g_gallery, g_state, g_status])
+        g_refresh.click(_gallery_load, [output_dir, g_sort, g_filter], [g_gallery, g_state, g_status])
+        g_sort.change(_gallery_load, [output_dir, g_sort, g_filter], [g_gallery, g_state, g_status])
+        g_filter.submit(_gallery_load, [output_dir, g_sort, g_filter], [g_gallery, g_state, g_status])
         g_gallery.select(_gallery_selected, [g_state], [g_meta, g_path])
-        g_delete.click(_gallery_delete, [g_path, output_dir],
+        g_delete.click(_gallery_delete, [g_path, output_dir, g_sort, g_filter],
                        [g_gallery, g_state, g_status, g_meta, g_path])
         g_blur.change(None, [g_blur], None,
                       js="(v) => { const el = document.getElementById('cz_gallery'); "
                          "if (el) el.classList.toggle('cz-blur', v); }")
+        g_copy.click(None, None, None, js="""async () => {
+  const root = document.getElementById('cz_gallery'); if (!root) return;
+  let img = root.querySelector('.preview img') || root.querySelector('button.selected img')
+         || root.querySelector('img');
+  if (!img) return;
+  try {
+    const c = document.createElement('canvas');
+    c.width = img.naturalWidth || img.width; c.height = img.naturalHeight || img.height;
+    c.getContext('2d').drawImage(img, 0, 0);
+    c.toBlob(async (b) => { try { await navigator.clipboard.write(
+      [new ClipboardItem({'image/png': b})]); } catch (e) { console.log('clipboard', e); } }, 'image/png');
+  } catch (e) { console.log('copy', e); }
+}""")
         preset.change(_apply_preset, [preset],
                       [factor, denoise, refine_steps, tile, overlap, refine_tile, refine_overlap, offload])
         _gen_inputs = [prompt, negative, styles, use_input, inp, input_mode, ref1, ref2, ref3, ref4,
