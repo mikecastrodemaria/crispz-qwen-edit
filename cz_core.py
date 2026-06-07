@@ -18,8 +18,11 @@ la valeur a jour. _log/_dbg lisent la valeur vive ici, donc les importer est san
 import os
 import sys
 import json
+import io
+import base64
 
 import torch
+from PIL import Image
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PREFS_PATH = os.path.join(HERE, "preferences.json")
@@ -174,3 +177,22 @@ def _dbg(msg):
     """Log niveau debug (visible seulement en LOG_LEVEL >= 2)."""
     if LOG_LEVEL >= 2:
         print(f"[crispz][dbg] {msg}", file=sys.stderr, flush=True)
+
+
+def _pil_to_b64_jpeg(img, max_side=1600, quality=85):
+    """Reduit + encode une image PIL en JPEG base64 (pour Ollama ou un <img> HTML)."""
+    if img is None:
+        return None
+    img = img.convert("RGB")
+    w, h = img.size
+    if max(w, h) > max_side:
+        if w >= h:
+            new_w = max_side
+            new_h = int(h * max_side / w)
+        else:
+            new_h = max_side
+            new_w = int(w * max_side / h)
+        img = img.resize((new_w, new_h), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=quality, optimize=True)
+    return base64.b64encode(buf.getvalue()).decode("ascii")

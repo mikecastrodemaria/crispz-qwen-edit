@@ -82,7 +82,7 @@ from cz_core import (  # noqa: E402,F401
     DESCRIBE_INSTRUCTION, IMPROVE_INSTRUCTION, COMPOSE_INSTRUCTION,
     DEVICE, DTYPE, VERBOSE,
     _load_config, _load_prefs_raw, _save_prefs_keys, _prefs, _is_single_file,
-    _parse_log_level, _LOG_NAMES, set_log_level, _log, _dbg,
+    _parse_log_level, _LOG_NAMES, set_log_level, _log, _dbg, _pil_to_b64_jpeg,
 )
 
 # Presets "cas d'usage" -> reglages auto. Seules les cles presentes sont appliquees,
@@ -227,77 +227,11 @@ def _apply_styles(prompt, negative, style_names):
 # ----------------------------------------------------------------------------
 # Ollama (Describe image -> prompt, Improve prompt). + fallback local BLIP.
 # ----------------------------------------------------------------------------
-def _ollama_http(path, payload=None, base=None, timeout=8):
-    import urllib.request
-    b = (base or OLLAMA_URL).rstrip("/")
-    data = json.dumps(payload).encode() if payload is not None else None
-    req = urllib.request.Request(b + path, data=data,
-                                 headers={"Content-Type": "application/json"} if data else {})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode())
-
-
-def _ollama_vision_models(base=None):
-    """Modeles Ollama reellement capables de vision. On se fie a la capacite
-    'vision' rapportee par /api/show (source autoritaire d'Ollama). Si /api/show
-    echoue (vieille version), repli sur un nom clairement multimodal. On NE se fie
-    PAS aux familles (clip...) qui donnent des faux positifs (ex. qwen3.6)."""
-    _VISION_NAME = ("llava", "-vl", "vl:", "moondream", "minicpm-v", "bakllava",
-                    "llama3.2-vision", "llama-3.2-vision")
-    block = [b.lower() for b in (CONFIG.get("ollama_vision_blocklist") or []) if b]
-    tags = _ollama_http("/api/tags", base=base, timeout=5)
-    names = [m.get("name") for m in tags.get("models", []) if m.get("name")]
-    vision = []
-    for n in names:
-        if any(b in n.lower() for b in block):   # exclu par l'utilisateur (config)
-            continue
-        try:
-            info = _ollama_http("/api/show", {"model": n}, base=base, timeout=8)
-            caps = [c.lower() for c in (info.get("capabilities") or [])]
-            if "vision" in caps:               # verite Ollama -> on garde
-                vision.append(n)
-            elif not info.get("capabilities"):  # champ absent (vieux Ollama)
-                if any(k in n.lower() for k in _VISION_NAME):
-                    vision.append(n)
-        except Exception:
-            if any(k in n.lower() for k in _VISION_NAME):
-                vision.append(n)
-    # Tri: vrais modeles vision "connus" (llava, *-vl, moondream...) d'abord, pour
-    # que le choix par defaut soit fiable.
-    vision.sort(key=lambda n: 0 if any(k in n.lower() for k in _VISION_NAME) else 1)
-    return vision
-
-
-def _ollama_describe(image, model, base=None):
-    """Decrit l'image en un prompt text-to-image via un modele vision Ollama."""
-    _dbg(f"ollama describe: url={base or OLLAMA_URL} model={model}")
-    b64 = _pil_to_b64_jpeg(image, max_side=1024)
-    out = _ollama_http("/api/generate",
-                       {"model": model, "prompt": DESCRIBE_INSTRUCTION, "images": [b64],
-                        **_ollama_gen_opts()}, base=base, timeout=180)
-    return (out.get("response") or "").strip()
-
-
-def _ollama_improve(prompt_text, model, base=None):
-    """Reecrit un prompt pour le rendre plus riche, via Ollama (modele texte/vision).
-    Instruction editable dans config.txt (ollama_improve_prompt, {prompt} = le prompt)."""
-    pt = prompt_text or ""
-    instr = (IMPROVE_INSTRUCTION.replace("{prompt}", pt) if "{prompt}" in IMPROVE_INSTRUCTION
-             else f"{IMPROVE_INSTRUCTION}\n\nPROMPT: {pt}")
-    out = _ollama_http("/api/generate", {"model": model, "prompt": instr, **_ollama_gen_opts()},
-                       base=base, timeout=120)
-    return (out.get("response") or "").strip()
-
-
-def _ollama_compose(captions, model, base=None):
-    """'Faux Omni': fusionne plusieurs descriptions d'images en UN seul prompt."""
-    listing = "\n".join(f"Image {i + 1}: {c}" for i, c in enumerate(captions) if c)
-    instr = (COMPOSE_INSTRUCTION.replace("{descriptions}", listing)
-             if "{descriptions}" in COMPOSE_INSTRUCTION
-             else f"{COMPOSE_INSTRUCTION}\n\n{listing}")
-    out = _ollama_http("/api/generate", {"model": model, "prompt": instr, **_ollama_gen_opts()},
-                       base=base, timeout=120)
-    return (out.get("response") or "").strip()
+# Fonctions Ollama -> cz_ollama.py (les handlers UI _ui_* restent ici, plus bas).
+from cz_ollama import (  # noqa: E402,F401
+    OLLAMA_URL, OLLAMA_KEEP_ALIVE, OLLAMA_CPU, _ollama_gen_opts, _ollama_http,
+    _ollama_vision_models, _ollama_describe, _ollama_improve, _ollama_compose,
+)
 
 
 _BLIP = None
@@ -570,23 +504,7 @@ LORAS = []
 LORA_WEIGHT = float(CONFIG.get("default_lora_weight", 1.0))  # poids par defaut des slots
 # Modele Omni/Edit (multi-reference). Reglable via config.txt ou l'UI.
 OMNI_MODEL = (os.environ.get("ZIMAGE_OMNI_MODEL") or CONFIG.get("zimage_omni_model") or "").strip()
-# Ollama (Describe image->prompt + Improve prompt). URL configurable, persistee.
-OLLAMA_URL = (os.environ.get("OLLAMA_URL") or _prefs.get("ollama_url")
-              or CONFIG.get("ollama_url") or "http://localhost:11434")
-# Duree de maintien du modele Ollama en VRAM apres un appel (keep_alive). 0 =
-# decharge immediatement -> libere la VRAM avant la generation Z-Image (evite la
-# concurrence VRAM sur un seul GPU). Peut etre un nombre (s) ou "30s"/"5m"/-1.
-OLLAMA_KEEP_ALIVE = CONFIG.get("ollama_keep_alive", 0)
-# Force Ollama sur CPU (num_gpu=0) -> 0 VRAM partagee avec Z-Image (plus lent).
-OLLAMA_CPU = bool(CONFIG.get("ollama_cpu", False))
-
-
-def _ollama_gen_opts():
-    """Options communes pour /api/generate (keep_alive + CPU optionnel)."""
-    p = {"stream": False, "keep_alive": OLLAMA_KEEP_ALIVE}
-    if OLLAMA_CPU:
-        p["options"] = {"num_gpu": 0}
-    return p
+# OLLAMA_URL / OLLAMA_KEEP_ALIVE / OLLAMA_CPU / _ollama_gen_opts -> cz_ollama.py.
 # FaceSwap: restauration GFPGAN post-swap (nettete du visage). Reglable via l'UI.
 FACESWAP_RESTORE = bool(CONFIG.get("faceswap_restore", False))
 FACESWAP_RESTORE_BLEND = float(CONFIG.get("faceswap_restore_blend", 0.8))
@@ -2349,23 +2267,7 @@ def delete_asset(rel, output_dir=None):
         return f"error: {e}"
 
 
-def _pil_to_b64_jpeg(img, max_side=1600, quality=85):
-    """Reduit + encode en JPEG base64 pour embarquer en HTML sans saturer la page."""
-    if img is None:
-        return None
-    img = img.convert("RGB")
-    w, h = img.size
-    if max(w, h) > max_side:
-        if w >= h:
-            new_w = max_side
-            new_h = int(h * max_side / w)
-        else:
-            new_h = max_side
-            new_w = int(w * max_side / h)
-        img = img.resize((new_w, new_h), Image.LANCZOS)
-    buf = io.BytesIO()
-    img.save(buf, "JPEG", quality=quality, optimize=True)
-    return base64.b64encode(buf.getvalue()).decode("ascii")
+# _pil_to_b64_jpeg -> cz_core.py (importe en tete).
 
 
 def _make_compare_html(src_img, result_img):
