@@ -27,8 +27,41 @@ Do NOT do it all at once. One module per PR, smoke-green between each.
   Keep them in ONE module so the many bare refs stay intra-module.
 - [ ] **Step 8 — `cz_ui.py` + `cz_cli.py`** (HIGH risk): build_ui wiring + argparse/serve.
 
-Recommend: do steps 5-8 with an in-browser pass each (generate, switch model, LoRA,
+Recommend: do steps 6-8 with an in-browser pass each (generate, switch model, LoRA,
 faceswap, wildcards) since smoke does not exercise the stateful generation/UI paths.
+
+## HOW TO RESUME (fresh session) — read this first
+Modules already extracted (DONE, green): cz_assets, cz_core, cz_ollama, cz_imageio,
+cz_assetbrowser, cz_prompt. app.py is 3017 lines and imports them. Remaining = the
+mutable-state core: ESRGAN, FaceSwap, models/generate, ui/cli.
+
+Pattern that worked (repeat it):
+1. Create `cz_<name>.py`. It imports from cz_core (and other DONE modules), NEVER app.
+2. Move the functions AND their mutable globals + setters TOGETHER so intra-module refs
+   stay bare. Only cross-module mutable state is read as `cz_<name>.NAME` from app.
+3. In app.py: delete the moved block, add `from cz_<name> import (...)` (+ `import
+   cz_<name>` if you must read a mutable global like `cz_esrgan.ESRGAN_DIR`).
+4. DO NOT use Edit replace_all on `ESRGAN_DIR` (it is a substring of DEFAULT_ESRGAN_DIR)
+   or on `BASE_REPO`/`GUIDANCE` (substrings of DEFAULT_*). Edit each call site by hand
+   with enough surrounding context.
+5. Validate every step BEFORE commit:
+   - `python -m py_compile app.py cz_<name>.py`
+   - import + `is`-identity asserts for moved names + `app.build_ui()`
+   - `.venv\Scripts\python tools\smoke_test.py`  (must stay 19/19)
+   - IN-BROWSER (this is the new safety net smoke can't give): run.bat, then
+     generate 1 image, switch checkpoint, apply a LoRA, run FaceSwap, use a wildcard.
+   - one commit per module (no "Co-Authored-By"; see CLAUDE.local.md).
+
+Step 6 = cz_esrgan.py (ESRGAN_DIR + _ESRGAN_CACHE + set_esrgan_dir + list_esrgan_models
++ _load/_esrgan_upscale) AND cz_face.py (_FACE_APP/_FACE_SWAPPER/_FACE_RESTORE_SESSION/
+_BLIP + setters + detect/swap/restore). ESRGAN_DIR is read in ~13 places (generate,
+upscale, API, CLI, build_ui) -> read as cz_esrgan.ESRGAN_DIR there.
+Step 7 = cz_models.py + cz_generate.py: BASE_REPO/ZIMAGE_TRANSFORMER/LORAS/OFFLOAD_MODE/
+GUIDANCE + _BASE_PIPE/_DERIVED/_LOADED_KEY caches + _ensure_base/get_pipe + checkpoint/
+LoRA/transformer setters + generate/txt2img/img2img/outpaint/inpaint/omni + _gen_meta.
+Keep ALL of this in ONE module (cz_pipeline.py is fine) so the many bare refs stay valid.
+Step 8 = move build_ui (+ handlers) and cli_main/serve out last; app.py becomes a thin
+entrypoint `from cz_cli import main`.
 
 ## Target layout
 ```
