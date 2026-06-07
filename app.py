@@ -2797,6 +2797,8 @@ def build_ui():
     with gr.Blocks(title="crispz-studio", theme=gr.themes.Default(), css=FOOOCUS_CSS, js=js_full) as demo:
         # ===== Galerie avancee (panneau plein largeur: meta, suppression, flou) =====
         with gr.Accordion("Gallery (output folder)", open=False):
+            gr.Markdown("*Saved images on disk (manage: sort/filter/copy/delete/blur). "
+                        "For a full standalone page, use Models > Asset Browser.*")
             with gr.Row():
                 g_refresh = gr.Button("Refresh", size="sm", scale=0, min_width=110)
                 g_sort = gr.Dropdown(["Newest", "Oldest", "Name"], value="Newest",
@@ -2825,6 +2827,8 @@ def build_ui():
 
                 history = gr.State([])
                 with gr.Accordion("History (this session)", open=False):
+                    gr.Markdown("*Renders made in this session (in-memory, not the disk folder). "
+                                "Use 'Load output folder' to pull saved files in.*")
                     history_gallery = gr.Gallery(label=None, height=240, columns=6,
                                                  object_fit="cover", show_download_button=True)
                     with gr.Row():
