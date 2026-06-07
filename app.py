@@ -130,6 +130,13 @@ from cz_prompt import (  # noqa: E402,F401
     set_wildcards_dir,
 )
 
+# Real-ESRGAN (spandrel) + upscale tuile/overlap-add -> cz_esrgan.py. L'etat mutable
+# (ESRGAN_DIR + cache) vit dans le module; app lit le dossier via cz_esrgan.ESRGAN_DIR.
+import cz_esrgan
+from cz_esrgan import (  # noqa: E402,F401
+    set_esrgan_dir, list_esrgan_models, load_esrgan, esrgan_upscale,
+)
+
 
 def _style_sample(name):
     """Chemin de la vignette d'un style (styles/samples/<nom>.jpg) ou None."""
@@ -398,8 +405,8 @@ if _is_single_file(_zmodel):
 else:
     BASE_REPO = _zmodel
 
-ESRGAN_DIR = os.environ.get("ESRGAN_DIR") or _prefs.get("esrgan_dir") or DEFAULT_ESRGAN_DIR
-# Dossiers de modeles Z-Image (comme ESRGAN_DIR): checkpoints single-file a switcher
+# ESRGAN_DIR + cache + setter -> cz_esrgan.py (lu via cz_esrgan.ESRGAN_DIR).
+# Dossiers de modeles Z-Image (comme cz_esrgan.ESRGAN_DIR): checkpoints single-file a switcher
 # + LoRA a appliquer. Path config (checkpoints_dir / loras_dir) ou defaut local.
 CHECKPOINTS_DIR = (os.environ.get("CHECKPOINTS_DIR") or _prefs.get("checkpoints_dir")
                    or CONFIG.get("checkpoints_dir") or os.path.join(HERE, "checkpoints"))
@@ -424,7 +431,7 @@ FACESWAP_RESTORE_BLEND = float(CONFIG.get("faceswap_restore_blend", 0.8))
 _BASE_PIPE = None
 _DERIVED = {}
 _LOADED_KEY = None
-_ESRGAN_CACHE = {}
+# _ESRGAN_CACHE -> cz_esrgan.py (avec ESRGAN_DIR + set_esrgan_dir).
 
 # Palier 2 (cohabitation VRAM, brief plugin Fooocus): offload CPU de la passe
 # diffusion. none = tout en VRAM (defaut). model = decharge par sous-module
@@ -480,14 +487,6 @@ def request_stop():
                 pass
     _log(f"STOP requested (interrupt set on {n} pipeline(s))")
     return "Stopping..."
-
-
-def set_esrgan_dir(path):
-    """Change le dossier ESRGAN. Invalide le cache (les noms peuvent collisionner entre dossiers)."""
-    global ESRGAN_DIR, _ESRGAN_CACHE
-    if path and path != ESRGAN_DIR:
-        ESRGAN_DIR = path
-        _ESRGAN_CACHE = {}
 
 
 def set_zimage_model(repo_or_path):
@@ -699,82 +698,8 @@ def apply_preset_to_args(args, raw_argv):
 # ----------------------------------------------------------------------------
 # Etage 1 : Real-ESRGAN via spandrel
 # ----------------------------------------------------------------------------
-def list_esrgan_models():
-    if not os.path.isdir(ESRGAN_DIR):
-        return []
-    return sorted(
-        f for f in os.listdir(ESRGAN_DIR)
-        if f.lower().endswith((".pth", ".safetensors"))
-    )
-
-
-def load_esrgan(model_name):
-    if model_name in _ESRGAN_CACHE:
-        return _ESRGAN_CACHE[model_name]
-    from spandrel import ModelLoader, ImageModelDescriptor
-    _log(f"loading ESRGAN model: {model_name} ...")
-    path = os.path.join(ESRGAN_DIR, model_name)
-    model = ModelLoader().load_from_file(path)
-    if not isinstance(model, ImageModelDescriptor):
-        raise ValueError(f"{model_name} is not a usable image SR model.")
-    model = model.to(DEVICE).eval()
-    _ESRGAN_CACHE[model_name] = model
-    return model
-
-
-def _pil_to_tensor(img):
-    arr = np.asarray(img.convert("RGB"), dtype=np.float32) / 255.0
-    return torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(DEVICE)
-
-
-def _tensor_to_pil(t):
-    arr = t.clamp(0, 1).squeeze(0).permute(1, 2, 0).float().cpu().numpy()
-    return Image.fromarray((arr * 255.0 + 0.5).astype(np.uint8))
-
-
-def esrgan_upscale(img, model, tile, overlap):
-    """Upscale ESRGAN avec tiling overlap-add et feather lineaire pour eviter les coutures."""
-    scale = model.scale
-    t = _pil_to_tensor(img)
-    _, _, h, w = t.shape
-
-    if tile <= 0 or (h <= tile and w <= tile):
-        with torch.no_grad():
-            out = model(t)
-        return _tensor_to_pil(out)
-
-    out_h, out_w = h * scale, w * scale
-    acc = torch.zeros(1, 3, out_h, out_w, device=DEVICE)
-    weight = torch.zeros(1, 1, out_h, out_w, device=DEVICE)
-    step = tile - overlap
-
-    for y in range(0, h, step):
-        for x in range(0, w, step):
-            y2, x2 = min(y + tile, h), min(x + tile, w)
-            y1, x1 = max(y2 - tile, 0), max(x2 - tile, 0)
-            patch = t[:, :, y1:y2, x1:x2]
-            with torch.no_grad():
-                up = model(patch)
-            ph, pw = up.shape[2], up.shape[3]
-            # masque feather: rampe lineaire sur la zone d'overlap
-            mask = torch.ones(1, 1, ph, pw, device=DEVICE)
-            f = overlap * scale
-            if f > 0:
-                ramp = torch.linspace(0, 1, int(f), device=DEVICE)
-                if x1 > 0:
-                    mask[:, :, :, :int(f)] *= ramp.view(1, 1, 1, -1)
-                if x2 < w:
-                    mask[:, :, :, -int(f):] *= ramp.flip(0).view(1, 1, 1, -1)
-                if y1 > 0:
-                    mask[:, :, :int(f), :] *= ramp.view(1, 1, -1, 1)
-                if y2 < h:
-                    mask[:, :, -int(f):, :] *= ramp.flip(0).view(1, 1, -1, 1)
-            oy, ox = y1 * scale, x1 * scale
-            acc[:, :, oy:oy + ph, ox:ox + pw] += up * mask
-            weight[:, :, oy:oy + ph, ox:ox + pw] += mask
-
-    out = acc / weight.clamp(min=1e-6)
-    return _tensor_to_pil(out)
+# list_esrgan_models / load_esrgan / _pil_to_tensor / _tensor_to_pil /
+# esrgan_upscale -> cz_esrgan.py (importes en tete). ESRGAN_DIR y est lu.
 
 
 # ----------------------------------------------------------------------------
@@ -1308,7 +1233,7 @@ def run(image, source_folder, esrgan_model, factor, denoise, steps, prompt, seed
     - do_esrgan=False: img2img pur (pas d'ESRGAN, juste le refine Z-Image).
     """
     if do_esrgan and not esrgan_model:
-        raise gr.Error(f"No ESRGAN model found in {ESRGAN_DIR}.")
+        raise gr.Error(f"No ESRGAN model found in {cz_esrgan.ESRGAN_DIR}.")
 
     # Mode batch
     if source_folder and os.path.isdir(source_folder):
@@ -1407,7 +1332,7 @@ def _refresh_models(new_dir):
     set_esrgan_dir(new_dir)
     models = list_esrgan_models()
     value = models[0] if models else None
-    return gr.update(choices=models, value=value), f"{len(models)} model(s) found in {ESRGAN_DIR}"
+    return gr.update(choices=models, value=value), f"{len(models)} model(s) found in {cz_esrgan.ESRGAN_DIR}"
 
 
 def _apply_zimage(repo):
@@ -1601,7 +1526,7 @@ def _save_paths_to_prefs(esrgan_dir, zimage_model, checkpoints_dir=None, loras_d
         set_loras_dir(loras_dir)
     if wildcards_dir:
         set_wildcards_dir(wildcards_dir)
-    _save_prefs_keys({"esrgan_dir": ESRGAN_DIR, "zimage_model": BASE_REPO,
+    _save_prefs_keys({"esrgan_dir": cz_esrgan.ESRGAN_DIR, "zimage_model": BASE_REPO,
                       "checkpoints_dir": CHECKPOINTS_DIR, "loras_dir": LORAS_DIR,
                       "wildcards_dir": cz_prompt.WILDCARDS_DIR})
     return (f"Saved to {PREFS_PATH}: esrgan_dir, zimage_model, checkpoints_dir, "
@@ -2345,7 +2270,7 @@ def build_ui():
                             value=BASE_REPO,
                             label="Z-Image base (HF repo, diffusers folder, or .safetensors file)",
                             info="A .safetensors (Civitai) = transformer; VAE+encoder from base repo.")
-                        esrgan_dir_tb = gr.Textbox(value=ESRGAN_DIR, label="ESRGAN_DIR (.pth/.safetensors folder)")
+                        esrgan_dir_tb = gr.Textbox(value=cz_esrgan.ESRGAN_DIR, label="ESRGAN_DIR (.pth/.safetensors folder)")
                         offload = gr.Dropdown(choices=list(OFFLOAD_CHOICES), value="none",
                                               label="CPU offload (VRAM)",
                                               info="none | model (~half) | sequential (~9GB, slower)")
@@ -2560,7 +2485,7 @@ def serve_main(host="127.0.0.1", port=7861, idle_timeout=300):
         print(f"[serve] detail: {e}", file=sys.stderr)
         return 1
 
-    os.makedirs(ESRGAN_DIR, exist_ok=True)
+    os.makedirs(cz_esrgan.ESRGAN_DIR, exist_ok=True)
     app = FastAPI(title="crispz")
     lock = threading.Lock()
     state = {"last": time.time()}
@@ -2590,7 +2515,7 @@ def serve_main(host="127.0.0.1", port=7861, idle_timeout=300):
 
     @app.get("/models")
     def models():
-        return {"esrgan_dir": ESRGAN_DIR, "models": list_esrgan_models()}
+        return {"esrgan_dir": cz_esrgan.ESRGAN_DIR, "models": list_esrgan_models()}
 
     @app.post("/unload")
     def unload():
@@ -2604,7 +2529,7 @@ def serve_main(host="127.0.0.1", port=7861, idle_timeout=300):
             raise HTTPException(status_code=400, detail=f"input not found: {req.input}")
         avail = list_esrgan_models()
         if not avail:
-            raise HTTPException(status_code=400, detail=f"no ESRGAN model in {ESRGAN_DIR}")
+            raise HTTPException(status_code=400, detail=f"no ESRGAN model in {cz_esrgan.ESRGAN_DIR}")
         # preset (s'il est fourni) sert de base; sinon les champs de la requete.
         p = PRESETS.get(req.preset or "Custom") or {}
         def pick(name, val):
@@ -2856,12 +2781,12 @@ def cli_main(argv=None):
     if args.txt2img:
         if not args.prompt:
             parser.error("--txt2img requires --prompt")
-        os.makedirs(ESRGAN_DIR, exist_ok=True)
+        os.makedirs(cz_esrgan.ESRGAN_DIR, exist_ok=True)
         model_name = None
         if args.upscale:
             avail = list_esrgan_models()
             if not avail:
-                parser.error(f"--upscale needs an ESRGAN model in {ESRGAN_DIR}")
+                parser.error(f"--upscale needs an ESRGAN model in {cz_esrgan.ESRGAN_DIR}")
             model_name = args.model if args.model in avail else avail[0]
         if args.report_vram:
             _reset_vram_peak()
@@ -2901,17 +2826,17 @@ def cli_main(argv=None):
         return 0
 
     if args.save_paths:
-        _save_prefs_keys({"esrgan_dir": ESRGAN_DIR, "zimage_model": BASE_REPO})
-        print(f"Saved to {PREFS_PATH}: esrgan_dir={ESRGAN_DIR}, zimage_model={BASE_REPO}")
+        _save_prefs_keys({"esrgan_dir": cz_esrgan.ESRGAN_DIR, "zimage_model": BASE_REPO})
+        print(f"Saved to {PREFS_PATH}: esrgan_dir={cz_esrgan.ESRGAN_DIR}, zimage_model={BASE_REPO}")
         if not args.input and not args.input_folder:
             return 0
 
-    os.makedirs(ESRGAN_DIR, exist_ok=True)
+    os.makedirs(cz_esrgan.ESRGAN_DIR, exist_ok=True)
     models = list_esrgan_models()
 
     if args.list_models:
         if not models:
-            print(f"No model in {ESRGAN_DIR}")
+            print(f"No model in {cz_esrgan.ESRGAN_DIR}")
         else:
             for m in models:
                 print(m)
@@ -2925,7 +2850,7 @@ def cli_main(argv=None):
         return 0
 
     if not models and not args.no_esrgan:
-        parser.error(f"No ESRGAN model in {ESRGAN_DIR} (or use --no-esrgan for img2img only)")
+        parser.error(f"No ESRGAN model in {cz_esrgan.ESRGAN_DIR} (or use --no-esrgan for img2img only)")
 
     model_name = (args.model if args.model in models else (models[0] if models else None))
 
