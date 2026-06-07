@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Byte-compile (no heavy deps)
+        run: |
+          python -m py_compile app.py
+          python -m py_compile tools/*.py
+      - name: Validate config + styles JSON
+        run: |
+          python -c "import json; json.load(open('config-sample.txt', encoding='utf-8')); print('config-sample.txt OK')"
+          python -c "import json, glob; [json.load(open(f, encoding='utf-8')) for f in glob.glob('styles/*.json')]; print('styles/*.json OK')"
