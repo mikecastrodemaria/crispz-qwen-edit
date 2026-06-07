@@ -1218,6 +1218,21 @@ def _editor_to_image_mask(editor_value):
     return bg, mask
 
 
+def _editor_img(v):
+    """Extrait l'image PIL d'un gr.ImageEditor (dict {background,composite,layers})
+    ou renvoie le PIL tel quel (retro-compat). Renvoie l'image recadree."""
+    if isinstance(v, dict):
+        return v.get("composite") or v.get("background")
+    return v
+
+
+def _crop_input(label, height=280):
+    """Entree image avec recadrage (crop) facon Fooocus, sans pinceau ni calques."""
+    return gr.ImageEditor(type="pil", label=label, height=height,
+                          sources=["upload", "clipboard"], brush=False, eraser=False,
+                          layers=False, transforms=["crop"])
+
+
 def outpaint(image, ratio_w, ratio_h, prompt, steps, seed):
     """Reframe / outpainting: agrandit l'image au ratio cible et fait remplir les
     bords par Z-Image (ZImageInpaintPipeline)."""
@@ -1766,6 +1781,7 @@ def _ui_detect_ollama(url):
 
 def _ui_describe(image, model, url):
     """Decrit l'image -> remplit le prompt. Ollama si modele choisi, sinon BLIP local."""
+    image = _editor_img(image)
     if image is None:
         return gr.update(), "Drop an image to describe first."
     if model:
@@ -1794,7 +1810,7 @@ def _ui_improve(prompt_text, model, url):
 def _ui_compose(r1, r2, r3, r4, model, url):
     """'Faux Omni': decrit chaque image de reference (vision) puis fusionne en UN
     prompt via le LLM. Remplit la zone de prompt."""
-    refs = [r for r in [r1, r2, r3, r4] if r is not None]
+    refs = [im for im in (_editor_img(r) for r in [r1, r2, r3, r4]) if im is not None]
     if not refs:
         return gr.update(), "Add at least one reference image."
     if not model:
@@ -1812,6 +1828,7 @@ def _ui_compose(r1, r2, r3, r4, model, url):
 
 def _ui_remove_bg(image, history, save_mode, output_dir):
     """Remove background -> resultat (PNG transparent) dans la galerie + historique."""
+    image = _editor_img(image)
     if image is None:
         return [], "Drop an image first.", history, history
     try:
@@ -1833,6 +1850,7 @@ def _ui_reframe(image, ratio, steps, prompt, guidance, offload_mode, seed,
                 save_mode, output_dir, output_format, history,
                 progress=gr.Progress(track_tqdm=True)):
     """Reframe / outpaint -> resultat dans la galerie + historique."""
+    image = _editor_img(image)
     if image is None:
         return [], "Drop an image first.", history, history
     global _PROGRESS
@@ -2010,6 +2028,11 @@ def _ui_generate(prompt, negative, styles, use_input, input_image,
     _STOP = False
     _PROGRESS = lambda f, d: progress(f, desc=d)
     progress(0.0, desc="Starting...")
+    # Les entrees image sont des gr.ImageEditor (crop) -> extraire le PIL recadre.
+    input_image = _editor_img(input_image)
+    faceswap_src = _editor_img(faceswap_src)
+    ref1, ref2, ref3, ref4 = (_editor_img(ref1), _editor_img(ref2),
+                              _editor_img(ref3), _editor_img(ref4))
 
     def _done(imgs, rep):
         # FaceSwap post-process (optionnel, gated). S'applique a tous les modes.
@@ -2263,7 +2286,7 @@ def build_ui():
                     with gr.Tabs():
                         with gr.Tab("Upscale or img2img"):
                             with gr.Row():
-                                inp = gr.Image(type="pil", label="Drop image here / click to upload", height=300)
+                                inp = _crop_input("Drop image here / click to upload", 300)
                                 with gr.Column():
                                     do_esrgan_cb = gr.Checkbox(value=True, label="ESRGAN upscale",
                                                                info="Uncheck = img2img only (no enlargement).")
@@ -2283,7 +2306,7 @@ def build_ui():
                                                            label="Diffusion tile overlap")
 
                         with gr.Tab("Describe"):
-                            describe_img = gr.Image(type="pil", label="Image to describe", height=280)
+                            describe_img = _crop_input("Image to describe", 280)
                             describe_btn = gr.Button("Describe -> prompt", variant="primary", size="sm")
                             describe_status = gr.Markdown(
                                 "*Uses the Ollama vision model selected in Advanced > Prompt AI "
@@ -2296,11 +2319,11 @@ def build_ui():
                                         "Needs Ollama with a vision model (Advanced > Prompt AI). "
                                         "It mixes ideas/style, not exact pixels.*")
                             with gr.Row():
-                                cref1 = gr.Image(type="pil", label="Ref 1", height=180)
-                                cref2 = gr.Image(type="pil", label="Ref 2", height=180)
+                                cref1 = _crop_input("Ref 1", 180)
+                                cref2 = _crop_input("Ref 2", 180)
                             with gr.Row():
-                                cref3 = gr.Image(type="pil", label="Ref 3", height=180)
-                                cref4 = gr.Image(type="pil", label="Ref 4", height=180)
+                                cref3 = _crop_input("Ref 3", 180)
+                                cref4 = _crop_input("Ref 4", 180)
                             with gr.Row():
                                 compose_btn = gr.Button("Vision Mix -> prompt", size="sm")
                                 vmix_gen_btn = gr.Button("Vision Mix & Generate", variant="primary",
@@ -2308,7 +2331,7 @@ def build_ui():
                             compose_status = gr.Markdown("")
 
                         with gr.Tab("Remove BG"):
-                            rembg_img = gr.Image(type="pil", label="Image", height=280)
+                            rembg_img = _crop_input("Image", 280)
                             rembg_btn = gr.Button("Remove background", variant="primary", size="sm")
                             rembg_status = gr.Markdown("*Local (rembg). Output = transparent PNG. "
                                                        "First use downloads the u2net model.*")
@@ -2316,7 +2339,7 @@ def build_ui():
                         with gr.Tab("Reframe (outpaint)"):
                             gr.Markdown("*Expand the image to a new aspect ratio; Z-Image fills "
                                         "the new borders (inpaint). The prompt guides the fill.*")
-                            reframe_img = gr.Image(type="pil", label="Image", height=260)
+                            reframe_img = _crop_input("Image", 260)
                             with gr.Row():
                                 reframe_ratio = gr.Dropdown(
                                     ["16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "1:1", "21:9"],
@@ -2347,18 +2370,18 @@ def build_ui():
                                 omni_check_btn2 = gr.Button("Check Omni model availability", size="sm")
                                 omni_status2 = gr.Markdown("")
                             with gr.Row():
-                                ref1 = gr.Image(type="pil", label="Ref 1", height=220)
-                                ref2 = gr.Image(type="pil", label="Ref 2", height=220)
+                                ref1 = _crop_input("Ref 1", 220)
+                                ref2 = _crop_input("Ref 2", 220)
                             with gr.Row():
-                                ref3 = gr.Image(type="pil", label="Ref 3", height=220)
-                                ref4 = gr.Image(type="pil", label="Ref 4", height=220)
+                                ref3 = _crop_input("Ref 3", 220)
+                                ref4 = _crop_input("Ref 4", 220)
 
                         with gr.Tab("Face Swap"):
                             gr.Markdown("*Post-process: replace the face in the result with this "
                                         "source face. Works on any mode (txt2img / img2img / omni). "
                                         "Needs `insightface` + `onnxruntime-gpu` installed and "
                                         "`faceswap_model_path` (inswapper .onnx) set in config.txt.*")
-                            faceswap_src = gr.Image(type="pil", label="Source face", height=240)
+                            faceswap_src = _crop_input("Source face", 240)
                             faceswap_enable = gr.Checkbox(value=False, label="Apply face swap to result")
                             faceswap_restore_cb = gr.Checkbox(
                                 value=FACESWAP_RESTORE,
