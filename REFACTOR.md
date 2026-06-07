@@ -34,10 +34,25 @@ Do NOT do it all at once. One module per PR, smoke-green between each.
     cz_face._faceswap(checkpoints_dir=...). _local_caption/_remove_bg re-exported.
     Validated: is-identity + live app<->cz_face sync + build_ui + smoke 19/19.
     (in-browser pass pending)
-- [ ] **Step 7 — `cz_models.py` + `cz_generate.py`** (HIGH risk): BASE_REPO/
-  ZIMAGE_TRANSFORMER/LORAS/OFFLOAD_MODE/GUIDANCE + pipe caches + setters + generate.
-  Keep them in ONE module so the many bare refs stay intra-module.
-- [ ] **Step 8 — `cz_ui.py` + `cz_cli.py`** (HIGH risk): build_ui wiring + argparse/serve.
+- [x] **Step 7 — `cz_pipeline.py`** (HIGH risk): kept as ONE module (not split
+  models/generate) so the many bare refs stay intra-module. Moved: BASE_REPO/
+  ZIMAGE_TRANSFORMER/CHECKPOINTS_DIR/LORAS_DIR/LORAS/LORA_WEIGHT/OMNI_MODEL/
+  OFFLOAD_MODE/OFFLOAD_CHOICES/GUIDANCE + _BASE_PIPE/_DERIVED/_LOADED_KEY +
+  _PROGRESS/_STOP + all setters + _ensure_base/get_pipe/_load_omni + generate/
+  generate_omni/inpaint_run/outpaint/process_one/txt2img_run + round_to_multiple/
+  _reframe_canvas/_make_generator/_refine_*/_gen_meta. app reads cz_pipeline.NAME
+  at all UI/serve/CLI sites and SETS cz_pipeline._PROGRESS / cz_pipeline._STOP in the
+  handlers. Two thin app wrappers: `set_loras` mirrors cz_pipeline.LORAS -> app.LORAS
+  (smoke reads app.LORAS live); `_faceswap` passes cz_pipeline.CHECKPOINTS_DIR.
+  KEPT in app: run (emits gr.Error), apply_preset_to_args, _crop_input,
+  _editor_img/_editor_to_image_mask (gr helpers, no pipeline state), timing/vram
+  helpers. app.py 3601 -> 1865 lines; cz_pipeline.py 648. Validated: py_compile +
+  is-identity (12 fns) + live-sync (LORAS/GUIDANCE/offload/_STOP) + `app.py --help`
+  + build_ui + smoke 19/19. (in-browser pass pending)
+- [ ] **Step 8 — `cz_ui.py` + `cz_cli.py`** (HIGH risk, replaces old numbering):
+  move build_ui (+ handlers) and cli_main/serve_main out; app.py becomes a thin
+  entrypoint. NOTE the cz_pipeline._PROGRESS/_STOP writes + app's set_loras/_faceswap
+  wrappers + FACESWAP alias must move/stay coherent with the UI module.
 
 Recommend: do steps 6-8 with an in-browser pass each (generate, switch model, LoRA,
 faceswap, wildcards) since smoke does not exercise the stateful generation/UI paths.

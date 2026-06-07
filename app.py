@@ -183,7 +183,7 @@ from cz_face import (  # noqa: E402,F401
 def _faceswap(target_img, source_img):
     """Wrapper: passe le dossier checkpoints courant (reste dans app.py jusqu'au
     step 7) a cz_face._faceswap, qui l'ajoute aux emplacements de recherche."""
-    return cz_face._faceswap(target_img, source_img, CHECKPOINTS_DIR)
+    return cz_face._faceswap(target_img, source_img, cz_pipeline.CHECKPOINTS_DIR)
 
 
 def set_faceswap_restore(enabled, blend):
@@ -224,295 +224,44 @@ if isinstance(CONFIG.get("performance_presets"), dict) and CONFIG["performance_p
 
 
 # _load_prefs_raw / _save_prefs_keys / _is_single_file / _prefs -> cz_core.py.
-_zmodel = os.environ.get("ZIMAGE_MODEL") or _prefs.get("zimage_model") or DEFAULT_BASE_REPO
-# Transformer single-file optionnel (poids du transformer seul, ex. Civitai). Le VAE
-# et l'encodeur Qwen3 restent tires du repo de base (BASE_REPO).
-ZIMAGE_TRANSFORMER = os.environ.get("ZIMAGE_TRANSFORMER") or _prefs.get("zimage_transformer") or None
-if _is_single_file(_zmodel):
-    # Un fichier passe comme "modele" = le transformer; base par defaut pour le reste.
-    ZIMAGE_TRANSFORMER = _zmodel
-    BASE_REPO = DEFAULT_BASE_REPO
-else:
-    BASE_REPO = _zmodel
+# Coeur Z-Image -> cz_pipeline.py: modele courant (BASE_REPO/ZIMAGE_TRANSFORMER),
+# dossiers checkpoints/loras, LoRA actives, Omni, caches pipe, offload, guidance,
+# stop/progress + generation/orchestration. app lit l'etat via cz_pipeline.NAME et
+# pose cz_pipeline._PROGRESS / cz_pipeline._STOP depuis les handlers UI.
+import cz_pipeline
+from cz_pipeline import (  # noqa: E402,F401
+    set_guidance, request_stop, set_zimage_model, set_zimage_transformer,
+    list_checkpoints, list_loras, set_checkpoints_dir, set_loras_dir, lora_keywords,
+    set_omni_model, check_omni_available, set_offload_mode, free_vram,
+    generate, generate_omni, inpaint_run, outpaint, txt2img_run, process_one,
+    round_to_multiple, _reframe_canvas, _gen_meta,
+)
 
-# ESRGAN_DIR + cache + setter -> cz_esrgan.py (lu via cz_esrgan.ESRGAN_DIR).
-# Dossiers de modeles Z-Image (comme cz_esrgan.ESRGAN_DIR): checkpoints single-file a switcher
-# + LoRA a appliquer. Path config (checkpoints_dir / loras_dir) ou defaut local.
-CHECKPOINTS_DIR = (os.environ.get("CHECKPOINTS_DIR") or _prefs.get("checkpoints_dir")
-                   or CONFIG.get("checkpoints_dir") or os.path.join(HERE, "checkpoints"))
-LORAS_DIR = (os.environ.get("LORAS_DIR") or _prefs.get("loras_dir")
-             or CONFIG.get("loras_dir") or os.path.join(HERE, "loras"))
-# Le dossier wildcards et son setter sont dans cz_prompt (lu via cz_prompt point dir).
-# LoRA active (chemin .safetensors) + poids. Inclus dans la clef de cache du pipe.
-# LoRA actives: liste de (chemin, poids). Plusieurs LoRA combinables (multi-slots).
-LORAS = []
-LORA_WEIGHT = float(CONFIG.get("default_lora_weight", 1.0))  # poids par defaut des slots
-# Modele Omni/Edit (multi-reference). Reglable via config.txt ou l'UI.
-OMNI_MODEL = (os.environ.get("ZIMAGE_OMNI_MODEL") or CONFIG.get("zimage_omni_model") or "").strip()
-# OLLAMA_URL / OLLAMA_KEEP_ALIVE / OLLAMA_CPU / _ollama_gen_opts -> cz_ollama.py.
 # FaceSwap restore: etat dans cz_face. Alias app maintenus a jour par le wrapper
 # set_faceswap_restore (lus par l'UI et le smoke).
 FACESWAP_RESTORE = cz_face.FACESWAP_RESTORE
 FACESWAP_RESTORE_BLEND = cz_face.FACESWAP_RESTORE_BLEND
-# DEVICE / DTYPE -> cz_core.py (importes en tete).
 
-# Caches process-wide. Un pipeline "base" (txt2img ZImagePipeline) detient les
-# composants; img2img / inpaint en derivent via from_pipe -> poids partages, pas de
-# VRAM en double. Clef de cache = (BASE_REPO, ZIMAGE_TRANSFORMER, OFFLOAD_MODE).
-_BASE_PIPE = None
-_DERIVED = {}
-_LOADED_KEY = None
-# _ESRGAN_CACHE -> cz_esrgan.py (avec ESRGAN_DIR + set_esrgan_dir).
-
-# Palier 2 (cohabitation VRAM, brief plugin Fooocus): offload CPU de la passe
-# diffusion. none = tout en VRAM (defaut). model = decharge par sous-module
-# (bon compromis). sequential = plus agressif, plus lent. N'est PAS de la quantif:
-# les poids restent BF16, ils transitent juste RAM <-> GPU. Requiert accelerate.
-OFFLOAD_MODE = "none"
-OFFLOAD_CHOICES = ("none", "model", "sequential")
-
-# CFG. Z-Image *Turbo* = distille -> guidance 0 (defaut). Z-Image *Base* (non Turbo,
-# ex. checkpoint Civitai "Z-Image Base") a besoin d'une vraie guidance (~3.5-5) et de
-# plus de steps (~20-28). Reglable par run (CLI --guidance, sliders UI).
-GUIDANCE = 0.0
+# LoRA: etat dans cz_pipeline. Alias app maintenu live par le wrapper set_loras
+# (le smoke lit app.LORAS apres app.set_loras).
+LORAS = cz_pipeline.LORAS
 
 
-def set_guidance(g):
-    global GUIDANCE
-    GUIDANCE = float(g)
+def set_loras(slots):
+    """Wrapper: delegue a cz_pipeline puis recopie LORAS dans app (lu par le smoke)."""
+    global LORAS
+    cz_pipeline.set_loras(slots)
+    LORAS = cz_pipeline.LORAS
 
 
 # Logging (LOG_LEVEL / _log / _dbg / set_log_level) -> cz_core.py (importes en tete).
 # Note: les lectures directes de LOG_LEVEL hors de cz_core utilisent cz_core.LOG_LEVEL.
 
 
-# Hook de progression UI (gradio gr.Progress). None hors UI (CLI/serveur). Permet
-# d'afficher l'avancement des etapes (ESRGAN, refine, tuiles i/N) dans l'interface.
-_PROGRESS = None
-
-
-def _progress(frac, desc=""):
-    if _PROGRESS is not None:
-        try:
-            _PROGRESS(min(1.0, max(0.0, float(frac))), desc)
-        except Exception:
-            pass
-
-
-# Stop "facon Fooocus": flag global + interruption des pipelines diffusers.
-_STOP = False
-
-
-def request_stop():
-    """Demande l'arret: stoppe la boucle de debruitage en cours (pipe._interrupt) et
-    les boucles batch/tuiles (_STOP). Quasi-immediat (s'arrete au pas suivant)."""
-    global _STOP
-    _STOP = True
-    n = 0
-    for p in [_BASE_PIPE] + list(_DERIVED.values()):
-        if p is not None:
-            try:
-                p._interrupt = True
-                n += 1
-            except Exception:
-                pass
-    _log(f"STOP requested (interrupt set on {n} pipeline(s))")
-    return "Stopping..."
-
-
-def set_zimage_model(repo_or_path):
-    """Change le modele Z-Image. Un repo HF / dossier diffusers -> BASE_REPO.
-    Un fichier single-file (.safetensors Civitai) -> transformer override.
-    Invalide le pipe si change."""
-    global BASE_REPO, ZIMAGE_TRANSFORMER
-    if not repo_or_path:
-        return
-    if _is_single_file(repo_or_path):
-        if repo_or_path != ZIMAGE_TRANSFORMER:
-            ZIMAGE_TRANSFORMER = repo_or_path
-            free_vram()
-            _log("Z-Image transformer (single-file) changed -> will reload")
-    elif repo_or_path != BASE_REPO:
-        BASE_REPO = repo_or_path
-        free_vram()
-        _log("Z-Image base repo changed -> will reload")
-
-
-def set_zimage_transformer(path):
-    """Definit (ou enleve avec '' / None) le transformer single-file."""
-    global ZIMAGE_TRANSFORMER
-    path = path or None
-    if path != ZIMAGE_TRANSFORMER:
-        ZIMAGE_TRANSFORMER = path
-        free_vram()
-        _log(f"Z-Image transformer -> {path or '(repo de base)'} -> will reload")
-
-
-def _safetensors_is_fp8(path):
-    """Vrai si le .safetensors contient des tenseurs FP8 (F8_E4M3/E5M2) -> ne charge
-    pas dans diffusers. Lit juste l'en-tete (rapide)."""
-    try:
-        import struct
-        with open(path, "rb") as f:
-            n = struct.unpack("<Q", f.read(8))[0]
-            hdr = json.loads(f.read(min(n, 2_000_000)).decode("utf-8", "ignore"))
-        for k, v in hdr.items():
-            if k != "__metadata__" and isinstance(v, dict):
-                if str(v.get("dtype", "")).upper().startswith("F8"):
-                    return True
-    except Exception:
-        pass
-    return False
-
-
-def list_checkpoints():
-    """Modeles Z-Image single-file (.safetensors) du dossier checkpoints. Exclut les
-    checkpoints FP8 (non charges par diffusers; prendre la version BF16/FP16)."""
-    if not os.path.isdir(CHECKPOINTS_DIR):
-        return []
-    out = []
-    for f in sorted(os.listdir(CHECKPOINTS_DIR)):
-        if not f.lower().endswith((".safetensors", ".ckpt", ".pt", ".sft")):
-            continue
-        if f.lower().endswith(".safetensors") and _safetensors_is_fp8(os.path.join(CHECKPOINTS_DIR, f)):
-            _log(f"checkpoint skipped (FP8, not supported by diffusers): {f}")
-            continue
-        out.append(f)
-    return out
-
-
-def list_loras():
-    """LoRA (.safetensors) du dossier loras."""
-    if not os.path.isdir(LORAS_DIR):
-        return []
-    return sorted(f for f in os.listdir(LORAS_DIR)
-                  if f.lower().endswith((".safetensors", ".ckpt", ".pt")))
-
-
-def set_checkpoints_dir(path):
-    global CHECKPOINTS_DIR
-    if path:
-        CHECKPOINTS_DIR = path
-
-
-def set_loras_dir(path):
-    global LORAS_DIR
-    if path:
-        LORAS_DIR = path
-
-
-def _read_safetensors_metadata(path):
-    """Lit le header JSON (__metadata__) d'un .safetensors SANS charger les poids."""
-    import struct
-    with open(path, "rb") as f:
-        n = struct.unpack("<Q", f.read(8))[0]
-        header = f.read(n)
-    return (json.loads(header.decode("utf-8")) or {}).get("__metadata__", {}) or {}
-
-
-def lora_keywords(path):
-    """Extrait les mots-cles / trigger words d'une LoRA depuis ses metadonnees:
-    champs trigger explicites + top tags d'entrainement (ss_tag_frequency)."""
-    if not path or not os.path.isfile(path):
-        return ""
-    try:
-        meta = _read_safetensors_metadata(path)
-    except Exception as e:
-        _dbg(f"lora metadata read failed: {e}")
-        return ""
-    words = []
-    for k in ("ss_trigger_words", "modelspec.trigger_phrase", "trigger_words",
-              "activation text", "ss_activation_text"):
-        v = meta.get(k)
-        if v:
-            words.append(v if isinstance(v, str) else ", ".join(map(str, v)))
-    tf = meta.get("ss_tag_frequency")
-    if tf:
-        try:
-            d = json.loads(tf) if isinstance(tf, str) else tf
-            counts = {}
-            for ds in d.values():
-                for tag, c in ds.items():
-                    counts[tag] = counts.get(tag, 0) + int(c)
-            words.extend(sorted(counts, key=counts.get, reverse=True)[:15])
-        except Exception:
-            pass
-    seen, out = set(), []
-    for w in words:
-        for part in str(w).split(","):
-            part = part.strip()
-            if part and part.lower() not in seen:
-                seen.add(part.lower())
-                out.append(part)
-    return ", ".join(out)
-
-
-def set_loras(slots):
-    """Definit les LoRA actives. slots = liste de (nom_ou_None, poids). Resout les
-    noms en chemins, ignore les None. Invalide le pipe si la combinaison change."""
-    global LORAS
-    new = []
-    for name, weight in slots:
-        if name and name not in ("None", "none", ""):
-            p = name if os.path.isabs(name) else os.path.join(LORAS_DIR, name)
-            new.append((p, float(weight)))
-    if new != LORAS:
-        LORAS = new
-        free_vram()
-        _log("LoRAs -> " + (", ".join(f"{os.path.basename(p)}@{w}" for p, w in new) or "(none)")
-             + " -> will reload")
-
-
-def set_omni_model(repo):
-    """Definit le modele Omni/Edit (repo HF ou dossier). Invalide le pipe omni."""
-    global OMNI_MODEL
-    repo = (repo or "").strip()
-    if repo != OMNI_MODEL:
-        OMNI_MODEL = repo
-        _DERIVED.pop("omni", None)
-        _log(f"Omni model -> {repo or '(none)'}")
-
-
-def check_omni_available():
-    """Teste l'existence des repos Omni/Edit sur Hugging Face (API publique)."""
-    import urllib.request
-    found = []
-    for repo in ("Tongyi-MAI/Z-Image-Omni-Base", "Tongyi-MAI/Z-Image-Edit"):
-        try:
-            req = urllib.request.Request("https://huggingface.co/api/models/" + repo,
-                                         headers={"User-Agent": "crispz-studio"})
-            with urllib.request.urlopen(req, timeout=8) as r:
-                if r.status == 200:
-                    found.append(repo)
-        except Exception:
-            pass
-    if found:
-        return ("**Omni model available!** " + ", ".join(f"`{r}`" for r in found)
-                + " - set it in config.txt `zimage_omni_model` (or Models tab).")
-    return ("Not released yet. Z-Image-Omni-Base / Z-Image-Edit are still 'coming "
-            "soon'. The Omni tab will work once they ship.")
-
-
-def set_offload_mode(mode):
-    """Change le mode d'offload CPU. Invalide le pipe (hooks poses au chargement)."""
-    global OFFLOAD_MODE
-    mode = mode if mode in OFFLOAD_CHOICES else "none"
-    if mode != OFFLOAD_MODE:
-        OFFLOAD_MODE = mode
-        free_vram()
-        _log(f"offload -> {OFFLOAD_MODE}: pipeline invalidated -> will reload")
-
-
-def free_vram():
-    """Libere le pipeline de base + les pipelines derives et rend la VRAM
-    (palier 3: unload sur inactivite ou endpoint /unload). Rechargement paresseux."""
-    global _BASE_PIPE, _DERIVED, _LOADED_KEY
-    _BASE_PIPE = None
-    _DERIVED = {}
-    _LOADED_KEY = None
-    gc.collect()
-    if DEVICE == "cuda":
-        torch.cuda.empty_cache()
+# Progress/stop, setters (model/transformer/checkpoints/loras/omni/offload/guidance),
+# list_checkpoints/list_loras, lora_keywords, check_omni_available, free_vram +
+# generation/orchestration -> cz_pipeline.py (importes en tete). L'UI pose
+# cz_pipeline._PROGRESS / cz_pipeline._STOP et lit cz_pipeline.NAME pour l'etat.
 
 
 def apply_preset_to_args(args, raw_argv):
@@ -534,240 +283,12 @@ def apply_preset_to_args(args, raw_argv):
 
 
 # ----------------------------------------------------------------------------
-# Z-Image (diffusers, BF16) : un pipeline "base" txt2img qui detient les composants,
-# img2img / inpaint derives via from_pipe (poids partages, pas de VRAM en double).
+# Z-Image (diffusers, BF16) -> cz_pipeline.py: _ensure_base / get_pipe / _load_omni /
+# generate / generate_omni / inpaint_run / outpaint / process_one / txt2img_run +
+# round_to_multiple / _reframe_canvas / _make_generator / _refine_* / _gen_meta.
+# (importes en tete). _editor_to_image_mask / _editor_img / _crop_input restent ici
+# (helpers gr.ImageEditor, pas d'etat pipeline).
 # ----------------------------------------------------------------------------
-def _ensure_base():
-    """Charge (si besoin) le pipeline de base txt2img. Gere le transformer
-    single-file (Civitai) et l'offload. Cache par (repo, transformer, offload)."""
-    global _BASE_PIPE, _DERIVED, _LOADED_KEY
-    key = (BASE_REPO, ZIMAGE_TRANSFORMER, OFFLOAD_MODE, tuple(LORAS))
-    _dbg(f"_ensure_base key={key} cached={_LOADED_KEY}")
-    if _BASE_PIPE is not None and _LOADED_KEY == key:
-        _dbg("base pipeline: reusing cached (no reload)")
-        return _BASE_PIPE
-    if _BASE_PIPE is not None:
-        _dbg("base pipeline: key changed -> free + reload")
-        free_vram()
-    from diffusers import ZImagePipeline, ZImageTransformer2DModel
-    t0 = time.time()
-    kwargs = {}
-    if ZIMAGE_TRANSFORMER:
-        if _is_single_file(ZIMAGE_TRANSFORMER):
-            _log(f"loading Z-Image transformer (single-file): {ZIMAGE_TRANSFORMER} ...")
-            kwargs["transformer"] = ZImageTransformer2DModel.from_single_file(
-                ZIMAGE_TRANSFORMER, torch_dtype=DTYPE)
-        else:
-            # repo HF / dossier diffusers -> charge le sous-dossier 'transformer'
-            # (utile pour les modeles comme Juggernaut-Z dont le tokenizer est
-            # incomplet: on garde VAE + encodeur + tokenizer du repo de base).
-            _log(f"loading Z-Image transformer (repo subfolder): {ZIMAGE_TRANSFORMER} ...")
-            kwargs["transformer"] = ZImageTransformer2DModel.from_pretrained(
-                ZIMAGE_TRANSFORMER, subfolder="transformer", torch_dtype=DTYPE)
-    _log(f"loading Z-Image base: {BASE_REPO} (offload={OFFLOAD_MODE}, dtype=bf16) ... "
-         "first time downloads from HF, then cached")
-    pipe = ZImagePipeline.from_pretrained(BASE_REPO, torch_dtype=DTYPE, **kwargs)
-    # LoRA Z-Image (sur le transformer du base -> partage par les pipes derives).
-    if LORAS:
-        try:
-            names, weights = [], []
-            for i, (p, w) in enumerate(LORAS):
-                if os.path.isfile(p):
-                    an = f"cz_lora_{i}"
-                    _log(f"applying LoRA: {os.path.basename(p)} (weight {w})")
-                    pipe.load_lora_weights(p, adapter_name=an)
-                    names.append(an)
-                    weights.append(float(w))
-            if names:
-                pipe.set_adapters(names, weights)
-        except Exception as e:
-            _log(f"LoRA load failed ({e}); continuing without LoRA")
-    try:
-        pipe.enable_attention_slicing()
-    except Exception:
-        pass
-    # enable_*_cpu_offload gere lui-meme le device -> ne PAS faire .to(cuda) alors.
-    if DEVICE == "cuda" and OFFLOAD_MODE == "model":
-        pipe.enable_model_cpu_offload()
-    elif DEVICE == "cuda" and OFFLOAD_MODE == "sequential":
-        pipe.enable_sequential_cpu_offload()
-    else:
-        pipe = pipe.to(DEVICE)
-    _BASE_PIPE = pipe
-    _DERIVED = {"txt2img": pipe}
-    _LOADED_KEY = key
-    _log(f"Z-Image base ready in {time.time() - t0:.1f}s")
-    return pipe
-
-
-def get_pipe(kind="img2img"):
-    """Renvoie le pipeline demande. txt2img/img2img/inpaint derivent du base via
-    from_pipe (poids partages). Omni a besoin de composants en plus (SigLIP) ->
-    charge separement depuis un modele Omni dedie (CONFIG['zimage_omni_model'])."""
-    base = _ensure_base()
-    if kind in _DERIVED:
-        _dbg(f"get_pipe('{kind}'): reuse derived")
-        return _DERIVED[kind]
-    if kind == "omni":
-        return _load_omni()
-    from diffusers import ZImageImg2ImgPipeline, ZImageInpaintPipeline
-    cls = {"img2img": ZImageImg2ImgPipeline, "inpaint": ZImageInpaintPipeline}.get(kind)
-    if cls is None:
-        return base
-    _log(f"deriving {kind} pipeline (shared weights, no extra VRAM)")
-    p = cls.from_pipe(base)
-    _DERIVED[kind] = p
-    return p
-
-
-def _load_omni():
-    """Charge le pipeline Omni (multi-reference). Necessite un modele Z-Image
-    Omni/Edit (avec encodeur SigLIP) -> CONFIG['zimage_omni_model'] ou env
-    ZIMAGE_OMNI_MODEL. Pipeline separe (ne partage pas avec le base)."""
-    global _DERIVED
-    from diffusers import ZImageOmniPipeline
-    repo = (OMNI_MODEL or os.environ.get("ZIMAGE_OMNI_MODEL")
-            or CONFIG.get("zimage_omni_model") or "").strip()
-    if not repo:
-        raise RuntimeError(
-            "Omni needs a dedicated Z-Image Omni/Edit model (with a SigLIP encoder that "
-            "the Turbo/Base text-to-image models do not ship). As of now Tongyi has only "
-            "released Z-Image-Turbo and Z-Image-Base; 'Z-Image-Omni-Base' and 'Z-Image-Edit' "
-            "are still 'coming soon'. Once published, set 'zimage_omni_model' in config.txt "
-            "to its HF repo id (likely 'Tongyi-MAI/Z-Image-Omni-Base' or 'Tongyi-MAI/"
-            "Z-Image-Edit') or a local diffusers folder.")
-    _log(f"loading Z-Image Omni: {repo} (offload={OFFLOAD_MODE}) ...")
-    t0 = time.time()
-    pipe = ZImageOmniPipeline.from_pretrained(repo, torch_dtype=DTYPE)
-    try:
-        pipe.enable_attention_slicing()
-    except Exception:
-        pass
-    if DEVICE == "cuda" and OFFLOAD_MODE == "model":
-        pipe.enable_model_cpu_offload()
-    elif DEVICE == "cuda" and OFFLOAD_MODE == "sequential":
-        pipe.enable_sequential_cpu_offload()
-    else:
-        pipe = pipe.to(DEVICE)
-    _DERIVED["omni"] = pipe
-    _log(f"Z-Image Omni ready in {time.time() - t0:.1f}s")
-    return pipe
-
-
-def generate_omni(refs, prompt, negative, width, height, steps, seed):
-    """Omni multi-reference: compose une image a partir de plusieurs images de
-    reference + un prompt (ex. personne + vetement). ZImageOmniPipeline natif."""
-    refs = [r for r in (refs or []) if r is not None]
-    if not refs:
-        raise ValueError("Omni needs at least one reference image.")
-    pipe = get_pipe("omni")
-    w = round_to_multiple(int(width))
-    h = round_to_multiple(int(height))
-    _log(f"omni: {len(refs)} ref(s) -> {w}x{h}, {int(steps)} steps, guidance {GUIDANCE:.1f} ...")
-    _progress(0.1, f"Omni compose ({len(refs)} refs)...")
-    t0 = time.time()
-    out = pipe(
-        image=[r.convert("RGB") for r in refs],
-        prompt=prompt or "",
-        negative_prompt=(negative or None),
-        width=w, height=h,
-        num_inference_steps=int(steps),
-        guidance_scale=GUIDANCE,
-        generator=_make_generator(seed),
-    ).images[0]
-    _log(f"omni done in {time.time() - t0:.1f}s")
-    gc.collect()
-    if DEVICE == "cuda":
-        torch.cuda.empty_cache()
-    return out
-
-
-def load_pipe():
-    """Compat: pipeline img2img (etage de raffinement)."""
-    return get_pipe("img2img")
-
-
-def generate(prompt, width, height, steps, seed, negative_prompt=""):
-    """txt2img Z-Image: genere une image depuis un prompt.
-    Turbo -> GUIDANCE 0. Base -> GUIDANCE ~3.5-5 + plus de steps."""
-    pipe = get_pipe("txt2img")
-    w = round_to_multiple(int(width))
-    h = round_to_multiple(int(height))
-    _log(f"txt2img: {w}x{h}, {int(steps)} steps, guidance {GUIDANCE:.1f} ...")
-    _dbg(f"txt2img seed={seed} dtype=bf16 device={DEVICE} offload={OFFLOAD_MODE} "
-         f"transformer={'single-file' if ZIMAGE_TRANSFORMER else 'repo'}")
-    if DEVICE == "cuda":
-        _dbg(f"VRAM before: alloc={torch.cuda.memory_allocated()/1024**3:.2f} Go")
-    _progress(0.1, f"Generating {w}x{h} ({int(steps)} steps)...")
-    t0 = time.time()
-    img = pipe(
-        prompt=prompt or "",
-        negative_prompt=(negative_prompt or None),
-        width=w, height=h,
-        num_inference_steps=int(steps),
-        guidance_scale=GUIDANCE,
-        generator=_make_generator(seed),
-    ).images[0]
-    _log(f"txt2img done in {time.time() - t0:.1f}s")
-    if DEVICE == "cuda":
-        _dbg(f"VRAM peak: alloc={torch.cuda.max_memory_allocated()/1024**3:.2f} Go | "
-             f"reserved={torch.cuda.max_memory_reserved()/1024**3:.2f} Go")
-    gc.collect()
-    if DEVICE == "cuda":
-        torch.cuda.empty_cache()
-    return img
-
-
-def round_to_multiple(x, m=16):
-    return max(m, int(round(x / m) * m))
-
-
-def _reframe_canvas(image, ratio_w, ratio_h, overlap=8):
-    """Place l'image dans un canevas plus grand au ratio cible (expansion sur 1 axe),
-    + un masque (blanc = a remplir, noir = a garder, avec un petit overlap)."""
-    from PIL import ImageDraw
-    image = image.convert("RGB")
-    w, h = image.size
-    r = ratio_w / ratio_h
-    # Alignement sur 32 (patch 2 x VAE 16): evite les erreurs de conv (no engine).
-    if w / h < r:  # trop etroit -> elargir
-        nw, nh = round_to_multiple(int(round(h * r)), 32), round_to_multiple(h, 32)
-    else:          # trop large -> agrandir en hauteur
-        nw, nh = round_to_multiple(w, 32), round_to_multiple(int(round(w / r)), 32)
-    nw, nh = max(nw, round_to_multiple(w, 32)), max(nh, round_to_multiple(h, 32))
-    ox, oy = (nw - w) // 2, (nh - h) // 2
-    canvas = Image.new("RGB", (nw, nh), (127, 127, 127))
-    canvas.paste(image, (ox, oy))
-    mask = Image.new("L", (nw, nh), 255)
-    ImageDraw.Draw(mask).rectangle(
-        [ox + overlap, oy + overlap, ox + w - overlap, oy + h - overlap], fill=0)
-    return canvas, mask, nw, nh
-
-
-def inpaint_run(background, mask, prompt, steps, denoise, seed):
-    """Inpaint: regenere la zone blanche du masque selon le prompt
-    (ZImageInpaintPipeline). background + mask = PIL (L: blanc = a changer)."""
-    bg = background.convert("RGB")
-    w = round_to_multiple(bg.width, 32)
-    h = round_to_multiple(bg.height, 32)
-    if (w, h) != bg.size:
-        bg = bg.resize((w, h), Image.LANCZOS)
-        mask = mask.resize((w, h), Image.NEAREST)
-    pipe = get_pipe("inpaint")
-    _log(f"inpaint: {w}x{h}, {int(steps)} steps, strength {float(denoise):.2f}, "
-         f"guidance {GUIDANCE:.1f} ...")
-    _progress(0.1, "Inpainting...")
-    t0 = time.time()
-    out = pipe(prompt=prompt or "", image=bg, mask_image=mask, strength=float(denoise),
-               num_inference_steps=int(steps), guidance_scale=GUIDANCE,
-               generator=_make_generator(seed)).images[0]
-    _log(f"inpaint done in {time.time() - t0:.1f}s")
-    gc.collect()
-    if DEVICE == "cuda":
-        torch.cuda.empty_cache()
-    return out
-
-
 def _editor_to_image_mask(editor_value):
     """Extrait (image, masque) d'un gr.ImageEditor. Masque = zone peinte (diff
     composite/background), blanc = a regenerer."""
@@ -805,207 +326,18 @@ def _crop_input(label, height=280):
                           layers=False, transforms=["crop"])
 
 
-def outpaint(image, ratio_w, ratio_h, prompt, steps, seed):
-    """Reframe / outpainting: agrandit l'image au ratio cible et fait remplir les
-    bords par Z-Image (ZImageInpaintPipeline)."""
-    canvas, mask, nw, nh = _reframe_canvas(image, ratio_w, ratio_h)
-    pipe = get_pipe("inpaint")
-    _log(f"outpaint: {image.size[0]}x{image.size[1]} -> {nw}x{nh}, {int(steps)} steps, "
-         f"guidance {GUIDANCE:.1f} ...")
-    _progress(0.1, f"Outpaint -> {nw}x{nh}...")
-    t0 = time.time()
-    out = pipe(prompt=prompt or "", image=canvas, mask_image=mask, strength=1.0,
-               num_inference_steps=int(steps), guidance_scale=GUIDANCE,
-               generator=_make_generator(seed)).images[0]
-    if out.size != (nw, nh):
-        out = out.resize((nw, nh), Image.LANCZOS)
-    _log(f"outpaint done in {time.time() - t0:.1f}s")
-    gc.collect()
-    if DEVICE == "cuda":
-        torch.cuda.empty_cache()
-    return out
+# outpaint / _make_generator / _refine_whole / _feather_mask_np / _refine_tiled /
+# process_one / txt2img_run -> cz_pipeline.py (importes en tete).
 
 
-def _make_generator(seed):
-    return torch.Generator(DEVICE).manual_seed(int(seed)) if int(seed) >= 0 else None
-
-
-def _refine_whole(pipe, image, denoise, steps, prompt, seed):
-    """Passe Z-Image img2img sur l'image entiere."""
-    return pipe(
-        prompt=prompt or "",
-        image=image,
-        strength=float(denoise),
-        num_inference_steps=int(steps),
-        guidance_scale=GUIDANCE,
-        generator=_make_generator(seed),
-    ).images[0]
-
-
-def _feather_mask_np(th, tw, overlap, left, right, top, bottom):
-    """Masque (th, tw, 1) a rampe lineaire sur les bords qui jouxtent une autre tuile."""
-    mask = np.ones((th, tw, 1), dtype=np.float32)
-    f = int(overlap)
-    if f > 0:
-        ramp = np.linspace(0.0, 1.0, f, dtype=np.float32)
-        if left:
-            mask[:, :f, 0] *= ramp[np.newaxis, :]
-        if right:
-            mask[:, tw - f:, 0] *= ramp[::-1][np.newaxis, :]
-        if top:
-            mask[:f, :, 0] *= ramp[:, np.newaxis]
-        if bottom:
-            mask[th - f:, :, 0] *= ramp[::-1][:, np.newaxis]
-    return mask
-
-
-def _refine_tiled(pipe, image, denoise, steps, prompt, seed, tile, overlap):
-    """Passe Z-Image en tuiles avec recomposition feather (facon Ultimate SD Upscale).
-    Plafonne le pic VRAM (une tuile a la fois) et permet le 4K+ sans coutures.
-    Memes rampe lineaire + overlap-add que esrgan_upscale, mais a scale 1 sur PIL."""
-    w, h = image.size
-    tile = round_to_multiple(tile)                       # multiple de 16 pour le VAE
-    overlap = max(0, min(int(overlap), tile - 16))
-    if w <= tile and h <= tile:
-        return _refine_whole(pipe, image, denoise, steps, prompt, seed)
-
-    acc = np.zeros((h, w, 3), dtype=np.float32)
-    weight = np.zeros((h, w, 1), dtype=np.float32)
-    step = max(16, tile - overlap)
-    ys = list(range(0, h, step))
-    xs = list(range(0, w, step))
-    total = len(ys) * len(xs)
-    _log(f"refine: tiled {w}x{h}, tile {tile} overlap {overlap} -> {len(xs)}x{len(ys)} = {total} tiles")
-    i = 0
-    for y in ys:
-        for x in xs:
-            if _STOP:
-                _log("refine tiled: stop requested")
-                break
-            i += 1
-            x2, y2 = min(x + tile, w), min(y + tile, h)
-            x1, y1 = max(x2 - tile, 0), max(y2 - tile, 0)
-            cw, ch = x2 - x1, y2 - y1
-            _log(f"  tile {i}/{total}")
-            _progress(0.45 + 0.5 * (i - 1) / max(1, total), f"Refine tile {i}/{total}")
-            crop = image.crop((x1, y1, x2, y2))
-            out = _refine_whole(pipe, crop, denoise, steps, prompt, seed)
-            if out.size != (cw, ch):
-                out = out.resize((cw, ch), Image.LANCZOS)
-            out_arr = np.asarray(out.convert("RGB"), dtype=np.float32) / 255.0
-            mask = _feather_mask_np(ch, cw, overlap,
-                                    left=x1 > 0, right=x2 < w, top=y1 > 0, bottom=y2 < h)
-            acc[y1:y2, x1:x2, :] += out_arr * mask
-            weight[y1:y2, x1:x2, :] += mask
-
-    out = acc / np.clip(weight, 1e-6, None)
-    return Image.fromarray((out * 255.0 + 0.5).astype(np.uint8))
-
-
-# ----------------------------------------------------------------------------
-# Orchestration : process_one, save, batch, run (UI/CLI commun)
-# ----------------------------------------------------------------------------
-def process_one(image, esrgan_model, factor, denoise, steps, prompt, seed, tile, overlap,
-                refine_tile=DEFAULT_REFINE_TILE, refine_overlap=DEFAULT_REFINE_OVERLAP,
-                do_esrgan=True):
-    """Pipeline sur une PIL Image, renvoie (image, timings_dict).
-    do_esrgan=False -> img2img pur (saute l'etage ESRGAN, refine sur l'image native)."""
-    timings = {}
-    image = image.convert("RGB")
-    w0, h0 = image.size
-    _dbg(f"process_one in={w0}x{h0} factor={factor} denoise={denoise} steps={int(steps)} "
-         f"do_esrgan={do_esrgan} esrgan={esrgan_model} refine_tile={int(refine_tile)}")
-
-    # Etage 1 : ESRGAN (saute si do_esrgan=False -> img2img pur)
-    if do_esrgan and esrgan_model:
-        t0 = time.time()
-        _progress(0.15, f"ESRGAN upscale {w0}x{h0}...")
-        model = load_esrgan(esrgan_model)
-        _log(f"stage 1/2 ESRGAN upscale: {w0}x{h0} (tile {int(tile)}) ...")
-        upscaled = esrgan_upscale(image, model, int(tile), int(overlap))
-        target_w = round_to_multiple(w0 * factor)
-        target_h = round_to_multiple(h0 * factor)
-        upscaled = upscaled.resize((target_w, target_h), Image.LANCZOS)
-        timings["esrgan"] = time.time() - t0
-        _log(f"stage 1/2 done in {timings['esrgan']:.1f}s -> {target_w}x{target_h}")
-    else:
-        upscaled = image
-        target_w, target_h = w0, h0
-        timings["esrgan"] = 0.0
-        _log(f"ESRGAN skipped (img2img only) on {w0}x{h0}")
-
-    if denoise <= 0.001:
-        timings["refine"] = 0.0
-        _log("refine skipped (denoise = 0)")
-        return upscaled, timings
-
-    # Etage 2 : Z-Image img2img (image entiere, ou tuiles si refine_tile > 0)
-    t0 = time.time()
-    pipe = load_pipe()
-    if int(refine_tile) > 0:
-        refined = _refine_tiled(pipe, upscaled, denoise, steps, prompt, seed,
-                                int(refine_tile), int(refine_overlap))
-    else:
-        _log(f"stage 2/2 Z-Image refine: whole image {target_w}x{target_h}, "
-             f"denoise {float(denoise):.2f}, {int(steps)} steps ...")
-        _progress(0.5, f"Z-Image refine {target_w}x{target_h}...")
-        refined = _refine_whole(pipe, upscaled, denoise, steps, prompt, seed)
-    timings["refine"] = time.time() - t0
-
-    gc.collect()
-    if DEVICE == "cuda":
-        torch.cuda.empty_cache()
-    _progress(1.0, "Done")
-    _log(f"stage 2/2 done in {timings['refine']:.1f}s | total "
-         f"{timings['esrgan'] + timings['refine']:.1f}s")
-    return refined, timings
-
-
-def txt2img_run(prompt, width, height, gen_steps, seed, negative_prompt="",
-                upscale=False, esrgan_model=None, factor=2.0, denoise=0.30, steps=12,
-                tile=DEFAULT_TILE, overlap=DEFAULT_OVERLAP,
-                refine_tile=DEFAULT_REFINE_TILE, refine_overlap=DEFAULT_REFINE_OVERLAP):
-    """Genere une image (txt2img Z-Image) puis, si upscale=True, la passe dans le
-    pipeline ESRGAN + refine. Renvoie (image, timings_dict)."""
-    timings = {"txt2img": 0.0, "esrgan": 0.0, "refine": 0.0}
-    t0 = time.time()
-    base = generate(prompt, width, height, gen_steps, seed, negative_prompt)
-    timings["txt2img"] = time.time() - t0
-    if not upscale:
-        return base, timings
-    result, t = process_one(base, esrgan_model, factor, denoise, steps, prompt, seed,
-                            tile, overlap, refine_tile=refine_tile, refine_overlap=refine_overlap)
-    timings["esrgan"] = t.get("esrgan", 0.0)
-    timings["refine"] = t.get("refine", 0.0)
-    return result, timings
-
-
-# I/O image (noms, sauvegarde, metadonnees) -> cz_imageio.py (_gen_meta reste ici).
+# I/O image (noms, sauvegarde, metadonnees) -> cz_imageio.py (_gen_meta -> cz_pipeline).
 from cz_imageio import (  # noqa: E402,F401
     _now_stamp, _unique_path, _format_filename, build_output_path, _exif_bytes,
     save_image, _list_output_files, _read_image_meta,
 )
 
 
-def _gen_meta(mode, prompt, negative="", seed=None, steps=None, guidance=None,
-              size=None, model=None, extra=None):
-    """Construit le dict de metadonnees de generation (pour sidecar/PNG)."""
-    m = {"app": "crispz-studio", "mode": mode, "prompt": prompt or "",
-         "negative": negative or "", "date": _now_stamp()}
-    if seed is not None and int(seed) >= 0:
-        m["seed"] = int(seed)
-    if steps is not None:
-        m["steps"] = int(steps)
-    if guidance is not None:
-        m["guidance"] = float(guidance)
-    if size:
-        m["size"] = f"{size[0]}x{size[1]}"
-    m["model"] = model or (ZIMAGE_TRANSFORMER or BASE_REPO)
-    if LORAS:
-        m["loras"] = [f"{os.path.basename(p)}@{w}" for p, w in LORAS]
-    if extra:
-        m.update(extra)
-    return m
+# _gen_meta -> cz_pipeline.py (importe en tete; lit le modele/LoRA courants).
 
 
 def _list_folder_images(folder):
@@ -1088,7 +420,7 @@ def run(image, source_folder, esrgan_model, factor, denoise, steps, prompt, seed
                 if dst:
                     save_image(result, dst, output_format, meta=_gen_meta(
                         "upscale" if do_esrgan else "img2img", prompt, seed=seed,
-                        steps=steps, guidance=GUIDANCE, size=result.size,
+                        steps=steps, guidance=cz_pipeline.GUIDANCE, size=result.size,
                         extra={"source": os.path.basename(p), "factor": factor,
                                "denoise": denoise, "esrgan": esrgan_model if do_esrgan else None}))
                     if print_output:
@@ -1131,7 +463,7 @@ def run(image, source_folder, esrgan_model, factor, denoise, steps, prompt, seed
     if dst:
         save_image(result, dst, output_format, meta=_gen_meta(
             "upscale" if do_esrgan else "img2img", prompt, seed=seed, steps=steps,
-            guidance=GUIDANCE, size=result.size,
+            guidance=cz_pipeline.GUIDANCE, size=result.size,
             extra={"factor": factor, "denoise": denoise,
                    "esrgan": esrgan_model if do_esrgan else None}))
         if print_output:
@@ -1168,18 +500,18 @@ def _refresh_models(new_dir):
 
 def _apply_zimage(repo):
     set_zimage_model(repo)
-    return f"Z-Image: {BASE_REPO} (will be (re)loaded on next run)"
+    return f"Z-Image: {cz_pipeline.BASE_REPO} (will be (re)loaded on next run)"
 
 
 def _refresh_checkpoints(new_dir):
     """Change le dossier checkpoints + liste les modeles + persiste."""
     set_checkpoints_dir(new_dir)
     try:
-        _save_prefs_keys({"checkpoints_dir": CHECKPOINTS_DIR})
+        _save_prefs_keys({"checkpoints_dir": cz_pipeline.CHECKPOINTS_DIR})
     except Exception:
         pass
     cks = list_checkpoints()
-    return gr.update(choices=["(base repo)"] + cks), f"{len(cks)} checkpoint(s) in {CHECKPOINTS_DIR} (saved)."
+    return gr.update(choices=["(base repo)"] + cks), f"{len(cks)} checkpoint(s) in {cz_pipeline.CHECKPOINTS_DIR} (saved)."
 
 
 def _apply_checkpoint(name):
@@ -1187,10 +519,10 @@ def _apply_checkpoint(name):
     Ajuste aussi steps/guidance selon le profil du modele (contextuel)."""
     if not name or name == "(base repo)":
         set_zimage_transformer("")
-        st, g = profile_for_model(BASE_REPO)
+        st, g = profile_for_model(cz_pipeline.BASE_REPO)
         return ("Z-Image: base repo transformer (single-file cleared).",
                 gr.update(value=st), gr.update(value=g))
-    path = name if os.path.isabs(name) else os.path.join(CHECKPOINTS_DIR, name)
+    path = name if os.path.isabs(name) else os.path.join(cz_pipeline.CHECKPOINTS_DIR, name)
     set_zimage_transformer(path)
     st, g = profile_for_model(os.path.basename(path))
     return (f"Z-Image transformer: {os.path.basename(path)} -> auto steps={st}, CFG={g} "
@@ -1282,26 +614,26 @@ def _refresh_loras(new_dir):
     """Change le dossier loras + liste les LoRA (met a jour les 3 slots) + persiste."""
     set_loras_dir(new_dir)
     try:
-        _save_prefs_keys({"loras_dir": LORAS_DIR})   # persiste -> survit au reboot
+        _save_prefs_keys({"loras_dir": cz_pipeline.LORAS_DIR})   # persiste -> survit au reboot
     except Exception:
         pass
     lr = ["None"] + list_loras()
     return (gr.update(choices=lr), gr.update(choices=lr), gr.update(choices=lr),
-            f"{len(lr) - 1} LoRA(s) in {LORAS_DIR} (saved).")
+            f"{len(lr) - 1} LoRA(s) in {cz_pipeline.LORAS_DIR} (saved).")
 
 
 def _apply_loras(n1, w1, n2, w2, n3, w3):
     """Applique la combinaison des 3 slots LoRA."""
     set_loras([(n1, w1), (n2, w2), (n3, w3)])
-    if not LORAS:
+    if not cz_pipeline.LORAS:
         return "LoRA: none."
-    return "LoRA: " + ", ".join(f"{os.path.basename(p)}@{w}" for p, w in LORAS) + " (reload on next run)."
+    return "LoRA: " + ", ".join(f"{os.path.basename(p)}@{w}" for p, w in cz_pipeline.LORAS) + " (reload on next run)."
 
 
 def _path_for_lora(name):
     if not name or name in ("None", "none", ""):
         return None
-    return name if os.path.isabs(name) else os.path.join(LORAS_DIR, name)
+    return name if os.path.isabs(name) else os.path.join(cz_pipeline.LORAS_DIR, name)
 
 
 def _ui_loras_apply(n1, w1, n2, w2, n3, w3):
@@ -1357,8 +689,8 @@ def _save_paths_to_prefs(esrgan_dir, zimage_model, checkpoints_dir=None, loras_d
         set_loras_dir(loras_dir)
     if wildcards_dir:
         set_wildcards_dir(wildcards_dir)
-    _save_prefs_keys({"esrgan_dir": cz_esrgan.ESRGAN_DIR, "zimage_model": BASE_REPO,
-                      "checkpoints_dir": CHECKPOINTS_DIR, "loras_dir": LORAS_DIR,
+    _save_prefs_keys({"esrgan_dir": cz_esrgan.ESRGAN_DIR, "zimage_model": cz_pipeline.BASE_REPO,
+                      "checkpoints_dir": cz_pipeline.CHECKPOINTS_DIR, "loras_dir": cz_pipeline.LORAS_DIR,
                       "wildcards_dir": cz_prompt.WILDCARDS_DIR})
     return (f"Saved to {PREFS_PATH}: esrgan_dir, zimage_model, checkpoints_dir, "
             f"loras_dir, wildcards_dir={cz_prompt.WILDCARDS_DIR}")
@@ -1476,8 +808,7 @@ def _ui_reframe(image, ratio, steps, prompt, guidance, offload_mode, seed,
     image = _editor_img(image)
     if image is None:
         return [], "Drop an image first.", history, history
-    global _PROGRESS
-    _PROGRESS = lambda f, d: progress(f, desc=d)
+    cz_pipeline._PROGRESS = lambda f, d: progress(f, desc=d)
     try:
         set_offload_mode(offload_mode)
         set_guidance(guidance)
@@ -1496,22 +827,21 @@ def _ui_reframe(image, ratio, steps, prompt, guidance, offload_mode, seed,
                                         tag="reframe", seed=seed, size=res.size)
                 if dst:
                     save_image(res, dst, output_format, meta=_gen_meta(
-                        "reframe", prompt, seed=seed, steps=steps, guidance=GUIDANCE,
+                        "reframe", prompt, seed=seed, steps=steps, guidance=cz_pipeline.GUIDANCE,
                         size=res.size, extra={"ratio": ratio}))
             except Exception as e:
                 _dbg(f"save reframe failed: {e}")
         new_hist = ([res] + list(history or []))[:200]
         return [res], f"Reframed to {res.size[0]}x{res.size[1]} ({ratio}).", new_hist, new_hist
     finally:
-        _PROGRESS = None
+        cz_pipeline._PROGRESS = None
 
 
 def _ui_inpaint(editor_value, prompt, negative, styles, guidance, offload_mode, steps, denoise,
                 seed, save_mode, output_dir, output_format, history,
                 progress=gr.Progress(track_tqdm=True)):
     """Inpaint depuis l'editeur (image + masque peint) -> galerie + historique."""
-    global _PROGRESS
-    _PROGRESS = lambda f, d: progress(f, desc=d)
+    cz_pipeline._PROGRESS = lambda f, d: progress(f, desc=d)
     try:
         bg, mask = _editor_to_image_mask(editor_value)
         if bg is None:
@@ -1532,14 +862,14 @@ def _ui_inpaint(editor_value, prompt, negative, styles, guidance, offload_mode, 
                                         tag="inpaint", seed=seed, size=res.size)
                 if dst:
                     save_image(res, dst, output_format, meta=_gen_meta(
-                        "inpaint", full_prompt, seed=seed, steps=steps, guidance=GUIDANCE,
+                        "inpaint", full_prompt, seed=seed, steps=steps, guidance=cz_pipeline.GUIDANCE,
                         size=res.size, extra={"strength": denoise}))
             except Exception as e:
                 _dbg(f"save inpaint failed: {e}")
         new_hist = ([res] + list(history or []))[:200]
         return [res], f"Inpaint -> {res.size[0]}x{res.size[1]}", new_hist, new_hist
     finally:
-        _PROGRESS = None
+        cz_pipeline._PROGRESS = None
 
 
 def _ui_clear_history():
@@ -1741,9 +1071,8 @@ def _ui_generate(prompt, negative, styles, style_random, use_input, input_image,
     """Bouton Generate unifie facon Fooocus. Renvoie 4 sorties:
     (images du run, report, history_state, history_gallery). L'historique accumule
     les rendus de la session (plus recents en tete, cap 200)."""
-    global _PROGRESS, _STOP
-    _STOP = False
-    _PROGRESS = lambda f, d: progress(f, desc=d)
+    cz_pipeline._STOP = False
+    cz_pipeline._PROGRESS = lambda f, d: progress(f, desc=d)
     progress(0.0, desc="Starting...")
     # Les entrees image sont des gr.ImageEditor (crop) -> extraire le PIL recadre.
     input_image = _editor_img(input_image)
@@ -1786,7 +1115,7 @@ def _ui_generate(prompt, negative, styles, style_random, use_input, input_image,
         # Garde-fou: on ne route en Omni que si un modele Omni est configure. Sinon
         # (UI obsolete dans le navigateur, mode reste sur Omni) on retombe en
         # txt2img/img2img au lieu d'echouer.
-        omni_ready = bool((OMNI_MODEL or "").strip())
+        omni_ready = bool((cz_pipeline.OMNI_MODEL or "").strip())
         if use_input and input_mode == "Reference (Omni)" and omni_ready:
             refs = [r for r in [ref1, ref2, ref3, ref4] if r is not None]
             _dbg(f"omni: {len(refs)} ref(s), size={int(width)}x{int(height)}")
@@ -1803,7 +1132,7 @@ def _ui_generate(prompt, negative, styles, style_random, use_input, input_image,
                                             tag="omni", seed=seed, size=img.size)
                     if dst:
                         save_image(img, dst, output_format, meta=_gen_meta(
-                            "omni", full_prompt, full_negative, seed, gen_steps, GUIDANCE,
+                            "omni", full_prompt, full_negative, seed, gen_steps, cz_pipeline.GUIDANCE,
                             img.size, extra={"refs": len(refs)}))
                         _dbg(f"saved: {dst}")
                 except Exception as e:
@@ -1812,7 +1141,7 @@ def _ui_generate(prompt, negative, styles, style_random, use_input, input_image,
         if use_input and input_image is not None:
             _dbg(f"img2img: esrgan={esrgan_model} do_esrgan={do_esrgan} factor={factor} "
                  f"denoise={denoise} refine_steps={int(refine_steps)} tile={int(tile)} "
-                 f"refine_tile={int(refine_tile)} model={BASE_REPO} transformer={ZIMAGE_TRANSFORMER}")
+                 f"refine_tile={int(refine_tile)} model={cz_pipeline.BASE_REPO} transformer={cz_pipeline.ZIMAGE_TRANSFORMER}")
             last_result, last_source, report = run(
                 input_image, None, esrgan_model, factor, denoise, refine_steps, full_prompt, seed,
                 tile, overlap, save_mode=save_mode, output_dir=output_dir,
@@ -1823,7 +1152,7 @@ def _ui_generate(prompt, negative, styles, style_random, use_input, input_image,
         n = max(1, int(image_number))
         images, total_t = [], 0.0
         for i in range(n):
-            if _STOP:
+            if cz_pipeline._STOP:
                 _log(f"stop requested after {i}/{n} image(s)")
                 break
             s = (int(seed) + i) if int(seed) >= 0 else -1
@@ -1845,7 +1174,7 @@ def _ui_generate(prompt, negative, styles, style_random, use_input, input_image,
                                             index=(i + 1 if n > 1 else 0))
                     if dst:
                         save_image(img, dst, output_format, meta=_gen_meta(
-                            "txt2img", fp, fn, s, gen_steps, GUIDANCE,
+                            "txt2img", fp, fn, s, gen_steps, cz_pipeline.GUIDANCE,
                             img.size, extra={"styles": chosen} if chosen else None))
                         _dbg(f"saved: {dst}")
                 except Exception as e:
@@ -1853,12 +1182,12 @@ def _ui_generate(prompt, negative, styles, style_random, use_input, input_image,
         progress(1.0, desc="Done")
         if not images:
             return _done([], "Stopped before any image.")
-        suffix = " (stopped)" if _STOP else ""
+        suffix = " (stopped)" if cz_pipeline._STOP else ""
         rep = (f"txt2img x{len(images)} - **{images[0].size[0]}x{images[0].size[1]}** "
                f"in **{total_t:.1f}s**{suffix}")
         return _done(images, rep)
     finally:
-        _PROGRESS = None
+        cz_pipeline._PROGRESS = None
 
 
 # JS injecte au chargement: force le theme sombre, preview de style au survol,
@@ -1875,7 +1204,7 @@ def build_ui():
             _sample_urls[n] = "/gradio_api/file=" + os.path.abspath(p).replace("\\", "/")
     js_full = CZ_JS.replace("__MAP__", json.dumps(_sample_urls))
     # Omni (multi-reference) propose seulement si un modele Omni/Edit est configure.
-    omni_on = bool((OMNI_MODEL or "").strip())
+    omni_on = bool((cz_pipeline.OMNI_MODEL or "").strip())
 
     with gr.Blocks(title="crispz-studio", theme=gr.themes.Default(), css=FOOOCUS_CSS, js=js_full) as demo:
         # La galerie du dossier de sortie s'ouvre dans un nouvel onglet (Asset Browser),
@@ -2098,11 +1427,11 @@ def build_ui():
 
                     with gr.Tab("Models"):
                         zimage_model_tb = gr.Textbox(
-                            value=BASE_REPO,
+                            value=cz_pipeline.BASE_REPO,
                             label="Z-Image base (HF repo, diffusers folder, or .safetensors file)",
                             info="A .safetensors (Civitai) = transformer; VAE+encoder from base repo.")
                         esrgan_dir_tb = gr.Textbox(value=cz_esrgan.ESRGAN_DIR, label="ESRGAN_DIR (.pth/.safetensors folder)")
-                        offload = gr.Dropdown(choices=list(OFFLOAD_CHOICES), value="none",
+                        offload = gr.Dropdown(choices=list(cz_pipeline.OFFLOAD_CHOICES), value="none",
                                               label="CPU offload (VRAM)",
                                               info="none | model (~half) | sequential (~9GB, slower)")
                         with gr.Row():
@@ -2112,7 +1441,7 @@ def build_ui():
                         paths_status = gr.Markdown("")
 
                         gr.Markdown("### Checkpoints (switch model, like ESRGAN)")
-                        ckpt_dir_tb = gr.Textbox(value=CHECKPOINTS_DIR, label="Checkpoints folder")
+                        ckpt_dir_tb = gr.Textbox(value=cz_pipeline.CHECKPOINTS_DIR, label="Checkpoints folder")
                         with gr.Row():
                             ckpt_dd = gr.Dropdown(choices=["(base repo)"] + list_checkpoints(),
                                                   value="(base repo)", label="Z-Image checkpoint", scale=3)
@@ -2128,19 +1457,19 @@ def build_ui():
                             transformer_apply_btn = gr.Button("Apply", size="sm", scale=1, variant="primary")
 
                         gr.Markdown("### LoRA (up to 3, combinable)")
-                        lora_dir_tb = gr.Textbox(value=LORAS_DIR, label="LoRA folder")
+                        lora_dir_tb = gr.Textbox(value=cz_pipeline.LORAS_DIR, label="LoRA folder")
                         _lchoices = ["None"] + list_loras()
                         with gr.Row():
                             lora_dd1 = gr.Dropdown(choices=_lchoices, value="None", label="LoRA 1", scale=3)
-                            lw1 = gr.Slider(0.0, 2.0, value=float(LORA_WEIGHT), step=0.05,
+                            lw1 = gr.Slider(0.0, 2.0, value=float(cz_pipeline.LORA_WEIGHT), step=0.05,
                                             label="Weight 1", scale=2)
                         with gr.Row():
                             lora_dd2 = gr.Dropdown(choices=_lchoices, value="None", label="LoRA 2", scale=3)
-                            lw2 = gr.Slider(0.0, 2.0, value=float(LORA_WEIGHT), step=0.05,
+                            lw2 = gr.Slider(0.0, 2.0, value=float(cz_pipeline.LORA_WEIGHT), step=0.05,
                                             label="Weight 2", scale=2)
                         with gr.Row():
                             lora_dd3 = gr.Dropdown(choices=_lchoices, value="None", label="LoRA 3", scale=3)
-                            lw3 = gr.Slider(0.0, 2.0, value=float(LORA_WEIGHT), step=0.05,
+                            lw3 = gr.Slider(0.0, 2.0, value=float(cz_pipeline.LORA_WEIGHT), step=0.05,
                                             label="Weight 3", scale=2)
                         lora_refresh_btn = gr.Button("Refresh LoRA list", size="sm")
                         lora_keywords_tb = gr.Textbox(label="Keywords / trigger words", lines=2,
@@ -2341,8 +1670,8 @@ def serve_main(host="127.0.0.1", port=7861, idle_timeout=300):
 
     @app.get("/health")
     def health():
-        return {"status": "ok", "device": DEVICE, "pipe_loaded": _BASE_PIPE is not None,
-                "offload": OFFLOAD_MODE, "idle_timeout": idle_timeout}
+        return {"status": "ok", "device": DEVICE, "pipe_loaded": cz_pipeline._BASE_PIPE is not None,
+                "offload": cz_pipeline.OFFLOAD_MODE, "idle_timeout": idle_timeout}
 
     @app.get("/models")
     def models():
@@ -2393,9 +1722,9 @@ def serve_main(host="127.0.0.1", port=7861, idle_timeout=300):
         period = min(30, max(5, idle_timeout // 4)) if idle_timeout > 0 else 30
         while True:
             time.sleep(period)
-            if idle_timeout > 0 and _BASE_PIPE is not None and (time.time() - state["last"]) > idle_timeout:
+            if idle_timeout > 0 and cz_pipeline._BASE_PIPE is not None and (time.time() - state["last"]) > idle_timeout:
                 with lock:
-                    if _BASE_PIPE is not None and (time.time() - state["last"]) > idle_timeout:
+                    if cz_pipeline._BASE_PIPE is not None and (time.time() - state["last"]) > idle_timeout:
                         free_vram()
                         print(f"[serve] model unloaded after {idle_timeout}s idle", file=sys.stderr)
 
@@ -2447,7 +1776,7 @@ def cli_main(argv=None):
                              "refine pass: caps VRAM and enables 4K+ without seams. Try 1024-1280.")
     parser.add_argument("--refine-overlap", type=int, default=DEFAULT_REFINE_OVERLAP,
                         help="Overlap (feather) of the Z-Image diffusion tiles")
-    parser.add_argument("--cpu-offload", choices=list(OFFLOAD_CHOICES), default="none",
+    parser.add_argument("--cpu-offload", choices=list(cz_pipeline.OFFLOAD_CHOICES), default="none",
                         help="CPU offload of the diffusion pass (VRAM). none=all in VRAM | "
                              "model=offload per submodule (good tradeoff) | "
                              "sequential=more aggressive, slower. Requires accelerate.")
@@ -2548,7 +1877,7 @@ def cli_main(argv=None):
             try:
                 slots.append((head, float(tail)))   # NAME:WEIGHT
             except ValueError:
-                slots.append((spec, LORA_WEIGHT))    # NAME (poids par defaut)
+                slots.append((spec, cz_pipeline.LORA_WEIGHT))    # NAME (poids par defaut)
         set_loras(slots)
 
     def _maybe_faceswap(img):
@@ -2657,8 +1986,8 @@ def cli_main(argv=None):
         return 0
 
     if args.save_paths:
-        _save_prefs_keys({"esrgan_dir": cz_esrgan.ESRGAN_DIR, "zimage_model": BASE_REPO})
-        print(f"Saved to {PREFS_PATH}: esrgan_dir={cz_esrgan.ESRGAN_DIR}, zimage_model={BASE_REPO}")
+        _save_prefs_keys({"esrgan_dir": cz_esrgan.ESRGAN_DIR, "zimage_model": cz_pipeline.BASE_REPO})
+        print(f"Saved to {PREFS_PATH}: esrgan_dir={cz_esrgan.ESRGAN_DIR}, zimage_model={cz_pipeline.BASE_REPO}")
         if not args.input and not args.input_folder:
             return 0
 
