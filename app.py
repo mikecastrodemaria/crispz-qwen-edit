@@ -416,9 +416,12 @@ def _face_restore(image, faces, blend=0.8):
             out = cv2.cvtColor((out * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
             IM = cv2.invertAffineTransform(M)
             back = cv2.warpAffine(out, IM, (w, h))
-            mask = cv2.warpAffine(np.full((512, 512), 255, np.uint8), IM, (w, h))
-            mask = cv2.erode(mask, np.ones((12, 12), np.uint8))
-            mask = (cv2.GaussianBlur(mask, (0, 0), 8).astype(np.float32) / 255.0)
+            # Masque ELLIPTIQUE adouci dans l'espace du crop 512 (s'estompe AVANT
+            # les bords) -> recollage sans bord carre visible.
+            m512 = np.zeros((512, 512), np.uint8)
+            cv2.ellipse(m512, (256, 256), (256 - 28, 256 - 28), 0, 0, 360, 255, -1)
+            m512 = cv2.GaussianBlur(m512, (0, 0), 24)
+            mask = cv2.warpAffine(m512, IM, (w, h)).astype(np.float32) / 255.0
             mask = (mask * float(blend))[:, :, None]
             arr = (back * mask + arr * (1 - mask)).astype(np.uint8)
         except Exception as e:
