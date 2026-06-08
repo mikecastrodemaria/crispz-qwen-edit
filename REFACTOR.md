@@ -49,10 +49,23 @@ Do NOT do it all at once. One module per PR, smoke-green between each.
   helpers. app.py 3601 -> 1865 lines; cz_pipeline.py 648. Validated: py_compile +
   is-identity (12 fns) + live-sync (LORAS/GUIDANCE/offload/_STOP) + `app.py --help`
   + build_ui + smoke 19/19. (in-browser pass pending)
-- [ ] **Step 8 — `cz_ui.py` + `cz_cli.py`** (HIGH risk, replaces old numbering):
-  move build_ui (+ handlers) and cli_main/serve_main out; app.py becomes a thin
-  entrypoint. NOTE the cz_pipeline._PROGRESS/_STOP writes + app's set_loras/_faceswap
-  wrappers + FACESWAP alias must move/stay coherent with the UI module.
+- [x] **Step 8 — `cz_ui.py` + `cz_cli.py`** (HIGH risk): DONE. `cz_ui.py` (1592 l.)
+  holds build_ui + all _ui_*/_gallery_* handlers + run + _editor_*/_crop_input +
+  constants (PRESETS/ASPECT_RATIOS/PERFORMANCE) + glue (apply_preset_to_args,
+  timing/vram, _faceswap). It branches every cz_* and NEVER imports app/cz_cli
+  (anti-circular). `cz_cli.py` (535 l.) holds _disable_brotli + serve_main + cli_main,
+  importing run/build_ui/etc. from cz_ui + the leaf modules. The app-level set_loras/
+  set_faceswap_restore mirror-wrappers are GONE: cz_ui re-exports cz_pipeline.set_loras
+  / cz_face.set_faceswap_restore directly, and `app.py` (62 l., thin entrypoint) exposes
+  a generic module `__getattr__` proxy over (cz_pipeline, cz_esrgan, cz_face) so
+  app.LORAS / app.FACESWAP_RESTORE / app.ESRGAN_DIR / app.BASE_REPO ... resolve LIVE
+  (smoke + cli_interactive.py rely on the `import app` facade). app.py 1887 -> 62 lines.
+  Validated: py_compile (app/cz_ui/cz_cli/cli_interactive) + proxy asserts + `app.py
+  --help` + build_ui + smoke 19/19. (in-browser pass pending)
+
+**Refactor COMPLETE (steps 0-8).** app.py is a thin entrypoint; everything lives in
+cz_* modules. Remaining: in-browser validation of the UI/CLI after the move, plus the
+optional package move (crispz_studio/) from the target layout below.
 
 Recommend: do steps 6-8 with an in-browser pass each (generate, switch model, LoRA,
 faceswap, wildcards) since smoke does not exercise the stateful generation/UI paths.
