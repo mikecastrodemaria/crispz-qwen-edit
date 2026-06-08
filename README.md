@@ -22,7 +22,9 @@ SwarmUI. On top of crispz's upscaler it adds:
 - **Advanced Gallery** (output folder): metadata (prompt/seed/params), sort/filter,
   copy, delete, NSFW blur — plus a per-session history.
 - **Metadata saved** with every image: PNG text chunk + EXIF (jpg/webp) + `.json`
-  sidecar. **Dated, unique filenames** (date + tag + seed + size).
+  sidecar — prompt, negative, seed, steps, guidance, size, model, LoRAs, **applied
+  style names**, and the **sampler/schedule**. **Dated, unique filenames** (date +
+  tag + seed + size).
 - **`config.txt`** for all defaults + the Ollama instruction strings.
 - **Reference (Omni)** native multi-image compose: code ready, UI hidden until the
   Z-Image Omni/Edit model ships.

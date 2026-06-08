@@ -857,7 +857,7 @@ def txt2img_run(prompt, width, height, gen_steps, seed, negative_prompt="",
 
 
 def _gen_meta(mode, prompt, negative="", seed=None, steps=None, guidance=None,
-              size=None, model=None, extra=None):
+              size=None, model=None, styles=None, extra=None):
     """Construit le dict de metadonnees de generation (pour sidecar/PNG)."""
     m = {"app": "crispz-studio", "mode": mode, "prompt": prompt or "",
          "negative": negative or "", "date": _now_stamp()}
@@ -869,6 +869,11 @@ def _gen_meta(mode, prompt, negative="", seed=None, steps=None, guidance=None,
         m["guidance"] = float(guidance)
     if size:
         m["size"] = f"{size[0]}x{size[1]}"
+    # Noms de styles appliques (en plus des mots-cles deja injectes dans le prompt).
+    _styles = [s for s in (styles or []) if s and s not in ("None", "none")]
+    if _styles:
+        m["styles"] = _styles
+    m["sampler"] = f"{SAMPLER}/{SCHEDULE}"
     m["model"] = model or (ZIMAGE_TRANSFORMER or BASE_REPO)
     if LORAS:
         m["loras"] = [f"{os.path.basename(p)}@{w}" for p, w in LORAS]

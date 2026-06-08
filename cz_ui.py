@@ -339,7 +339,7 @@ def run(image, source_folder, esrgan_model, factor, denoise, steps, prompt, seed
         tile, overlap, save_mode=DEFAULT_SAVE_MODE, output_dir=DEFAULT_OUTPUT_DIR,
         output_format=DEFAULT_OUTPUT_FORMAT, time_log_path=None, print_output=False,
         refine_tile=DEFAULT_REFINE_TILE, refine_overlap=DEFAULT_REFINE_OVERLAP,
-        do_esrgan=True, refine_first=False):
+        do_esrgan=True, refine_first=False, styles=None):
     """Point d'entree commun UI / CLI.
     Renvoie (last_result_PIL, last_source_PIL, report_markdown).
     - Si source_folder est un dossier existant -> batch sur ses images.
@@ -375,6 +375,7 @@ def run(image, source_folder, esrgan_model, factor, denoise, steps, prompt, seed
                     save_image(result, dst, output_format, meta=_gen_meta(
                         "upscale" if do_esrgan else "img2img", prompt, seed=seed,
                         steps=steps, guidance=cz_pipeline.GUIDANCE, size=result.size,
+                        styles=styles,
                         extra={"source": os.path.basename(p), "factor": factor,
                                "denoise": denoise, "esrgan": esrgan_model if do_esrgan else None}))
                     if print_output:
@@ -417,7 +418,7 @@ def run(image, source_folder, esrgan_model, factor, denoise, steps, prompt, seed
     if dst:
         save_image(result, dst, output_format, meta=_gen_meta(
             "upscale" if do_esrgan else "img2img", prompt, seed=seed, steps=steps,
-            guidance=cz_pipeline.GUIDANCE, size=result.size,
+            guidance=cz_pipeline.GUIDANCE, size=result.size, styles=styles,
             extra={"factor": factor, "denoise": denoise,
                    "esrgan": esrgan_model if do_esrgan else None}))
         if print_output:
@@ -817,7 +818,7 @@ def _ui_inpaint(editor_value, prompt, negative, styles, guidance, offload_mode, 
                 if dst:
                     save_image(res, dst, output_format, meta=_gen_meta(
                         "inpaint", full_prompt, seed=seed, steps=steps, guidance=cz_pipeline.GUIDANCE,
-                        size=res.size, extra={"strength": denoise}))
+                        size=res.size, styles=styles, extra={"strength": denoise}))
             except Exception as e:
                 _dbg(f"save inpaint failed: {e}")
         new_hist = ([res] + list(history or []))[:200]
@@ -1057,8 +1058,8 @@ def _ui_generate(prompt, negative, styles, style_random, use_input, input_image,
         set_offload_mode(offload_mode)
         set_guidance(guidance)
         base_prompt = _apply_wildcards(prompt, _seed_rng(seed))   # __name__ -> random line
-        full_prompt, full_negative = _apply_styles(base_prompt, negative,
-                                                   _pick_styles(styles, style_random))
+        picked_styles = _pick_styles(styles, style_random)        # noms de styles -> meta
+        full_prompt, full_negative = _apply_styles(base_prompt, negative, picked_styles)
         mode = "img2img/upscale" if (use_input and input_image is not None) else "txt2img"
         _log(f"Generate ({mode})")
         _dbg(f"params: mode={mode} use_input={use_input} has_img={input_image is not None} "
@@ -1087,7 +1088,7 @@ def _ui_generate(prompt, negative, styles, style_random, use_input, input_image,
                     if dst:
                         save_image(img, dst, output_format, meta=_gen_meta(
                             "omni", full_prompt, full_negative, seed, gen_steps, cz_pipeline.GUIDANCE,
-                            img.size, extra={"refs": len(refs)}))
+                            img.size, styles=picked_styles, extra={"refs": len(refs)}))
                         _dbg(f"saved: {dst}")
                 except Exception as e:
                     _dbg(f"save failed: {e}")
@@ -1102,7 +1103,7 @@ def _ui_generate(prompt, negative, styles, style_random, use_input, input_image,
                 input_image, None, esrgan_model, factor, eff_denoise, refine_steps, full_prompt, seed,
                 tile, overlap, save_mode=save_mode, output_dir=output_dir,
                 output_format=output_format, refine_tile=refine_tile, refine_overlap=refine_overlap,
-                do_esrgan=bool(do_esrgan), refine_first=bool(refine_first))
+                do_esrgan=bool(do_esrgan), refine_first=bool(refine_first), styles=picked_styles)
             return _done([last_result], report)
         # txt2img (batch image_number)
         n = max(1, int(image_number))
@@ -1131,7 +1132,7 @@ def _ui_generate(prompt, negative, styles, style_random, use_input, input_image,
                     if dst:
                         save_image(img, dst, output_format, meta=_gen_meta(
                             "txt2img", fp, fn, s, gen_steps, cz_pipeline.GUIDANCE,
-                            img.size, extra={"styles": chosen} if chosen else None))
+                            img.size, styles=chosen))
                         _dbg(f"saved: {dst}")
                 except Exception as e:
                     _dbg(f"save failed: {e}")
