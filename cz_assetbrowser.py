@@ -109,7 +109,7 @@ def ab_reindex(output_dir, thumb_size=256, quality=85, blur=False, gen_thumbs=Tr
             "seed": meta.get("seed"), "steps": meta.get("steps"),
             "guidance": meta.get("guidance"), "size": meta.get("size"), "mode": meta.get("mode"),
             "model": (os.path.basename(str(meta["model"])) if meta.get("model") else ""),
-            "loras": meta.get("loras"),
+            "loras": meta.get("loras"), "styles": meta.get("styles"), "sampler": meta.get("sampler", ""),
         })
     manifest = {"count": len(entries), "blur": bool(blur), "thumb_size": int(thumb_size),
                 "pending_thumbs": len(jobs),

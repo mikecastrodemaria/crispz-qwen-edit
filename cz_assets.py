@@ -16,7 +16,7 @@ font-family:system-ui,Segoe UI,Roboto,sans-serif}
 header{position:sticky;top:0;z-index:5;background:#0b1018ee;backdrop-filter:blur(6px);
 padding:10px 14px;display:flex;gap:12px;align-items:center;border-bottom:1px solid var(--line);flex-wrap:wrap}
 header h1{font-size:15px;margin:0;font-weight:600}
-input,button{background:#141b29;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:7px 10px;font-size:13px}
+input,button,select{background:#141b29;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:7px 10px;font-size:13px}
 button{cursor:pointer}#count{color:var(--mut);font-size:12px}
 #grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px;padding:12px}
 .cell{position:relative;aspect-ratio:1;border-radius:8px;overflow:hidden;background:#11182a;cursor:zoom-in;border:1px solid var(--line)}
@@ -38,7 +38,8 @@ user-select:none;padding:0 14px;opacity:.7}.nav:hover{opacity:1}#prev{left:0}#ne
 #close{position:fixed;top:10px;right:352px;font-size:30px;color:#fff;cursor:pointer;z-index:11}
 </style></head><body>
 <header><h1>🖼️ crispz-studio</h1>
-<input id="q" placeholder="Search prompt / filename..." style="flex:1;min-width:160px">
+<input id="q" placeholder="Search metadata (prompt, style, model, seed, sampler...)" style="flex:1;min-width:160px">
+<select id="dayf" title="Filter by day"></select>
 <button id="blurbtn">Blur</button><span id="count"></span></header>
 <div id="grid"></div>
 <div id="lb"><span id="close">&times;</span><span class="nav" id="prev">&#10094;</span>
@@ -47,19 +48,24 @@ user-select:none;padding:0 14px;opacity:.7}.nav:hover{opacity:1}#prev{left:0}#ne
 <script>
 let DATA=[],VIEW=[],cur=0;
 const grid=document.getElementById('grid'),lb=document.getElementById('lb'),big=document.getElementById('big'),
-side=document.getElementById('side'),q=document.getElementById('q'),cnt=document.getElementById('count');
+side=document.getElementById('side'),q=document.getElementById('q'),cnt=document.getElementById('count'),
+dayf=document.getElementById('dayf');
 function esc(s){return (s==null?'':String(s)).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
 function render(){grid.innerHTML='';VIEW.forEach((e,i)=>{const c=document.createElement('div');c.className='cell';
 c.innerHTML='<img loading="lazy" src="'+encodeURI(e.thumb)+'" onerror="this.onerror=null;this.src=\''+encodeURI(e.file)+'\'">'+
 '<div class="cap">'+esc(e.file)+'</div>';
 c.onclick=()=>open(i);grid.appendChild(c);});cnt.textContent=VIEW.length+' / '+DATA.length;}
-function filter(){const s=q.value.toLowerCase().trim();VIEW=!s?DATA.slice():DATA.filter(e=>
-(e.file+' '+(e.prompt||'')+' '+(e.mode||'')+' '+(e.seed||'')).toLowerCase().includes(s));render();}
+function hay(e){return (e.file+' '+(e.prompt||'')+' '+(e.negative||'')+' '+(e.mode||'')+' '+
+(e.seed||'')+' '+(e.steps||'')+' '+(e.guidance||'')+' '+(e.size||'')+' '+(e.model||'')+' '+
+((e.loras||[]).join(' '))+' '+((e.styles||[]).join(' '))+' '+(e.sampler||'')+' '+(e.day||'')).toLowerCase();}
+function filter(){const s=q.value.toLowerCase().trim();const dv=dayf.value;
+VIEW=DATA.filter(e=>(!dv||e.day===dv)&&(!s||hay(e).includes(s)));render();}
 function open(i){cur=i;const e=VIEW[i];big.src=encodeURI(e.file);
 let h='<h3>Prompt</h3><div class="v">'+esc(e.prompt||'(none)')+'</div>';
 if(e.negative)h+='<h3>Negative</h3><div class="v">'+esc(e.negative)+'</div>';
 h+='<h3>Info</h3><div class="v">';
-['mode','seed','steps','guidance','size','model','date'].forEach(k=>{if(e[k]!=null&&e[k]!=='')h+=k+': '+esc(e[k])+'\n';});
+['mode','seed','steps','guidance','size','model','sampler','day','date'].forEach(k=>{if(e[k]!=null&&e[k]!=='')h+=k+': '+esc(e[k])+'\n';});
+if(e.styles&&e.styles.length)h+='styles: '+esc(e.styles.join(', '))+'\n';
 if(e.loras&&e.loras.length)h+='loras: '+esc(e.loras.join(', '))+'\n';
 h+='file: '+esc(e.file)+'</div>';
 h+='<button onclick="cp(\''+'prompt'+'\')">Copy prompt</button>';
@@ -82,10 +88,12 @@ lb.onclick=ev=>{if(ev.target===lb||ev.target===big.parentNode)close();};
 document.addEventListener('keydown',ev=>{if(!lb.classList.contains('open'))return;
 if(ev.key==='Escape')close();if(ev.key==='ArrowLeft')document.getElementById('prev').click();
 if(ev.key==='ArrowRight')document.getElementById('next').click();});
-q.oninput=filter;
+q.oninput=filter;dayf.onchange=filter;
 document.getElementById('blurbtn').onclick=()=>document.body.classList.toggle('blur');
+function fillDays(){const days=[...new Set(DATA.map(e=>e.day).filter(Boolean))].sort().reverse();
+dayf.innerHTML='<option value="">All days ('+days.length+')</option>'+days.map(d=>'<option value="'+esc(d)+'">'+esc(d)+'</option>').join('');}
 fetch('_index/manifest.json?t='+Date.now()).then(r=>r.json()).then(m=>{
-DATA=m.images||[];if(m.blur)document.body.classList.add('blur');filter();})
+DATA=m.images||[];if(m.blur)document.body.classList.add('blur');fillDays();filter();})
 .catch(e=>{grid.innerHTML='<p style="padding:20px;color:#8b98ad">No manifest. Click Reindex in crispz-studio.</p>';});
 </script></body></html>
 """
