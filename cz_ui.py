@@ -159,6 +159,22 @@ def _faceswap(target_img, source_img):
     qui l'ajoute aux emplacements de recherche du modele inswapper."""
     return cz_face._faceswap(target_img, source_img, cz_pipeline.CHECKPOINTS_DIR)
 
+
+def _dl_path(pil, path):
+    """Pour la galerie: renvoie le CHEMIN du fichier sauve (-> telechargement avec le
+    vrai nom unique au lieu de 'image') s'il existe SOUS le dossier de sortie autorise
+    par Gradio; sinon l'image PIL (apercu). Garde-fou: jamais d'apercu casse si le
+    fichier est hors allowed_paths (dossier de sortie non-defaut)."""
+    if path:
+        try:
+            ap = os.path.abspath(path)
+            root = os.path.abspath(_ab_resolve_dir(DEFAULT_OUTPUT_DIR))
+            if os.path.isfile(ap) and (ap == root or ap.startswith(root + os.sep)):
+                return ap
+        except Exception:
+            pass
+    return pil
+
 # ----------------------------------------------------------------------------
 # Config (persistance dans preferences.json a cote de app.py)
 # Ordre de priorite pour ESRGAN_DIR et BASE_REPO:
@@ -776,6 +792,7 @@ def _ui_reframe(image, ratio, steps, prompt, guidance, offload_mode, seed,
         except Exception as e:
             _log(f"outpaint error: {e}")
             return [], f"Reframe failed: {e}", history, history
+        dst = None
         if save_mode != "display":
             try:
                 dst = build_output_path(None, save_mode, output_dir, output_format,
@@ -785,9 +802,11 @@ def _ui_reframe(image, ratio, steps, prompt, guidance, offload_mode, seed,
                         "reframe", prompt, seed=seed, steps=steps, guidance=cz_pipeline.GUIDANCE,
                         size=res.size, extra={"ratio": ratio}))
             except Exception as e:
+                dst = None
                 _dbg(f"save reframe failed: {e}")
-        new_hist = ([res] + list(history or []))[:200]
-        return [res], f"Reframed to {res.size[0]}x{res.size[1]} ({ratio}).", new_hist, new_hist
+        item = _dl_path(res, dst)   # telechargement avec le vrai nom de fichier si sauve
+        new_hist = ([item] + list(history or []))[:200]
+        return [item], f"Reframed to {res.size[0]}x{res.size[1]} ({ratio}).", new_hist, new_hist
     finally:
         cz_pipeline._PROGRESS = None
 
@@ -811,6 +830,7 @@ def _ui_inpaint(editor_value, prompt, negative, styles, guidance, offload_mode, 
         except Exception as e:
             _log(f"inpaint error: {e}")
             return [], f"Inpaint failed: {e}", history, history
+        dst = None
         if save_mode != "display":
             try:
                 dst = build_output_path(None, save_mode, output_dir, output_format,
@@ -820,9 +840,11 @@ def _ui_inpaint(editor_value, prompt, negative, styles, guidance, offload_mode, 
                         "inpaint", full_prompt, seed=seed, steps=steps, guidance=cz_pipeline.GUIDANCE,
                         size=res.size, styles=styles, extra={"strength": denoise}))
             except Exception as e:
+                dst = None
                 _dbg(f"save inpaint failed: {e}")
-        new_hist = ([res] + list(history or []))[:200]
-        return [res], f"Inpaint -> {res.size[0]}x{res.size[1]}", new_hist, new_hist
+        item = _dl_path(res, dst)   # telechargement avec le vrai nom de fichier si sauve
+        new_hist = ([item] + list(history or []))[:200]
+        return [item], f"Inpaint -> {res.size[0]}x{res.size[1]}", new_hist, new_hist
     finally:
         cz_pipeline._PROGRESS = None
 
@@ -1035,12 +1057,13 @@ def _ui_generate(prompt, negative, styles, style_random, use_input, input_image,
     ref1, ref2, ref3, ref4 = (_editor_img(ref1), _editor_img(ref2),
                               _editor_img(ref3), _editor_img(ref4))
 
-    def _done(imgs, rep):
+    def _done(imgs, rep, paths=None):
         # FaceSwap post-process (optionnel, gated). S'applique a tous les modes.
         if faceswap_enable and faceswap_src is not None and imgs:
             try:
                 imgs = [_faceswap(im, faceswap_src) for im in imgs]
                 rep += " + faceswap"
+                paths = [None] * len(imgs)   # nouvelles images -> nouveaux chemins
                 if save_mode != "display":
                     for k, im in enumerate(imgs):
                         dst = build_output_path(None, save_mode, output_dir, output_format,
@@ -1048,11 +1071,16 @@ def _ui_generate(prompt, negative, styles, style_random, use_input, input_image,
                                                 index=(k + 1 if len(imgs) > 1 else 0))
                         if dst:
                             save_image(im, dst, output_format)
+                            paths[k] = dst
             except Exception as e:
                 _log(f"faceswap error: {e}")
                 rep += f"  \n[faceswap skipped: {e}]"
-        new_hist = (list(imgs) + list(history or []))[:200]
-        return imgs, rep, new_hist, new_hist
+        # Galerie + historique: chemin du fichier (vrai nom au telechargement) si dispo,
+        # sinon l'image PIL (apercu). _dl_path garde l'apercu intact dans tous les cas.
+        paths = paths or [None] * len(imgs)
+        gallery = [_dl_path(imgs[i], paths[i] if i < len(paths) else None) for i in range(len(imgs))]
+        new_hist = (list(gallery) + list(history or []))[:200]
+        return gallery, rep, new_hist, new_hist
 
     try:
         set_offload_mode(offload_mode)
@@ -1081,18 +1109,19 @@ def _ui_generate(prompt, negative, styles, style_random, use_input, input_image,
             except Exception as e:
                 _log(f"omni error: {e}")
                 return _done([], f"Omni error: {e}")
+            omni_dst = None
             if save_mode != "display":
                 try:
-                    dst = build_output_path(None, save_mode, output_dir, output_format,
-                                            tag="omni", seed=seed, size=img.size)
-                    if dst:
-                        save_image(img, dst, output_format, meta=_gen_meta(
+                    omni_dst = build_output_path(None, save_mode, output_dir, output_format,
+                                                 tag="omni", seed=seed, size=img.size)
+                    if omni_dst:
+                        save_image(img, omni_dst, output_format, meta=_gen_meta(
                             "omni", full_prompt, full_negative, seed, gen_steps, cz_pipeline.GUIDANCE,
                             img.size, styles=picked_styles, extra={"refs": len(refs)}))
-                        _dbg(f"saved: {dst}")
+                        _dbg(f"saved: {omni_dst}")
                 except Exception as e:
                     _dbg(f"save failed: {e}")
-            return _done([img], f"omni - **{img.size[0]}x{img.size[1]}** from {len(refs)} ref(s)")
+            return _done([img], f"omni - **{img.size[0]}x{img.size[1]}** from {len(refs)} ref(s)", [omni_dst])
         if use_input and input_image is not None:
             # Refine (img2img) decoche -> denoise 0 = saute la passe de diffusion (lente).
             eff_denoise = float(denoise) if do_refine else 0.0
@@ -1107,7 +1136,7 @@ def _ui_generate(prompt, negative, styles, style_random, use_input, input_image,
             return _done([last_result], report)
         # txt2img (batch image_number)
         n = max(1, int(image_number))
-        images, total_t = [], 0.0
+        images, img_paths, total_t = [], [], 0.0
         for i in range(n):
             if cz_pipeline._STOP:
                 _log(f"stop requested after {i}/{n} image(s)")
@@ -1124,6 +1153,7 @@ def _ui_generate(prompt, negative, styles, style_random, use_input, input_image,
                                  upscale=False, steps=refine_steps)
             images.append(img)
             total_t += t["txt2img"]
+            dst = None
             if save_mode != "display":
                 try:
                     dst = build_output_path(None, save_mode, output_dir, output_format,
@@ -1135,14 +1165,16 @@ def _ui_generate(prompt, negative, styles, style_random, use_input, input_image,
                             img.size, styles=chosen))
                         _dbg(f"saved: {dst}")
                 except Exception as e:
+                    dst = None
                     _dbg(f"save failed: {e}")
+            img_paths.append(dst)
         progress(1.0, desc="Done")
         if not images:
             return _done([], "Stopped before any image.")
         suffix = " (stopped)" if cz_pipeline._STOP else ""
         rep = (f"txt2img x{len(images)} - **{images[0].size[0]}x{images[0].size[1]}** "
                f"in **{total_t:.1f}s**{suffix}")
-        return _done(images, rep)
+        return _done(images, rep, img_paths)
     finally:
         cz_pipeline._PROGRESS = None
 
