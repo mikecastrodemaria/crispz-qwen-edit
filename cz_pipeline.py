@@ -511,6 +511,15 @@ def _ensure_base():
         pipe.enable_sequential_cpu_offload()
     else:
         pipe = pipe.to(DEVICE)
+    # VAE tiling/slicing: indispensable pour l'img2img/upscale. L'encode/decode VAE d'une
+    # tuile 1024 + le modele complet en VRAM (transformer + encodeur Qwen3-4B ~8 Go) fait
+    # deborder les 32 Go -> spill RAM partagee -> ~300s/step. Tuiler le VAE plafonne ce pic
+    # (comme le "tiled decode" de ComfyUI). Le VAE est partage par les pipes derives.
+    try:
+        pipe.enable_vae_slicing()
+        pipe.enable_vae_tiling()
+    except Exception as e:
+        _dbg(f"VAE tiling not enabled: {e}")
     _apply_sampler(pipe)   # pose le sampler choisi (euler par defaut) sur le pipe de base
     _BASE_PIPE = pipe
     _DERIVED = {"txt2img": pipe}
