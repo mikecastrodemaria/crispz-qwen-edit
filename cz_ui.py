@@ -1128,11 +1128,20 @@ def _ui_generate(prompt, negative, styles, style_random, use_input, input_image,
             _dbg(f"img2img: esrgan={esrgan_model} do_esrgan={do_esrgan} do_refine={do_refine} "
                  f"factor={factor} denoise={eff_denoise} refine_steps={int(refine_steps)} tile={int(tile)} "
                  f"refine_tile={int(refine_tile)} model={cz_pipeline.BASE_REPO} transformer={cz_pipeline.ZIMAGE_TRANSFORMER}")
-            last_result, last_source, report = run(
-                input_image, None, esrgan_model, factor, eff_denoise, refine_steps, full_prompt, seed,
-                tile, overlap, save_mode=save_mode, output_dir=output_dir,
-                output_format=output_format, refine_tile=refine_tile, refine_overlap=refine_overlap,
-                do_esrgan=bool(do_esrgan), refine_first=bool(refine_first), styles=picked_styles)
+            try:
+                last_result, last_source, report = run(
+                    input_image, None, esrgan_model, factor, eff_denoise, refine_steps, full_prompt, seed,
+                    tile, overlap, save_mode=save_mode, output_dir=output_dir,
+                    output_format=output_format, refine_tile=refine_tile, refine_overlap=refine_overlap,
+                    do_esrgan=bool(do_esrgan), refine_first=bool(refine_first), styles=picked_styles)
+            except Exception as e:
+                _log(f"img2img/upscale error: {e}")
+                msg = f"Upscale/img2img failed: {e}"
+                if "CUDA" in str(e) or "out of memory" in str(e).lower():
+                    msg += ("  \n**VRAM saturee** (autre app GPU comme ComfyUI encore chargee ? "
+                            "spill -> timeout Windows TDR). Ferme les autres apps GPU, **redemarre "
+                            "crispz-studio** (le contexte CUDA est mort), baisse refine_tile / factor.")
+                return _done([], msg)
             return _done([last_result], report)
         # txt2img (batch image_number)
         n = max(1, int(image_number))

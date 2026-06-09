@@ -432,6 +432,20 @@ def _set_slicing(pipe, longest_side):
         pass
 
 
+def _vram_str():
+    """Pic VRAM PyTorch reserve / total (pour reperer la saturation -> spill RAM partagee
+    Windows = lenteur extreme, et TDR/'CUDA unknown error'). Ne voit PAS la VRAM des
+    autres process (ComfyUI, etc.) -> utiliser nvidia-smi pour le total reel."""
+    if DEVICE != "cuda":
+        return ""
+    try:
+        resv = torch.cuda.memory_reserved() / 1024**3
+        tot = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        return f" | VRAM {resv:.1f}/{tot:.0f} Go"
+    except Exception:
+        return ""
+
+
 # ----------------------------------------------------------------------------
 # Z-Image (diffusers, BF16) : un pipeline "base" txt2img qui detient les composants,
 # img2img / inpaint derives via from_pipe (poids partages, pas de VRAM en double).
@@ -758,7 +772,7 @@ def _refine_tiled(pipe, image, denoise, steps, prompt, seed, tile, overlap):
             x2, y2 = min(x + tile, w), min(y + tile, h)
             x1, y1 = max(x2 - tile, 0), max(y2 - tile, 0)
             cw, ch = x2 - x1, y2 - y1
-            _log(f"  tile {i}/{total}")
+            _log(f"  tile {i}/{total}{_vram_str()}")
             _progress(0.45 + 0.5 * (i - 1) / max(1, total), f"Refine tile {i}/{total}")
             crop = image.crop((x1, y1, x2, y2))
             out = _refine_whole(pipe, crop, denoise, steps, prompt, seed)
