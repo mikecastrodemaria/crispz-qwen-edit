@@ -419,6 +419,10 @@ def free_vram():
 # attention SDPA native = RAPIDE (comme ComfyUI). Reglable via config attention_slice_above.
 _SLICE_ABOVE = int(CONFIG.get("attention_slice_above", 1664))
 
+# Garde-fou: au-dela de ce cote (px), un refine "whole image" (refine_tile=0) explose la
+# VRAM (4K+ -> crash). On force alors le tuilage automatique (tuile 1024). Reglable.
+_AUTO_TILE_ABOVE = int(CONFIG.get("auto_refine_tile_above", 2048))
+
 
 def _set_slicing(pipe, longest_side):
     """Active/desactive l'attention slicing selon le plus grand cote a traiter. Appele
@@ -867,9 +871,15 @@ def process_one(image, esrgan_model, factor, denoise, steps, prompt, seed, tile,
         t0 = time.time()
         pipe = load_pipe()
         rw, rh = img.size
-        if int(refine_tile) > 0:
+        rt = int(refine_tile)
+        # Garde-fou anti-crash: refine whole-image trop grand (4K+) -> auto-tuilage.
+        if rt <= 0 and max(rw, rh) > _AUTO_TILE_ABOVE:
+            rt = 1024
+            _log(f"refine: image {rw}x{rh} > {_AUTO_TILE_ABOVE}px -> auto-tiling (tile 1024) "
+                 "pour eviter le pic VRAM (regle: auto_refine_tile_above)")
+        if rt > 0:
             out = _refine_tiled(pipe, img, denoise, steps, prompt, seed,
-                                int(refine_tile), int(refine_overlap))
+                                rt, int(refine_overlap) or 64)
         else:
             _log(f"Z-Image refine: whole image {rw}x{rh}, denoise {float(denoise):.2f}, "
                  f"{int(steps)} steps ...")
