@@ -668,8 +668,14 @@ fastest first:
   Windows shared memory in `none` mode (slow); `model` fits in ~24 GB with no spill
   and is actually **faster**. This is the single biggest fix if the refine crawls.
 - **Fewer refine steps / lower denoise** (effective steps = `steps x denoise`).
-- Attention slicing stays on (it caps the refine's VRAM peak; turning it off makes
-  high-res refines spill and run ~4-5x slower). TF32 matmul is enabled on CUDA.
+- **Attention slicing is now per-pass, by resolution** (`attention_slice_above`, default
+  1664 px): OFF for tiles / 1024-1536 (native SDPA attention = fast, like ComfyUI), ON
+  only for whole-image 2K+ (caps the VRAM peak, avoids the shared-RAM spill). This is the
+  big one for **tiled upscale** (`--refine-tile 1024`): slicing no longer slows the tiles.
+- **`--cpu-offload none`** on a big card (5090): `model`/`sequential` stream weights
+  RAM<->GPU every step (much slower); only use them when you actually lack VRAM. With
+  `--refine-tile`, VRAM is already capped, so keep offload `none`.
+- TF32 matmul is enabled on CUDA.
 
 ```bash
 # Fast img2img + upscale: refine small, then ESRGAN to x2

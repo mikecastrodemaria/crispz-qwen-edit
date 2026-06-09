@@ -43,6 +43,7 @@
     "default_refine_tile": 0,
     "default_refine_overlap": 64,
     "default_cpu_offload": "none",
+    "attention_slice_above": 1664,
 
     "checkpoints_dir": "",
     "loras_dir": "",

@@ -414,6 +414,24 @@ def free_vram():
         torch.cuda.empty_cache()
 
 
+# Au-dela de ce cote (px) on active l'attention slicing (whole-image 2K+ -> evite le
+# spill VRAM 32 Go). En-dessous (tuiles 1024, txt2img 1024/1536) -> slicing OFF =
+# attention SDPA native = RAPIDE (comme ComfyUI). Reglable via config attention_slice_above.
+_SLICE_ABOVE = int(CONFIG.get("attention_slice_above", 1664))
+
+
+def _set_slicing(pipe, longest_side):
+    """Active/desactive l'attention slicing selon le plus grand cote a traiter. Appele
+    avant CHAQUE passe de diffusion (txt2img/refine/tuile/inpaint/outpaint/omni)."""
+    try:
+        if int(longest_side) > _SLICE_ABOVE:
+            pipe.enable_attention_slicing()
+        else:
+            pipe.disable_attention_slicing()
+    except Exception:
+        pass
+
+
 # ----------------------------------------------------------------------------
 # Z-Image (diffusers, BF16) : un pipeline "base" txt2img qui detient les composants,
 # img2img / inpaint derives via from_pipe (poids partages, pas de VRAM en double).
@@ -469,14 +487,9 @@ def _ensure_base():
                 pipe.set_adapters(names, weights)
         except Exception as e:
             _log(f"LoRA load failed ({e}); continuing without LoRA")
-    # Attention slicing: INDISPENSABLE pour le refine haute-resolution (2K+). Sans lui,
-    # le pic VRAM de l'attention deborde au-dela des 32 Go et spille en RAM partagee
-    # Windows -> la passe devient 4-5x plus lente. On le garde toujours actif (le
-    # surcout en 1024 est negligeable; le desactiver casse le refine x2/x4).
-    try:
-        pipe.enable_attention_slicing()
-    except Exception:
-        pass
+    # Attention slicing: POSE PAR APPEL via _set_slicing (selon la resolution traitee),
+    # PAS au chargement. En tuile/1024 -> slicing OFF = attention SDPA native, rapide
+    # (comme ComfyUI). Whole-image 2K+ -> slicing ON pour eviter le spill VRAM 32 Go.
     # enable_*_cpu_offload gere lui-meme le device -> ne PAS faire .to(cuda) alors.
     if DEVICE == "cuda" and OFFLOAD_MODE == "model":
         pipe.enable_model_cpu_offload()
@@ -532,11 +545,7 @@ def _load_omni():
     _log(f"loading Z-Image Omni: {repo} (offload={OFFLOAD_MODE}) ...")
     t0 = time.time()
     pipe = ZImageOmniPipeline.from_pretrained(repo, torch_dtype=DTYPE)
-    # Attention slicing toujours actif (cf. _ensure_base): evite le spill VRAM en haute-def.
-    try:
-        pipe.enable_attention_slicing()
-    except Exception:
-        pass
+    # Attention slicing pose par appel via _set_slicing (cf. _ensure_base).
     if DEVICE == "cuda" and OFFLOAD_MODE == "model":
         pipe.enable_model_cpu_offload()
     elif DEVICE == "cuda" and OFFLOAD_MODE == "sequential":
@@ -559,6 +568,7 @@ def generate_omni(refs, prompt, negative, width, height, steps, seed):
     h = round_to_multiple(int(height))
     _log(f"omni: {len(refs)} ref(s) -> {w}x{h}, {int(steps)} steps, guidance {GUIDANCE:.1f} ...")
     _progress(0.1, f"Omni compose ({len(refs)} refs)...")
+    _set_slicing(pipe, max(w, h))
     t0 = time.time()
     out = pipe(
         image=[r.convert("RGB") for r in refs],
@@ -593,6 +603,7 @@ def generate(prompt, width, height, steps, seed, negative_prompt=""):
     if DEVICE == "cuda":
         _dbg(f"VRAM before: alloc={torch.cuda.memory_allocated()/1024**3:.2f} Go")
     _progress(0.1, f"Generating {w}x{h} ({int(steps)} steps)...")
+    _set_slicing(pipe, max(w, h))
     t0 = time.time()
     img = pipe(
         prompt=prompt or "",
@@ -651,6 +662,7 @@ def inpaint_run(background, mask, prompt, steps, denoise, seed):
     _log(f"inpaint: {w}x{h}, {int(steps)} steps, strength {float(denoise):.2f}, "
          f"guidance {GUIDANCE:.1f} ...")
     _progress(0.1, "Inpainting...")
+    _set_slicing(pipe, max(w, h))
     t0 = time.time()
     out = pipe(prompt=prompt or "", image=bg, mask_image=mask, strength=float(denoise),
                num_inference_steps=int(steps), guidance_scale=GUIDANCE,
@@ -670,6 +682,7 @@ def outpaint(image, ratio_w, ratio_h, prompt, steps, seed):
     _log(f"outpaint: {image.size[0]}x{image.size[1]} -> {nw}x{nh}, {int(steps)} steps, "
          f"guidance {GUIDANCE:.1f} ...")
     _progress(0.1, f"Outpaint -> {nw}x{nh}...")
+    _set_slicing(pipe, max(nw, nh))
     t0 = time.time()
     out = pipe(prompt=prompt or "", image=canvas, mask_image=mask, strength=1.0,
                num_inference_steps=int(steps), guidance_scale=GUIDANCE,
@@ -688,7 +701,9 @@ def _make_generator(seed):
 
 
 def _refine_whole(pipe, image, denoise, steps, prompt, seed):
-    """Passe Z-Image img2img sur l'image entiere."""
+    """Passe Z-Image img2img sur l'image entiere (ou une tuile). Le slicing est pose
+    selon la taille reelle traitee: tuile 1024 -> OFF (rapide), whole 2K+ -> ON."""
+    _set_slicing(pipe, max(image.size))
     return pipe(
         prompt=prompt or "",
         image=image,
