@@ -79,7 +79,8 @@ attention_slice_above   Cote (px) au-dela duquel on active l'attention slicing (
                         slicing est OFF = attention SDPA rapide. 1664 par defaut. Sur grosse
                         carte tu peux monter (ex. 2048) pour ne jamais slicer.
 auto_refine_tile_above  Cote (px) au-dela duquel un refine "whole image" (refine_tile=0) est
-                        auto-tuile (tuile 1024) pour eviter le crash VRAM en 4K. 2048 defaut.
+                        auto-tuile (tuile 1024). Defaut = attention_slice_above (1664): au-dela
+                        un whole-image serait slice (lent ~120s en 2K) et risque le spill 4K.
 default_cpu_offload     "none" | "model" (~half VRAM) | "sequential" (~9GB, slower).
 
 checkpoints_dir         Folder of single-file Z-Image models (.safetensors). Scanned

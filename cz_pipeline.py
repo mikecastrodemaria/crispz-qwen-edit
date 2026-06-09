@@ -419,9 +419,10 @@ def free_vram():
 # attention SDPA native = RAPIDE (comme ComfyUI). Reglable via config attention_slice_above.
 _SLICE_ABOVE = int(CONFIG.get("attention_slice_above", 1664))
 
-# Garde-fou: au-dela de ce cote (px), un refine "whole image" (refine_tile=0) explose la
-# VRAM (4K+ -> crash). On force alors le tuilage automatique (tuile 1024). Reglable.
-_AUTO_TILE_ABOVE = int(CONFIG.get("auto_refine_tile_above", 2048))
+# Garde-fou: au-dela de ce cote (px), un refine "whole image" (refine_tile=0) est auto-
+# tuile (tuile 1024). Defaut = le seuil de slicing: au-dela, un whole-image serait slice
+# (lent: ~120s en 2K) ET risque le spill VRAM (4K -> crash). Tuiler est plus rapide ET sur.
+_AUTO_TILE_ABOVE = int(CONFIG.get("auto_refine_tile_above", _SLICE_ABOVE))
 
 
 def _set_slicing(pipe, longest_side):
