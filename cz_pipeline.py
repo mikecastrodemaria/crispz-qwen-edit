@@ -536,6 +536,17 @@ def get_pipe(kind="img2img"):
     _log(f"deriving {kind} pipeline (shared weights, no extra VRAM)")
     p = cls.from_pipe(base)
     _apply_sampler(p)   # meme sampler que le base (au cas ou from_pipe recree le scheduler)
+    # Diagnostic vitesse: si le pipe derive n'est PAS sur cuda -> img2img/refine tourne
+    # sur CPU = ultra lent. On le force sur DEVICE en mode plein VRAM (offload gere seul).
+    try:
+        tdev = next(p.transformer.parameters()).device
+        if DEVICE == "cuda" and OFFLOAD_MODE == "none" and tdev.type != "cuda":
+            _log(f"{kind} pipeline was on {tdev} -> moving to {DEVICE}")
+            p = p.to(DEVICE)
+            tdev = next(p.transformer.parameters()).device
+        _log(f"{kind} pipeline ready: transformer={tdev}")
+    except Exception as e:
+        _dbg(f"device check failed: {e}")
     _DERIVED[kind] = p
     return p
 
@@ -772,10 +783,11 @@ def _refine_tiled(pipe, image, denoise, steps, prompt, seed, tile, overlap):
             x2, y2 = min(x + tile, w), min(y + tile, h)
             x1, y1 = max(x2 - tile, 0), max(y2 - tile, 0)
             cw, ch = x2 - x1, y2 - y1
-            _log(f"  tile {i}/{total}{_vram_str()}")
             _progress(0.45 + 0.5 * (i - 1) / max(1, total), f"Refine tile {i}/{total}")
             crop = image.crop((x1, y1, x2, y2))
+            _t_tile = time.time()
             out = _refine_whole(pipe, crop, denoise, steps, prompt, seed)
+            _log(f"  tile {i}/{total} ({cw}x{ch}) in {time.time() - _t_tile:.1f}s{_vram_str()}")
             if out.size != (cw, ch):
                 out = out.resize((cw, ch), Image.LANCZOS)
             out_arr = np.asarray(out.convert("RGB"), dtype=np.float32) / 255.0

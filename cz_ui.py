@@ -63,11 +63,18 @@ from cz_core import (  # noqa: E402,F401
 # le reste est laisse tel quel. Utilise par l'UI (_apply_preset) et la CLI (--preset).
 PRESETS = {
     "Custom": {},
+    # Reglages facon ComfyUI Ultimate SD Upscale (x2, tuiles 1024, denoise bas, offload
+    # none sur grosse carte). Le tiling plafonne deja la VRAM -> PAS d'offload (qui ralentit).
+    "Benchmark (fast)":    {"factor": 2.0, "denoise": 0.12, "steps": 12, "tile": 1024, "overlap": 32,
+                            "refine_tile": 1024, "refine_overlap": 64, "cpu_offload": "none"},
     "Photo (balanced)":    {"factor": 2.0, "denoise": 0.30, "steps": 12, "refine_tile": 0, "cpu_offload": "none"},
     "Subtle (clean-up)":   {"factor": 2.0, "denoise": 0.12, "steps": 16, "refine_tile": 0},
     "Detailed (creative)": {"factor": 2.0, "denoise": 0.40, "steps": 16},
     "Portrait (faces)":    {"factor": 2.0, "denoise": 0.22, "steps": 14},
-    "4K (tiled)":          {"factor": 4.0, "denoise": 0.30, "steps": 12, "refine_tile": 1024, "refine_overlap": 64, "cpu_offload": "model"},
+    # 4K: le tiling plafonne la VRAM -> offload none (l'offload ne sert plus a rien et
+    # ralentit 5-10x sur grosse carte). Mettre offload sequential SEULEMENT si <16 Go.
+    "4K (tiled)":          {"factor": 4.0, "denoise": 0.20, "steps": 12, "tile": 1024, "overlap": 32,
+                            "refine_tile": 1024, "refine_overlap": 64, "cpu_offload": "none"},
     "Low VRAM (8-12GB)":   {"denoise": 0.30, "steps": 12, "tile": 512, "refine_tile": 1024, "refine_overlap": 64, "cpu_offload": "sequential"},
 }
 # param interne -> flag CLI, pour appliquer un preset sans ecraser un flag explicite.
