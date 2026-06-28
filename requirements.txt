@@ -16,6 +16,11 @@ spandrel
 # Without it: "PEFT backend is required for this method" -> LoRA silently skipped.
 peft
 
+# GGUF quantized single-file transformers (GGUFQuantizationConfig). Lets a quantized
+# Qwen-Image .gguf (e.g. Q4_K_M ~11GB) fit in consumer VRAM, fast, no offload. Unlike
+# ComfyUI FP8 .safetensors (transformer-only, not loadable by diffusers).
+gguf
+
 # Comparateur avant/apres = composant HTML+JS interne (voir _make_compare_html dans app.py).
 # Pas de dep externe -> stack stable.
 # Borne <6: Gradio 6 a un middleware Brotli buggé avec h11 ("Too little data for
