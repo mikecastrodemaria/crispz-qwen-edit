@@ -586,9 +586,12 @@ def _ensure_base():
                 # reste rapide. Le VAE + encodeur texte viennent du repo de base (cache).
                 from diffusers import GGUFQuantizationConfig
                 _log(f"loading Qwen transformer (GGUF, quantized): {ZIMAGE_TRANSFORMER} ...")
+                # config/subfolder = archi du transformer depuis le repo de base (cache),
+                # sinon from_single_file ne sait pas la structure et tente un repo par defaut.
                 kwargs["transformer"] = QwenImageTransformer2DModel.from_single_file(
                     ZIMAGE_TRANSFORMER,
                     quantization_config=GGUFQuantizationConfig(compute_dtype=DTYPE),
+                    config=BASE_REPO, subfolder="transformer",
                     torch_dtype=DTYPE)
             else:
                 # checkpoint Qwen single-file (.safetensors bf16/fp16) -> override transformer.
