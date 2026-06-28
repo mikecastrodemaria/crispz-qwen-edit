@@ -28,11 +28,25 @@ git merge upstream/main      # seuls les conflits attendus sont dans cz_pipeline
 
 `upstream` = crispz-studio (Z-Image). `origin` = ce fork.
 
-## TODO
+## État
 
-- [ ] Réécrire `cz_pipeline.py` pour Qwen-Image-Edit (branché sur `generate_omni`).
-- [ ] Arbitrer édition-seule vs édition + txt2img.
-- [ ] Valider l'offload VRAM (~20B) ; déclarer la limite dans le launcher si besoin.
-- [ ] Adapter `requirements.txt` (transformers récent pour l'encodeur Qwen — déjà couvert).
-- [ ] Mettre à jour README + identité.
-- [ ] Launcher Pinokio `crispz-qwen-edit.pinokio.git` (clone ce repo).
+Architecture retenue : **studio complet + onglet Edit** (les deux décidés).
+- base txt2img/img2img/inpaint = **Qwen-Image** (`Qwen/Qwen-Image`)
+- onglet Omni/Edit = **Qwen-Image-Edit-2509** (modèle séparé, multi-images), via `generate_omni`.
+
+- [x] Réécrire `cz_pipeline.py` : `QwenImagePipeline` / `QwenImageImg2ImgPipeline` /
+      `QwenImageInpaintPipeline` (base) + `QwenImageEditPlusPipeline` (onglet Edit, repli
+      `QwenImageEditPipeline`). Tous les appels passent par `_qwen_call` + `_cfg`
+      (`true_cfg_scale` = curseur guidance, `guidance_scale` distillé = 1.0, negative actif).
+- [x] `generate_omni` rebranché sur l'édition par instruction (image(s) + prompt), dimensions
+      d'entrée préservées. API publique du module **inchangée** (cz_ui/cz_cli intacts).
+- [x] Défauts Qwen : `config-sample.txt` (true_cfg 4.0, 30 steps, presets, profils qwen/edit,
+      `zimage_omni_model = Qwen/Qwen-Image-Edit-2509`) + `cz_core.py`.
+- [x] Vérifié : `import app` OK, contrat d'API complet préservé, classes Qwen présentes,
+      defaults corrects (base=Qwen-Image, edit=2509, cfg=4.0, profil=(30,4.0)).
+- [ ] `requirements.txt` : Qwen-Image/Edit déjà dans diffusers (source) + transformers récent
+      (déjà couvert). À confirmer au 1er run.
+- [ ] Valider l'offload VRAM (~20B base + ~20B edit) ; défaut `OFFLOAD_MODE=model` côté launcher.
+- [ ] Test génération + édition réels sur GPU (download des deux modèles).
+- [ ] Mettre à jour README + identité (titres, captures).
+- [ ] Launcher Pinokio `crispz-qwen-edit.pinokio.git` (clone ce repo, `OFFLOAD_MODE=model`).
