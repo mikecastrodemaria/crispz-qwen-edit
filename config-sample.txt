@@ -12,26 +12,26 @@
     "_improve_local_keywords_help": "Quality tags appended by 'Improve prompt' when no Ollama model is selected (local rule-based fallback, no model).",
 
     "performance_presets": {
-        "Turbo (8 steps)": [8, 0.0],
-        "Quality (20 steps)": [20, 0.0],
-        "Base CFG (28 steps)": [28, 4.0]
+        "Fast (20 steps)": [20, 4.0],
+        "Qwen (30 steps)": [30, 4.0],
+        "Quality (50 steps)": [50, 4.0]
     },
     "model_profiles": {
-        "turbo": {"steps": 8, "guidance": 0.0},
-        "juggernaut": {"steps": 28, "guidance": 6.0},
-        "base": {"steps": 24, "guidance": 4.0}
+        "qwen": {"steps": 30, "guidance": 4.0},
+        "edit": {"steps": 30, "guidance": 4.0}
     },
-    "default_model_profile": {"steps": 8, "guidance": 0.0},
+    "default_model_profile": {"steps": 30, "guidance": 4.0},
 
     "default_prompt": "",
     "default_negative_prompt": "",
     "default_styles": [],
     "default_aspect_ratio": "1024 x 1024  (1:1)",
-    "default_performance": "Turbo (8 steps)",
+    "default_performance": "Qwen (30 steps)",
     "default_width": 1024,
     "default_height": 1024,
-    "default_gen_steps": 8,
-    "default_guidance": 0.0,
+    "default_gen_steps": 30,
+    "default_guidance": 4.0,
+    "_default_guidance_help": "Qwen 'guidance' = true_cfg_scale (real CFG, enables negative prompt). ~3-5 recommended.",
     "default_sampler": "euler",
     "default_schedule": "sgm_uniform",
     "default_image_number": 1,
@@ -56,7 +56,8 @@
     "loras_dir": "",
     "wildcards_dir": "",
     "default_lora_weight": 1.0,
-    "zimage_omni_model": "",
+    "_zimage_omni_model_help": "Qwen-Image-Edit model for the Edit tab (instruction editing). Empty -> Qwen/Qwen-Image-Edit-2509.",
+    "zimage_omni_model": "Qwen/Qwen-Image-Edit-2509",
     "faceswap_model_path": "",
     "faceswap_model_url": "",
     "faceswap_restore": false,

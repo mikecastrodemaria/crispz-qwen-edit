@@ -1,12 +1,21 @@
-"""crispz-studio - coeur Z-Image (diffusers, BF16): chargement des pipelines
-(txt2img / img2img / inpaint / omni), LoRA / checkpoints / transformer, generation
-et orchestration (generate / txt2img_run / process_one / outpaint / inpaint) + l'etat
-mutable runtime (modele courant, caches pipe, offload, guidance, stop/progress).
+"""crispz-qwen-edit - coeur Qwen-Image (diffusers, BF16): chargement des pipelines
+(txt2img / img2img / inpaint) + edition par instruction (onglet Omni/Edit), LoRA /
+checkpoints / transformer, generation et orchestration (generate / txt2img_run /
+process_one / outpaint / inpaint) + l'etat mutable runtime.
 
-Extrait de app.py en UN seul module (step 7): les nombreuses fonctions partagent ces
-globaux par reference nue, donc elles vivent ensemble ici. app lit l'etat courant via
-cz_pipeline.NAME (BASE_REPO, ZIMAGE_TRANSFORMER, CHECKPOINTS_DIR, LORAS_DIR, LORAS,
-OMNI_MODEL, OFFLOAD_MODE, GUIDANCE, _PROGRESS, _STOP, _BASE_PIPE, ...) et pose
+Fork de crispz-studio (Z-Image). Mapping :
+  - base txt2img             -> QwenImagePipeline
+  - img2img (refine/upscale) -> QwenImageImg2ImgPipeline
+  - inpaint / reframe        -> QwenImageInpaintPipeline
+  - onglet Omni/Edit         -> QwenImageEditPlusPipeline (modele SEPARE, multi-images,
+                                defaut 'Qwen/Qwen-Image-Edit-2509') via generate_omni.
+Tous les pipelines Qwen utilisent un VRAI CFG (`true_cfg_scale`) + negative_prompt ; le
+curseur "guidance" de l'UI pilote donc true_cfg_scale (cf. _cfg / _qwen_call), et le
+`guidance_scale` distille reste a 1.0. L'API publique du module reste identique a
+l'upstream (memes noms, ex. ZIMAGE_TRANSFORMER, generate_omni, SAMPLER_CHOICES) pour ne
+casser ni cz_ui ni cz_cli.
+
+app lit l'etat courant via cz_pipeline.NAME (BASE_REPO, ZIMAGE_TRANSFORMER, ...) et pose
 cz_pipeline._PROGRESS / cz_pipeline._STOP depuis les handlers UI.
 Ne depend que de cz_core / cz_esrgan / cz_imageio (jamais de app ni de gradio).
 """
@@ -21,10 +30,17 @@ import torch
 from PIL import Image
 
 from cz_core import (
-    CONFIG, HERE, DEVICE, DTYPE, DEFAULT_BASE_REPO,
+    CONFIG, HERE, DEVICE, DTYPE,
     DEFAULT_TILE, DEFAULT_OVERLAP, DEFAULT_REFINE_TILE, DEFAULT_REFINE_OVERLAP,
     _prefs, _is_single_file, _log, _dbg,
 )
+
+# Modele Qwen de base (txt2img/img2img/inpaint). Surcharge via env ZIMAGE_MODEL (compat)
+# ou QWEN_MODEL, ou prefs. Repo public.
+DEFAULT_BASE_REPO = (os.environ.get("QWEN_MODEL") or "Qwen/Qwen-Image")
+# Modele d'edition par instruction (onglet Omni/Edit), charge separement. 2509 = revision
+# recente, multi-images. Surcharge via env ZIMAGE_OMNI_MODEL / QWEN_EDIT_MODEL ou config.
+DEFAULT_OMNI_REPO = (os.environ.get("QWEN_EDIT_MODEL") or "Qwen/Qwen-Image-Edit-2509")
 from cz_esrgan import load_esrgan, esrgan_upscale
 from cz_imageio import _now_stamp
 
@@ -61,8 +77,10 @@ LORAS_DIR = (os.environ.get("LORAS_DIR") or _prefs.get("loras_dir")
 # LoRA actives: liste de (chemin, poids). Plusieurs LoRA combinables (multi-slots).
 LORAS = []
 LORA_WEIGHT = float(CONFIG.get("default_lora_weight", 1.0))  # poids par defaut des slots
-# Modele Omni/Edit (multi-reference). Reglable via config.txt ou l'UI.
-OMNI_MODEL = (os.environ.get("ZIMAGE_OMNI_MODEL") or CONFIG.get("zimage_omni_model") or "").strip()
+# Modele Omni/Edit (Qwen-Image-Edit, multi-images). Defaut = DEFAULT_OMNI_REPO pour que
+# l'onglet Edit marche sans config. Reglable via config.txt (zimage_omni_model) ou l'UI.
+OMNI_MODEL = (os.environ.get("ZIMAGE_OMNI_MODEL") or CONFIG.get("zimage_omni_model")
+              or DEFAULT_OMNI_REPO).strip()
 
 # Caches process-wide. Un pipeline "base" (txt2img ZImagePipeline) detient les
 # composants; img2img / inpaint en derivent via from_pipe -> poids partages, pas de
@@ -77,9 +95,11 @@ _LOADED_KEY = None
 OFFLOAD_MODE = "none"
 OFFLOAD_CHOICES = ("none", "model", "sequential")
 
-# CFG. Z-Image *Turbo* = distille -> guidance 0 (defaut). Z-Image *Base* (non Turbo) a
-# besoin d'une vraie guidance (~3.5-5) et de plus de steps (~20-28). Reglable par run.
-GUIDANCE = 0.0
+# Guidance Qwen-Image. Le curseur "guidance" de l'UI = `true_cfg_scale` (vrai CFG, qui
+# active le negative prompt). Plage conseillee ~3-5 (defaut 4.0). Le `guidance_scale`
+# distille du pipeline reste a 1.0 (cf. _cfg). Un 0 herite d'une config Z-Image retombe
+# sur 4.0. Override possible via env QWEN_CFG.
+GUIDANCE = float(os.environ.get("QWEN_CFG") or CONFIG.get("default_guidance") or 0) or 4.0
 
 # Sampler / scheduler. Le pipeline Z-Image impose un schedule `sigmas` custom: seuls
 # les schedulers dont set_timesteps accepte `sigmas` fonctionnent. En pratique -> Euler
@@ -114,6 +134,28 @@ _STOP = False
 def set_guidance(g):
     global GUIDANCE
     GUIDANCE = float(g)
+
+
+def _cfg(negative=None):
+    """kwargs CFG communs a tous les pipelines Qwen : `true_cfg_scale` = curseur guidance
+    de l'UI (vrai CFG, active le negative prompt), `guidance_scale` distille fixe a 1.0."""
+    return {"true_cfg_scale": float(GUIDANCE), "guidance_scale": 1.0,
+            "negative_prompt": (negative or None)}
+
+
+def _qwen_call(pipe, **kw):
+    """Appelle un pipeline Qwen en tolerant les variations d'API diffusers : si la version
+    installee ne connait pas `true_cfg_scale` / `negative_prompt`, on retire ces kwargs et
+    on relance plutot que de crasher la generation."""
+    try:
+        return pipe(**kw)
+    except TypeError as e:
+        if any(k in kw for k in ("true_cfg_scale", "negative_prompt")):
+            for k in ("true_cfg_scale", "negative_prompt"):
+                kw.pop(k, None)
+            _dbg(f"qwen call: retry sans kwargs CFG ({e})")
+            return pipe(**kw)
+        raise
 
 
 def _scheduler_accepts_sigmas(sched):
@@ -412,23 +454,22 @@ def set_omni_model(repo):
 
 
 def check_omni_available():
-    """Teste l'existence des repos Omni/Edit sur Hugging Face (API publique)."""
+    """Onglet Edit = Qwen-Image-Edit (modele d'edition par instruction). Verifie que le
+    repo d'edition configure existe sur Hugging Face (API publique)."""
     import urllib.request
-    found = []
-    for repo in ("Tongyi-MAI/Z-Image-Omni-Base", "Tongyi-MAI/Z-Image-Edit"):
-        try:
-            req = urllib.request.Request("https://huggingface.co/api/models/" + repo,
-                                         headers={"User-Agent": "crispz-studio"})
-            with urllib.request.urlopen(req, timeout=8) as r:
-                if r.status == 200:
-                    found.append(repo)
-        except Exception:
-            pass
-    if found:
-        return ("**Omni model available!** " + ", ".join(f"`{r}`" for r in found)
-                + " - set it in config.txt `zimage_omni_model` (or Models tab).")
-    return ("Not released yet. Z-Image-Omni-Base / Z-Image-Edit are still 'coming "
-            "soon'. The Omni tab will work once they ship.")
+    repo = (OMNI_MODEL or DEFAULT_OMNI_REPO).strip()
+    try:
+        req = urllib.request.Request("https://huggingface.co/api/models/" + repo,
+                                     headers={"User-Agent": "crispz-qwen-edit"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            if r.status == 200:
+                return (f"**Edit model ready:** `{repo}`. The Edit tab edits an input image "
+                        "from an instruction prompt. Change it in config.txt "
+                        "`zimage_omni_model` (or the Models tab).")
+    except Exception:
+        pass
+    return (f"Edit model `{repo}` not reachable (network/HF). It downloads on first use of "
+            "the Edit tab. Override via config.txt `zimage_omni_model`.")
 
 
 def set_offload_mode(mode):
@@ -515,12 +556,12 @@ def _vram_str():
 
 
 # ----------------------------------------------------------------------------
-# Z-Image (diffusers, BF16) : un pipeline "base" txt2img qui detient les composants,
+# Qwen-Image (diffusers, BF16) : un pipeline "base" txt2img qui detient les composants,
 # img2img / inpaint derives via from_pipe (poids partages, pas de VRAM en double).
 # ----------------------------------------------------------------------------
 def _ensure_base():
     """Charge (si besoin) le pipeline de base txt2img. Gere le transformer
-    single-file (Civitai) et l'offload. Cache par (repo, transformer, offload)."""
+    single-file et l'offload. Cache par (repo, transformer, offload)."""
     global _BASE_PIPE, _DERIVED, _LOADED_KEY, _BASE_SCHED_CONFIG
     key = (BASE_REPO, ZIMAGE_TRANSFORMER, OFFLOAD_MODE, tuple(LORAS))
     _dbg(f"_ensure_base key={key} cached={_LOADED_KEY}")
@@ -530,31 +571,30 @@ def _ensure_base():
     if _BASE_PIPE is not None:
         _dbg("base pipeline: key changed -> free + reload")
         free_vram()
-    from diffusers import ZImagePipeline, ZImageTransformer2DModel
+    from diffusers import QwenImagePipeline, QwenImageTransformer2DModel
     t0 = time.time()
     kwargs = {}
     if ZIMAGE_TRANSFORMER:
         if _is_single_file(ZIMAGE_TRANSFORMER):
-            _log(f"loading Z-Image transformer (single-file): {ZIMAGE_TRANSFORMER} ...")
-            kwargs["transformer"] = ZImageTransformer2DModel.from_single_file(
+            # checkpoint Qwen single-file (.safetensors) -> override du transformer.
+            _log(f"loading Qwen transformer (single-file): {ZIMAGE_TRANSFORMER} ...")
+            kwargs["transformer"] = QwenImageTransformer2DModel.from_single_file(
                 ZIMAGE_TRANSFORMER, torch_dtype=DTYPE)
         else:
-            # repo HF / dossier diffusers -> charge le sous-dossier 'transformer'
-            # (utile pour les modeles comme Juggernaut-Z dont le tokenizer est
-            # incomplet: on garde VAE + encodeur + tokenizer du repo de base).
-            _log(f"loading Z-Image transformer (repo subfolder): {ZIMAGE_TRANSFORMER} ...")
-            kwargs["transformer"] = ZImageTransformer2DModel.from_pretrained(
+            # repo HF / dossier diffusers -> charge le sous-dossier 'transformer'.
+            _log(f"loading Qwen transformer (repo subfolder): {ZIMAGE_TRANSFORMER} ...")
+            kwargs["transformer"] = QwenImageTransformer2DModel.from_pretrained(
                 ZIMAGE_TRANSFORMER, subfolder="transformer", torch_dtype=DTYPE)
-    _log(f"loading Z-Image base: {BASE_REPO} (offload={OFFLOAD_MODE}, dtype=bf16) ... "
-         "first time downloads from HF, then cached")
-    pipe = ZImagePipeline.from_pretrained(BASE_REPO, torch_dtype=DTYPE, **kwargs)
+    _log(f"loading Qwen-Image base: {BASE_REPO} (offload={OFFLOAD_MODE}, dtype=bf16) ... "
+         "first time downloads from HF (~20B, large), then cached")
+    pipe = QwenImagePipeline.from_pretrained(BASE_REPO, torch_dtype=DTYPE, **kwargs)
     # Capture le config natif (flow-matching) du scheduler -> base pour construire les
     # autres samplers (euler/dpm2a/dpmpp2m) sans perdre shift/flow params.
     try:
         _BASE_SCHED_CONFIG = dict(pipe.scheduler.config)
     except Exception:
         _BASE_SCHED_CONFIG = None
-    # LoRA Z-Image (sur le transformer du base -> partage par les pipes derives).
+    # LoRA Qwen-Image (sur le transformer du base -> partage par les pipes derives).
     if LORAS:
         try:
             names, weights = [], []
@@ -579,10 +619,10 @@ def _ensure_base():
         pipe.enable_sequential_cpu_offload()
     else:
         pipe = pipe.to(DEVICE)
-    # VAE tiling/slicing: indispensable pour l'img2img/upscale. L'encode/decode VAE d'une
-    # tuile 1024 + le modele complet en VRAM (transformer + encodeur Qwen3-4B ~8 Go) fait
-    # deborder les 32 Go -> spill RAM partagee -> ~300s/step. Tuiler le VAE plafonne ce pic
-    # (comme le "tiled decode" de ComfyUI). Le VAE est partage par les pipes derives.
+    # VAE tiling/slicing: indispensable pour l'img2img/upscale. Qwen-Image est gros (~20B
+    # transformer + encodeur texte) -> sans tiling le VAE peut faire deborder la VRAM (spill
+    # RAM partagee = tres lent). Tuiler le VAE plafonne ce pic (comme le "tiled decode" de
+    # ComfyUI). Le VAE est partage par les pipes derives.
     try:
         pipe.vae.config.force_upcast = False   # VAE en bf16 (fp32 lent sur Blackwell) -- TOUJOURS
     except Exception:
@@ -596,7 +636,7 @@ def _ensure_base():
     _BASE_PIPE = pipe
     _DERIVED = {"txt2img": pipe}
     _LOADED_KEY = key
-    _log(f"Z-Image base ready in {time.time() - t0:.1f}s (sampler={SAMPLER}/{SCHEDULE})")
+    _log(f"Qwen-Image base ready in {time.time() - t0:.1f}s (sampler={SAMPLER}/{SCHEDULE})")
     return pipe
 
 
@@ -610,16 +650,15 @@ def get_pipe(kind="img2img"):
         return _DERIVED[kind]
     if kind == "omni":
         return _load_omni()
-    from diffusers import ZImageImg2ImgPipeline, ZImageInpaintPipeline
-    cls = {"img2img": ZImageImg2ImgPipeline, "inpaint": ZImageInpaintPipeline}.get(kind)
+    from diffusers import QwenImageImg2ImgPipeline, QwenImageInpaintPipeline
+    cls = {"img2img": QwenImageImg2ImgPipeline, "inpaint": QwenImageInpaintPipeline}.get(kind)
     if cls is None:
         return base
     _log(f"deriving {kind} pipeline (shared weights, no extra VRAM)")
-    # BUG diffusers: ZImage*Pipeline.from_pipe() UPCASTE tout le pipe (transformer + VAE)
-    # en float32. Sur Blackwell (5090: pas de tensor cores fp32) l'img2img/inpaint devient
-    # 100-300x plus lent que txt2img (transformer 0.5s -> 108s, mesure). On force bf16 a la
-    # derivation, on recaste (composants partages avec le base), on coupe le re-upcast fp32
-    # du VAE, et on vide le cache (les copies fp32 transitoires reservaient ~49 Go -> spill).
+    # Defensif (herite de l'upstream Z-Image): certains from_pipe() de diffusers upcastent
+    # le pipe en float32, ce qui ecroule la vitesse sur les GPU sans tensor cores fp32
+    # (Blackwell). On force donc bf16 a la derivation, on recaste les composants partages,
+    # on coupe le re-upcast fp32 du VAE, et on vide le cache des copies fp32 transitoires.
     try:
         p = cls.from_pipe(base, torch_dtype=DTYPE)
     except TypeError:
@@ -648,59 +687,69 @@ def get_pipe(kind="img2img"):
 
 
 def _load_omni():
-    """Charge le pipeline Omni (multi-reference). Necessite un modele Z-Image
-    Omni/Edit (avec encodeur SigLIP) -> CONFIG['zimage_omni_model'] ou env
-    ZIMAGE_OMNI_MODEL. Pipeline separe (ne partage pas avec le base)."""
+    """Charge le pipeline d'edition Qwen-Image-Edit (onglet Omni/Edit). Modele SEPARE du
+    base (defaut 'Qwen/Qwen-Image-Edit-2509', multi-images). 2509 -> QwenImageEditPlus ;
+    revision de base -> QwenImageEdit. Pipeline separe (ne partage pas avec le base)."""
     global _DERIVED
-    from diffusers import ZImageOmniPipeline
+    import diffusers
     repo = (OMNI_MODEL or os.environ.get("ZIMAGE_OMNI_MODEL")
-            or CONFIG.get("zimage_omni_model") or "").strip()
+            or CONFIG.get("zimage_omni_model") or DEFAULT_OMNI_REPO).strip()
     if not repo:
-        raise RuntimeError(
-            "Omni needs a dedicated Z-Image Omni/Edit model (with a SigLIP encoder that "
-            "the Turbo/Base text-to-image models do not ship). As of now Tongyi has only "
-            "released Z-Image-Turbo and Z-Image-Base; 'Z-Image-Omni-Base' and 'Z-Image-Edit' "
-            "are still 'coming soon'. Once published, set 'zimage_omni_model' in config.txt "
-            "to its HF repo id (likely 'Tongyi-MAI/Z-Image-Omni-Base' or 'Tongyi-MAI/"
-            "Z-Image-Edit') or a local diffusers folder.")
-    _log(f"loading Z-Image Omni: {repo} (offload={OFFLOAD_MODE}) ...")
+        raise RuntimeError("No Qwen-Image-Edit model set (config.txt 'zimage_omni_model').")
+    # 2509 supporte plusieurs images de reference -> QwenImageEditPlusPipeline ; sinon
+    # QwenImageEditPipeline (mono-image). On choisit selon le nom, avec repli automatique.
+    plus = "2509" in repo or "plus" in repo.lower()
+    EditCls = (getattr(diffusers, "QwenImageEditPlusPipeline", None) if plus else None) \
+        or diffusers.QwenImageEditPipeline
+    _log(f"loading Qwen-Image-Edit: {repo} via {EditCls.__name__} (offload={OFFLOAD_MODE}) ...")
     t0 = time.time()
-    pipe = ZImageOmniPipeline.from_pretrained(repo, torch_dtype=DTYPE)
-    # Attention slicing pose par appel via _set_slicing (cf. _ensure_base).
+    try:
+        pipe = EditCls.from_pretrained(repo, torch_dtype=DTYPE)
+    except Exception as e:
+        alt = diffusers.QwenImageEditPipeline
+        if EditCls is alt:
+            raise
+        _log(f"{EditCls.__name__} failed ({e}); falling back to {alt.__name__}")
+        pipe = alt.from_pretrained(repo, torch_dtype=DTYPE)
     if DEVICE == "cuda" and OFFLOAD_MODE == "model":
         pipe.enable_model_cpu_offload()
     elif DEVICE == "cuda" and OFFLOAD_MODE == "sequential":
         pipe.enable_sequential_cpu_offload()
     else:
         pipe = pipe.to(DEVICE)
+    try:
+        pipe.enable_vae_slicing()
+        pipe.enable_vae_tiling()
+    except Exception as e:
+        _dbg(f"VAE tiling not available on edit pipe: {e}")
     _DERIVED["omni"] = pipe
-    _log(f"Z-Image Omni ready in {time.time() - t0:.1f}s")
+    _log(f"Qwen-Image-Edit ready in {time.time() - t0:.1f}s")
     return pipe
 
 
 def generate_omni(refs, prompt, negative, width, height, steps, seed):
-    """Omni multi-reference: compose une image a partir de plusieurs images de
-    reference + un prompt (ex. personne + vetement). ZImageOmniPipeline natif."""
-    refs = [r for r in (refs or []) if r is not None]
+    """Edition par instruction Qwen-Image-Edit: edite une (ou plusieurs, via 2509) image(s)
+    d'entree selon le prompt d'instruction. Conserve la signature de l'upstream (cz_ui).
+    width/height sont ignores: l'edition preserve les dimensions de l'image d'entree."""
+    refs = [r.convert("RGB") for r in (refs or []) if r is not None]
     if not refs:
-        raise ValueError("Omni needs at least one reference image.")
+        raise ValueError("Edit needs at least one input image.")
     pipe = get_pipe("omni")
-    w = round_to_multiple(int(width))
-    h = round_to_multiple(int(height))
-    _log(f"omni: {len(refs)} ref(s) -> {w}x{h}, {int(steps)} steps, guidance {GUIDANCE:.1f} ...")
-    _progress(0.1, f"Omni compose ({len(refs)} refs)...")
-    _set_slicing(pipe, max(w, h))
+    _log(f"edit: {len(refs)} image(s), {int(steps)} steps, cfg {GUIDANCE:.1f} ...")
+    _progress(0.1, f"Editing ({len(refs)} image(s))...")
+    _set_slicing(pipe, max(max(r.size) for r in refs))
     t0 = time.time()
-    out = pipe(
-        image=[r.convert("RGB") for r in refs],
+    # 2509/Plus accepte une liste d'images; la revision de base prend une seule image.
+    image_arg = refs if len(refs) > 1 else refs[0]
+    out = _qwen_call(
+        pipe,
+        image=image_arg,
         prompt=prompt or "",
-        negative_prompt=(negative or None),
-        width=w, height=h,
         num_inference_steps=int(steps),
-        guidance_scale=GUIDANCE,
         generator=_make_generator(seed),
+        **_cfg(negative),
     ).images[0]
-    _log(f"omni done in {time.time() - t0:.1f}s")
+    _log(f"edit done in {time.time() - t0:.1f}s")
     gc.collect()
     if DEVICE == "cuda":
         torch.cuda.empty_cache()
@@ -713,12 +762,13 @@ def load_pipe():
 
 
 def generate(prompt, width, height, steps, seed, negative_prompt=""):
-    """txt2img Z-Image: genere une image depuis un prompt.
-    Turbo -> GUIDANCE 0. Base -> GUIDANCE ~3.5-5 + plus de steps."""
+    """txt2img Qwen-Image: genere une image depuis un prompt. CFG reel via true_cfg_scale
+    (= curseur guidance, ~4.0), ~30-50 steps conseilles. Le negative prompt agit grace au
+    vrai CFG (cf. _cfg)."""
     pipe = get_pipe("txt2img")
     w = round_to_multiple(int(width))
     h = round_to_multiple(int(height))
-    _log(f"txt2img: {w}x{h}, {int(steps)} steps, guidance {GUIDANCE:.1f} ...")
+    _log(f"txt2img: {w}x{h}, {int(steps)} steps, cfg {GUIDANCE:.1f} ...")
     _dbg(f"txt2img seed={seed} dtype=bf16 device={DEVICE} offload={OFFLOAD_MODE} "
          f"transformer={'single-file' if ZIMAGE_TRANSFORMER else 'repo'}")
     if DEVICE == "cuda":
@@ -726,13 +776,13 @@ def generate(prompt, width, height, steps, seed, negative_prompt=""):
     _progress(0.1, f"Generating {w}x{h} ({int(steps)} steps)...")
     _set_slicing(pipe, max(w, h))
     t0 = time.time()
-    img = pipe(
+    img = _qwen_call(
+        pipe,
         prompt=prompt or "",
-        negative_prompt=(negative_prompt or None),
         width=w, height=h,
         num_inference_steps=int(steps),
-        guidance_scale=GUIDANCE,
         generator=_make_generator(seed),
+        **_cfg(negative_prompt),
     ).images[0]
     _log(f"txt2img done in {time.time() - t0:.1f}s")
     if DEVICE == "cuda":
@@ -780,13 +830,13 @@ def inpaint_run(background, mask, prompt, steps, denoise, seed):
     w, h = bg.size
     pipe = get_pipe("inpaint")
     _log(f"inpaint: work {w}x{h} (orig {orig_size[0]}x{orig_size[1]}), {int(steps)} steps, "
-         f"strength {float(denoise):.2f}, guidance {GUIDANCE:.1f} ...")
+         f"strength {float(denoise):.2f}, cfg {GUIDANCE:.1f} ...")
     _progress(0.1, "Inpainting...")
     _set_slicing(pipe, max(w, h))
     t0 = time.time()
-    out = pipe(prompt=prompt or "", image=bg, mask_image=work_mask, strength=float(denoise),
-               num_inference_steps=int(steps), guidance_scale=GUIDANCE,
-               generator=_make_generator(seed)).images[0]
+    out = _qwen_call(pipe, prompt=prompt or "", image=bg, mask_image=work_mask,
+                     strength=float(denoise), num_inference_steps=int(steps),
+                     generator=_make_generator(seed), **_cfg(None)).images[0]
     # Recompose: hors-masque garde la pleine resolution; jointure fondue (feather).
     out = _composite_back(out, orig, full_mask, orig_size,
                           feather=max(2, int(min(orig_size) * 0.01)))
@@ -881,13 +931,13 @@ def reframe(image, ratio_w, ratio_h, fit, prompt, steps, seed, strength=1.0):
     canvas = Image.composite(canvas.filter(ImageFilter.GaussianBlur(blur_r)), canvas, mask)
     pipe = get_pipe("inpaint")
     _log(f"reframe contain (outpaint): {w}x{h} -> {nw}x{nh}, {int(steps)} steps, "
-         f"strength {float(strength):.2f}, guidance {GUIDANCE:.1f} ...")
+         f"strength {float(strength):.2f}, cfg {GUIDANCE:.1f} ...")
     _progress(0.1, f"Reframe -> {nw}x{nh}...")
     _set_slicing(pipe, max(nw, nh))
     t0 = time.time()
-    out = pipe(prompt=prompt or "", image=canvas, mask_image=mask, strength=float(strength),
-               num_inference_steps=int(steps), guidance_scale=GUIDANCE,
-               generator=_make_generator(seed)).images[0]
+    out = _qwen_call(pipe, prompt=prompt or "", image=canvas, mask_image=mask,
+                     strength=float(strength), num_inference_steps=int(steps),
+                     generator=_make_generator(seed), **_cfg(None)).images[0]
     if out.size != (nw, nh):
         out = out.resize((nw, nh), Image.LANCZOS)
     _log(f"reframe done in {time.time() - t0:.1f}s")
@@ -951,14 +1001,13 @@ def outpaint_directions(image, mask, directions, prompt, steps, seed, strength=1
     pipe = get_pipe("inpaint")
     _log(f"outpaint {sorted(dirs)}: {image.size[0]}x{image.size[1]} -> "
          f"{full_size[0]}x{full_size[1]} (work {w2}x{h2}), {int(steps)} steps, "
-         f"guidance {GUIDANCE:.1f} ...")
+         f"cfg {GUIDANCE:.1f} ...")
     _progress(0.1, f"Outpaint -> {full_size[0]}x{full_size[1]}...")
     _set_slicing(pipe, max(w2, h2))
     t0 = time.time()
-    out = pipe(prompt=prompt or "", image=work_img, mask_image=work_mask,
-               strength=float(strength),
-               num_inference_steps=int(steps), guidance_scale=GUIDANCE,
-               generator=_make_generator(seed)).images[0]
+    out = _qwen_call(pipe, prompt=prompt or "", image=work_img, mask_image=work_mask,
+                     strength=float(strength), num_inference_steps=int(steps),
+                     generator=_make_generator(seed), **_cfg(None)).images[0]
     out = _composite_back(out, canvas, mask_img, full_size,
                           feather=max(4, int(min(full_size) * 0.015)))
     _log(f"outpaint done in {time.time() - t0:.1f}s")
@@ -973,16 +1022,17 @@ def _make_generator(seed):
 
 
 def _refine_whole(pipe, image, denoise, steps, prompt, seed):
-    """Passe Z-Image img2img sur l'image entiere (ou une tuile). Le slicing est pose
+    """Passe Qwen-Image img2img sur l'image entiere (ou une tuile). Le slicing est pose
     selon la taille reelle traitee: tuile 1024 -> OFF (rapide), whole 2K+ -> ON."""
     _set_slicing(pipe, max(image.size))
-    return pipe(
+    return _qwen_call(
+        pipe,
         prompt=prompt or "",
         image=image,
         strength=float(denoise),
         num_inference_steps=int(steps),
-        guidance_scale=GUIDANCE,
         generator=_make_generator(seed),
+        **_cfg(None),
     ).images[0]
 
 
@@ -1107,9 +1157,9 @@ def process_one(image, esrgan_model, factor, denoise, steps, prompt, seed, tile,
             out = _refine_tiled(pipe, img, denoise, steps, prompt, seed,
                                 rt, int(refine_overlap) or 64)
         else:
-            _log(f"Z-Image refine: whole image {rw}x{rh}, denoise {float(denoise):.2f}, "
+            _log(f"Qwen refine: whole image {rw}x{rh}, denoise {float(denoise):.2f}, "
                  f"{int(steps)} steps ...")
-            _progress(0.5, f"Z-Image refine {rw}x{rh}...")
+            _progress(0.5, f"Qwen refine {rw}x{rh}...")
             out = _refine_whole(pipe, img, denoise, steps, prompt, seed)
         timings["refine"] += time.time() - t0
         return out
@@ -1164,7 +1214,7 @@ def txt2img_run(prompt, width, height, gen_steps, seed, negative_prompt="",
 def _gen_meta(mode, prompt, negative="", seed=None, steps=None, guidance=None,
               size=None, model=None, styles=None, extra=None):
     """Construit le dict de metadonnees de generation (pour sidecar/PNG)."""
-    m = {"app": "crispz-studio", "mode": mode, "prompt": prompt or "",
+    m = {"app": "crispz-qwen-edit", "mode": mode, "prompt": prompt or "",
          "negative": negative or "", "date": _now_stamp()}
     if seed is not None and int(seed) >= 0:
         m["seed"] = int(seed)
