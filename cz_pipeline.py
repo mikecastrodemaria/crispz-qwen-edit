@@ -89,11 +89,15 @@ _BASE_PIPE = None
 _DERIVED = {}
 _LOADED_KEY = None
 
-# Palier 2 (cohabitation VRAM): offload CPU de la passe diffusion. none = tout en VRAM
-# (defaut). model = decharge par sous-module (bon compromis). sequential = plus agressif,
-# plus lent. N'est PAS de la quantif: les poids restent BF16, ils transitent RAM <-> GPU.
-OFFLOAD_MODE = "none"
+# Palier 2 (cohabitation VRAM): offload CPU de la passe diffusion. none = tout en VRAM.
+# model = decharge par sous-module (bon compromis). sequential = plus agressif, plus lent.
+# N'est PAS de la quantif: les poids restent BF16, ils transitent RAM <-> GPU.
+# Qwen-Image est gros (~20B) : on initialise depuis la config (default_cpu_offload, defaut
+# 'model' pour ce fork) ou l'env CZ_OFFLOAD -> offload actif DES le 1er chargement (anti-OOM).
 OFFLOAD_CHOICES = ("none", "model", "sequential")
+OFFLOAD_MODE = (os.environ.get("CZ_OFFLOAD") or CONFIG.get("default_cpu_offload") or "none")
+if OFFLOAD_MODE not in OFFLOAD_CHOICES:
+    OFFLOAD_MODE = "none"
 
 # Guidance Qwen-Image. Le curseur "guidance" de l'UI = `true_cfg_scale` (vrai CFG, qui
 # active le negative prompt). Plage conseillee ~3-5 (defaut 4.0). Le `guidance_scale`
