@@ -20,10 +20,11 @@ REM Effet de bord: l'onglet Edit (Qwen-Image-Edit-2509, non cache) affichera une
 REM au lieu d'aspirer ~20 Go. Mets cette ligne en commentaire (REM) pour autoriser les
 REM telechargements une fois (puis remets-la).
 set HF_HUB_OFFLINE=1
-REM === VRAM: Qwen-Image bf16 = transformer ~44 Go. Sur 32 Go (RTX 5090), 'none' ET 'model'
-REM debordent (OOM): 'model' deplace le transformer ENTIER (44 Go) sur le GPU. Seul
-REM 'sequential' (couche par couche) tient -> plus lent mais ne plante pas. Cet env force
-REM l'offload quel que soit le reglage UI/config. Sur un GPU 48 Go+, mets 'model' (rapide). ===
-set CZ_OFFLOAD=sequential
+REM === VRAM (RTX 5090, 32 Go). Cet env force l'offload quel que soit le reglage UI/config.
+REM   - Avec un transformer GGUF quantifie (ex. qwen-image-Q4_K_M.gguf, ~12 Go): 'model'
+REM     tient large ET reste rapide (~1 s/step). Recommande (defaut ci-dessous).
+REM   - Avec Qwen-Image bf16 COMPLET (~44 Go, sans GGUF): 'model' OOM -> mets 'sequential'
+REM     (couche par couche, tient mais lent). ===
+set CZ_OFFLOAD=model
 REM Delegue au run.bat (detection venv + ESRGAN_DIR + lancement)
 call "%~dp0run.bat" %*
