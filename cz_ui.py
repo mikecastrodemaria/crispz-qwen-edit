@@ -489,16 +489,13 @@ def _refresh_models(new_dir):
     return gr.update(choices=models, value=value), f"{len(models)} model(s) found in {cz_esrgan.ESRGAN_DIR}"
 
 
-# Repos de base officiels Z-Image, proposes directement dans le dropdown
-# "Z-Image checkpoint" (selectionner = swap complet du BASE_REPO).
-ZIMAGE_BASE_REPOS = ["Tongyi-MAI/Z-Image-Turbo", "Tongyi-MAI/Z-Image"]
-# Preset Performance par defaut pour chaque repo de base officiel: Turbo (distille,
-# guidance 0) vs Base (a besoin d'une vraie CFG + plus de steps). Le nom du repo de base
-# ("...Z-Image") ne contient pas "base", donc on mappe explicitement plutot que par
-# substring. steps/guidance sont ensuite tires du preset lui-meme (source unique).
+# Repos de base officiels Qwen-Image, proposes directement dans le dropdown
+# "Qwen checkpoint" (selectionner = swap complet du BASE_REPO).
+ZIMAGE_BASE_REPOS = ["Qwen/Qwen-Image"]
+# Preset Performance par defaut pour chaque repo de base officiel. steps/guidance sont
+# ensuite tires du preset lui-meme (source unique).
 ZIMAGE_BASE_PERFORMANCE = {
-    "Tongyi-MAI/Z-Image-Turbo": "Turbo (8 steps)",
-    "Tongyi-MAI/Z-Image": "Base CFG (28 steps)",
+    "Qwen/Qwen-Image": "Qwen (30 steps)",
 }
 
 
@@ -550,12 +547,12 @@ def _apply_checkpoint(name):
         else:
             st, g = profile_for_model(name)
             perf_upd = _perf_update(st, g)
-        return (f"Z-Image base: {name} -> {perf or 'auto'} (steps={st}, CFG={g}, reload on next run).",
+        return (f"Qwen base: {name} -> {perf or 'auto'} (steps={st}, CFG={g}, reload on next run).",
                 gr.update(value=st), gr.update(value=g), perf_upd)
     path = resolve_checkpoint(name)
     set_zimage_transformer(path)
     st, g = profile_for_model(os.path.basename(path))
-    return (f"Z-Image transformer: {os.path.basename(path)} -> auto steps={st}, CFG={g} "
+    return (f"Qwen transformer: {os.path.basename(path)} -> auto steps={st}, CFG={g} "
             f"(reload on next run).", gr.update(value=st), gr.update(value=g), _perf_update(st, g))
 
 
@@ -1616,9 +1613,11 @@ def build_ui():
                         log_level_status = gr.Markdown("")
 
                     with gr.Tab("Models"):
-                        offload = gr.Dropdown(choices=list(cz_pipeline.OFFLOAD_CHOICES), value="none",
+                        offload = gr.Dropdown(choices=list(cz_pipeline.OFFLOAD_CHOICES),
+                                              value=cz_pipeline.OFFLOAD_MODE,
                                               label="CPU offload (VRAM)",
-                                              info="How much of the model to move to CPU RAM to save VRAM. Details below.")
+                                              info="How much of the model to move to CPU RAM to save VRAM. Details below. "
+                                                   "Qwen-Image is ~20B: 'model' is recommended (default).")
                         with gr.Accordion("ℹ️  What is CPU offload?", open=False):
                             gr.Markdown(
                                 "**CPU offload** moves part of the model weights from VRAM (GPU) to RAM (CPU) "
@@ -1631,13 +1630,14 @@ def build_ui():
                                 "- **sequential** — aggressive, module-by-module. Runs in ~9GB but much slower "
                                 "(5–10×). For small cards (8–12GB).")
 
-                        gr.Markdown("### Checkpoints (switch model, like ESRGAN)")
+                        gr.Markdown("### Checkpoints (switch Qwen model, like ESRGAN)")
                         ckpt_dir_tb = gr.Textbox(value=cz_pipeline.CHECKPOINTS_DIR, label="Checkpoints folder")
                         ckpt_extra_dir_tb = gr.Textbox(
                             value=cz_pipeline.CHECKPOINTS_EXTRA_DIR,
                             label="Extra checkpoints folder (optional)",
-                            placeholder="e.g. D:\\models\\Z-Image",
-                            info="Merged into the single 'Z-Image checkpoint' list above. Leave empty to disable.")
+                            placeholder="e.g. D:\\models\\Qwen",
+                            info="Merged into the single 'Qwen checkpoint' list above. Leave empty to disable. "
+                                 "Note: ComfyUI FP8 single-files are skipped (diffusers can't load FP8).")
                         esrgan_dir_tb = gr.Textbox(value=cz_esrgan.ESRGAN_DIR,
                                                    label="ESRGAN_DIR (.pth/.safetensors folder)")
                         with gr.Row():
@@ -1648,16 +1648,17 @@ def build_ui():
                             _ckpt_choices = ZIMAGE_BASE_REPOS + list_checkpoints()
                             _ckpt_value = cz_pipeline.BASE_REPO if cz_pipeline.BASE_REPO in _ckpt_choices else ZIMAGE_BASE_REPOS[0]
                             ckpt_dd = gr.Dropdown(choices=_ckpt_choices,
-                                                  value=_ckpt_value, label="Z-Image checkpoint", scale=3)
+                                                  value=_ckpt_value, label="Qwen checkpoint", scale=3)
                             ckpt_refresh_btn = gr.Button("Refresh", size="sm", scale=1)
                         ckpt_status = gr.Markdown("")
                         with gr.Row():
                             transformer_tb = gr.Textbox(
                                 value="", scale=3,
                                 label="Transformer override (HF repo / diffusers folder)",
-                                placeholder="e.g. RunDiffusion/Juggernaut-Z-Image",
-                                info="For community models with an incomplete tokenizer (Juggernaut-Z): "
-                                     "loads only the transformer, keeps base VAE/encoder. Set base = Turbo.")
+                                placeholder="e.g. a diffusers Qwen-Image transformer repo/folder",
+                                info="Loads only the transformer, keeps the base VAE/encoder "
+                                     "(base = Qwen/Qwen-Image). For diffusers-format weights only "
+                                     "(ComfyUI FP8 single-files are not supported).")
                             transformer_apply_btn = gr.Button("Apply", size="sm", scale=1, variant="primary")
 
                         gr.Markdown("### LoRA (up to 3, combinable)")
@@ -1704,15 +1705,16 @@ def build_ui():
                             wild_create_btn = gr.Button("Create new", size="sm", variant="primary")
                         wild_status = gr.Markdown("")
 
-                        gr.Markdown("### Omni / Edit model (multi-reference)")
-                        gr.Markdown("*The Reference (Omni) tab stays hidden until a model is set "
-                                    "here (then restart). Z-Image-Omni-Base / Z-Image-Edit are not "
-                                    "released yet. For a reference image now, use img2img.*")
+                        gr.Markdown("### Edit model (Qwen-Image-Edit, instruction editing)")
+                        gr.Markdown("*The Reference (Edit) tab edits an input image from a prompt. "
+                                    "Default `Qwen/Qwen-Image-Edit-2509` downloads on first use "
+                                    "(~20GB) unless you point this to a local diffusers folder. "
+                                    "Set it then restart to enable the tab.*")
                         omni_model_tb = gr.Textbox(value=CONFIG.get("zimage_omni_model", ""),
-                                                   label="Omni model (HF repo or local folder)",
-                                                   info="Needs SigLIP. Set it then restart to enable "
-                                                        "the Reference (Omni) tab.")
-                        omni_check_btn = gr.Button("Check Omni availability (Hugging Face)", size="sm")
+                                                   label="Edit model (HF repo or local diffusers folder)",
+                                                   info="Qwen-Image-Edit (e.g. Qwen/Qwen-Image-Edit-2509). "
+                                                        "Set it then restart to enable the Reference (Edit) tab.")
+                        omni_check_btn = gr.Button("Check Edit model availability (Hugging Face)", size="sm")
                         omni_status = gr.Markdown("")
 
                     with gr.Tab("Save"):
