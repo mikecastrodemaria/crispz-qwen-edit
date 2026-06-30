@@ -77,6 +77,15 @@ LORAS_DIR = (os.environ.get("LORAS_DIR") or _prefs.get("loras_dir")
 # LoRA actives: liste de (chemin, poids). Plusieurs LoRA combinables (multi-slots).
 LORAS = []
 LORA_WEIGHT = float(CONFIG.get("default_lora_weight", 1.0))  # poids par defaut des slots
+# LoRA appliquees AU DEMARRAGE (ex. Lightning 8-step). config 'default_loras' = liste de
+# noms (dans LORAS_DIR) ou de paires [nom, poids]. Resolues en (chemin, poids).
+for _spec in (CONFIG.get("default_loras") or []):
+    _nm, _w = (_spec if isinstance(_spec, (list, tuple)) and len(_spec) == 2
+               else (_spec, LORA_WEIGHT))
+    if _nm and _nm not in ("None", "none"):
+        _p = _nm if os.path.isabs(_nm) else os.path.join(LORAS_DIR, _nm)
+        if os.path.isfile(_p):
+            LORAS.append((_p, float(_w)))
 # Modele Omni/Edit (Qwen-Image-Edit, multi-images). Defaut = DEFAULT_OMNI_REPO pour que
 # l'onglet Edit marche sans config. Reglable via config.txt (zimage_omni_model) ou l'UI.
 OMNI_MODEL = (os.environ.get("ZIMAGE_OMNI_MODEL") or CONFIG.get("zimage_omni_model")
@@ -620,7 +629,11 @@ def _ensure_base():
                 if os.path.isfile(p):
                     an = f"cz_lora_{i}"
                     _log(f"applying LoRA: {os.path.basename(p)} (weight {w})")
-                    pipe.load_lora_weights(p, adapter_name=an)
+                    # Passer le dossier + weight_name (et non le chemin complet) : sinon
+                    # diffusers en mode offline (HF_HUB_OFFLINE) refuse "must specify a
+                    # weight_name". Marche aussi online et avec un fichier local direct.
+                    pipe.load_lora_weights(os.path.dirname(p) or ".",
+                                           weight_name=os.path.basename(p), adapter_name=an)
                     names.append(an)
                     weights.append(float(w))
             if names:
@@ -679,7 +692,9 @@ def get_pipe(kind="img2img"):
     # (certains from_pipe upcastent en float32 -> tres lent sans tensor cores fp32).
     quantized = bool(ZIMAGE_TRANSFORMER) and ZIMAGE_TRANSFORMER.lower().endswith(".gguf")
     try:
-        p = cls.from_pipe(base) if quantized else cls.from_pipe(base, torch_dtype=DTYPE)
+        # GGUF quantifie: torch_dtype=None EXPLICITE -> sinon from_pipe met float32 par
+        # defaut et caste le modele quantifie -> ValueError "Casting a quantized model".
+        p = cls.from_pipe(base, torch_dtype=None) if quantized else cls.from_pipe(base, torch_dtype=DTYPE)
     except TypeError:
         p = cls.from_pipe(base)
     try:
