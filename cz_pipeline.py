@@ -714,21 +714,36 @@ def _load_omni():
             or CONFIG.get("zimage_omni_model") or DEFAULT_OMNI_REPO).strip()
     if not repo:
         raise RuntimeError("No Qwen-Image-Edit model set (config.txt 'zimage_omni_model').")
-    # 2509 supporte plusieurs images de reference -> QwenImageEditPlusPipeline ; sinon
-    # QwenImageEditPipeline (mono-image). On choisit selon le nom, avec repli automatique.
-    plus = "2509" in repo or "plus" in repo.lower()
-    EditCls = (getattr(diffusers, "QwenImageEditPlusPipeline", None) if plus else None) \
-        or diffusers.QwenImageEditPipeline
-    _log(f"loading Qwen-Image-Edit: {repo} via {EditCls.__name__} (offload={OFFLOAD_MODE}) ...")
+    EditPlus = getattr(diffusers, "QwenImageEditPlusPipeline", None)
     t0 = time.time()
-    try:
-        pipe = EditCls.from_pretrained(repo, torch_dtype=DTYPE)
-    except Exception as e:
-        alt = diffusers.QwenImageEditPipeline
-        if EditCls is alt:
-            raise
-        _log(f"{EditCls.__name__} failed ({e}); falling back to {alt.__name__}")
-        pipe = alt.from_pretrained(repo, torch_dtype=DTYPE)
+    if repo.lower().endswith(".gguf"):
+        # GGUF: transformer d'edition quantifie (local, ~13 Go) + le RESTE (encodeur texte
+        # ~17 Go, VAE, processor) tire du repo d'edition de base (zimage_omni_base, defaut
+        # Qwen-Image-Edit-2509). Fait tenir l'edition en VRAM 32 Go, sans le transformer 40 Go.
+        from diffusers import QwenImageTransformer2DModel, GGUFQuantizationConfig
+        base_edit = (os.environ.get("QWEN_EDIT_BASE") or CONFIG.get("zimage_omni_base")
+                     or DEFAULT_OMNI_REPO).strip()
+        EditCls = EditPlus or diffusers.QwenImageEditPipeline
+        _log(f"loading Qwen-Image-Edit transformer (GGUF): {repo} + base {base_edit} "
+             f"via {EditCls.__name__} (offload={OFFLOAD_MODE}) ...")
+        tf = QwenImageTransformer2DModel.from_single_file(
+            repo, config=base_edit, subfolder="transformer",
+            quantization_config=GGUFQuantizationConfig(compute_dtype=DTYPE), torch_dtype=DTYPE)
+        pipe = EditCls.from_pretrained(base_edit, transformer=tf, torch_dtype=DTYPE)
+    else:
+        # repo diffusers complet (telechargement). 2509 -> QwenImageEditPlusPipeline
+        # (multi-images) ; revision de base -> QwenImageEditPipeline. Repli automatique.
+        plus = "2509" in repo or "plus" in repo.lower()
+        EditCls = (EditPlus if plus else None) or diffusers.QwenImageEditPipeline
+        _log(f"loading Qwen-Image-Edit: {repo} via {EditCls.__name__} (offload={OFFLOAD_MODE}) ...")
+        try:
+            pipe = EditCls.from_pretrained(repo, torch_dtype=DTYPE)
+        except Exception as e:
+            alt = diffusers.QwenImageEditPipeline
+            if EditCls is alt:
+                raise
+            _log(f"{EditCls.__name__} failed ({e}); falling back to {alt.__name__}")
+            pipe = alt.from_pretrained(repo, torch_dtype=DTYPE)
     if DEVICE == "cuda" and OFFLOAD_MODE == "model":
         pipe.enable_model_cpu_offload()
     elif DEVICE == "cuda" and OFFLOAD_MODE == "sequential":
