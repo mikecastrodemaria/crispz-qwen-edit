@@ -32,7 +32,7 @@
     "default_performance": "Qwen (30 steps)",
     "default_width": 1024,
     "default_height": 1024,
-    "default_gen_steps": 30,
+    "default_gen_steps": 20,
     "default_guidance": 4.0,
     "_default_guidance_help": "Qwen 'guidance' = true_cfg_scale (real CFG, enables negative prompt). ~3-5 recommended.",
     "default_sampler": "euler",
@@ -42,7 +42,8 @@
 
     "default_factor": 2.0,
     "default_denoise": 0.30,
-    "default_refine": true,
+    "_default_refine_help": "Upscale/refine pass OFF by default (txt2img only = fast startup). NB: the diffusion refine needs a non-quantized base; with a GGUF model it is skipped/limited. Enable per-run via the Upscale checkbox.",
+    "default_refine": false,
     "default_refine_first": false,
     "default_refine_steps": 12,
     "default_tile": 760,
