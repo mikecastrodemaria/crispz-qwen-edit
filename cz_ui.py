@@ -102,6 +102,9 @@ PERFORMANCE = {
     "Quality (20 steps)": (20, 0.0),
     "Base CFG (28 steps)": (28, 4.0),
 }
+# Optionnel: une LoRA associee a un preset (3e element du preset dans config.txt).
+# Ex. le preset "Lightning 8" applique automatiquement la LoRA Lightning -> 8 steps rapides.
+PERFORMANCE_LORA = {}
 # Styles. Format Fooocus: nom -> {"prompt": template avec {prompt} (ou None),
 # "negative_prompt": str}. La vraie biblio est chargee depuis styles/*.json (cf.
 # _load_styles plus bas). Ceci n'est qu'un fallback si le dossier est absent.
@@ -200,10 +203,13 @@ import json  # noqa: F811 (utilise par _load_styles ci-dessous)
 
 # CONFIG + defauts pilotes par config.txt -> cz_core.py (importes en tete).
 
-# Presets Performance editables via config.txt (performance_presets: nom -> [steps, guidance]).
+# Presets Performance editables via config.txt (performance_presets: nom -> [steps, guidance]
+# ou [steps, guidance, lora_filename] pour associer une LoRA au preset).
 if isinstance(CONFIG.get("performance_presets"), dict) and CONFIG["performance_presets"]:
     try:
         PERFORMANCE = {k: (int(v[0]), float(v[1])) for k, v in CONFIG["performance_presets"].items()}
+        PERFORMANCE_LORA = {k: str(v[2]) for k, v in CONFIG["performance_presets"].items()
+                            if isinstance(v, (list, tuple)) and len(v) > 2 and v[2]}
     except Exception:
         pass
 
@@ -758,10 +764,18 @@ def _set_aspect(name):
     return w, h
 
 
-def _set_performance(name):
-    """UI: applique un preset Performance -> (gen_steps, guidance)."""
+def _set_performance(name, n2="None", w2=1.0, n3="None", w3=1.0):
+    """UI: applique un preset Performance -> (gen_steps, guidance) + sa LoRA associee
+    (slot 1) si le preset en definit une (ex. 'Lightning' -> LoRA 8-step). Applique
+    immediatement la combinaison de LoRA (les slots 2/3 sont preserves)."""
     steps, g = PERFORMANCE.get(name, (8, 0.0))
-    return steps, g
+    n1 = PERFORMANCE_LORA.get(name, "") or "None"
+    w1 = float(cz_pipeline.LORA_WEIGHT)
+    try:
+        set_loras([(n1, w1), (n2, w2), (n3, w3)])
+    except Exception as e:
+        _log(f"performance preset LoRA apply failed: {e}")
+    return steps, g, gr.update(value=n1), gr.update(value=w1)
 
 
 def _ui_detect_ollama(url):
@@ -1690,9 +1704,17 @@ def build_ui():
                         gr.Markdown("### LoRA (up to 3, combinable)")
                         lora_dir_tb = gr.Textbox(value=cz_pipeline.LORAS_DIR, label="LoRA folder")
                         _lchoices = ["None"] + list_loras()
+                        # Slot 1 pre-rempli avec la 1ere LoRA active au demarrage (config
+                        # default_loras, ex. Lightning) -> reflete ce que charge cz_pipeline.
+                        _lora1_default = (os.path.basename(cz_pipeline.LORAS[0][0])
+                                          if cz_pipeline.LORAS else "None")
+                        _lw1_default = (float(cz_pipeline.LORAS[0][1])
+                                        if cz_pipeline.LORAS else float(cz_pipeline.LORA_WEIGHT))
+                        if _lora1_default not in _lchoices:
+                            _lora1_default = "None"
                         with gr.Row():
-                            lora_dd1 = gr.Dropdown(choices=_lchoices, value="None", label="LoRA 1", scale=3)
-                            lw1 = gr.Slider(0.0, 2.0, value=float(cz_pipeline.LORA_WEIGHT), step=0.05,
+                            lora_dd1 = gr.Dropdown(choices=_lchoices, value=_lora1_default, label="LoRA 1", scale=3)
+                            lw1 = gr.Slider(0.0, 2.0, value=_lw1_default, step=0.05,
                                             label="Weight 1", scale=2)
                         with gr.Row():
                             lora_dd2 = gr.Dropdown(choices=_lchoices, value="None", label="LoRA 2", scale=3)
@@ -1775,7 +1797,8 @@ def build_ui():
         advanced_cb.change(lambda v: gr.update(visible=bool(v)), advanced_cb, advanced_col)
         use_input.change(lambda v: gr.update(visible=bool(v)), use_input, input_group)
         aspect.change(_set_aspect, [aspect], [width, height])
-        performance.change(_set_performance, [performance], [gen_steps, guidance])
+        performance.change(_set_performance, [performance, lora_dd2, lw2, lora_dd3, lw3],
+                           [gen_steps, guidance, lora_dd1, lw1])
         style_search.change(_filter_styles, [style_search, styles], [styles])
 
         # Actions

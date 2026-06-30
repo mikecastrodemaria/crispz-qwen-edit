@@ -14,11 +14,14 @@
     "improve_local_keywords": "highly detailed, sharp focus, professional photography, intricate details, natural lighting, high quality, 8k",
     "_improve_local_keywords_help": "Quality tags appended by 'Improve prompt' when no Ollama model is selected (local rule-based fallback, no model).",
 
+    "_performance_presets_help": "name -> [steps, guidance] or [steps, guidance, lora_file]. A 3rd value applies that LoRA (slot 1) when the preset is selected. A distilled Lightning LoRA enables 8 steps + guidance 1 (no CFG) = fast & good. Put the LoRA in loras_dir and set its filename here.",
     "performance_presets": {
-        "Fast (20 steps)": [20, 4.0],
-        "Qwen (30 steps)": [30, 4.0],
-        "Quality (50 steps)": [50, 4.0]
+        "Lightning (8 steps)": [8, 1.0, "PUT_YOUR_LIGHTNING_LORA.safetensors"],
+        "Balanced (24 steps)": [24, 4.0],
+        "Quality (40 steps)": [40, 4.0]
     },
+    "_default_loras_help": "LoRAs applied at startup (in loras_dir). Names or [name, weight]. Empty = none. Set a Lightning LoRA here + default_performance 'Lightning (8 steps)' + default_gen_steps 8 + default_guidance 1.0 for a fast default.",
+    "default_loras": [],
     "model_profiles": {
         "qwen": {"steps": 30, "guidance": 4.0},
         "edit": {"steps": 30, "guidance": 4.0}
@@ -29,10 +32,10 @@
     "default_negative_prompt": "",
     "default_styles": [],
     "default_aspect_ratio": "1024 x 1024  (1:1)",
-    "default_performance": "Qwen (30 steps)",
+    "default_performance": "Balanced (24 steps)",
     "default_width": 1024,
     "default_height": 1024,
-    "default_gen_steps": 20,
+    "default_gen_steps": 24,
     "default_guidance": 4.0,
     "_default_guidance_help": "Qwen 'guidance' = true_cfg_scale (real CFG, enables negative prompt). ~3-5 recommended.",
     "default_sampler": "euler",
