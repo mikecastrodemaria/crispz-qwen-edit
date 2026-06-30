@@ -720,16 +720,34 @@ def _load_omni():
         # GGUF: transformer d'edition quantifie (local, ~13 Go) + le RESTE (encodeur texte
         # ~17 Go, VAE, processor) tire du repo d'edition de base (zimage_omni_base, defaut
         # Qwen-Image-Edit-2509). Fait tenir l'edition en VRAM 32 Go, sans le transformer 40 Go.
+        import importlib, json as _json
+        from huggingface_hub import hf_hub_download
         from diffusers import QwenImageTransformer2DModel, GGUFQuantizationConfig
         base_edit = (os.environ.get("QWEN_EDIT_BASE") or CONFIG.get("zimage_omni_base")
                      or DEFAULT_OMNI_REPO).strip()
         EditCls = EditPlus or diffusers.QwenImageEditPipeline
         _log(f"loading Qwen-Image-Edit transformer (GGUF): {repo} + base {base_edit} "
              f"via {EditCls.__name__} (offload={OFFLOAD_MODE}) ...")
+        # Transformer depuis le GGUF (archi tiree du repo de base, pas de download du
+        # transformer bf16). NB: from_pretrained(base, transformer=tf) telechargerait QUAND
+        # MEME le transformer 40 Go du repo -> on construit donc le pipeline composant par
+        # composant. Les classes viennent du model_index.json du repo de base.
         tf = QwenImageTransformer2DModel.from_single_file(
             repo, config=base_edit, subfolder="transformer",
             quantization_config=GGUFQuantizationConfig(compute_dtype=DTYPE), torch_dtype=DTYPE)
-        pipe = EditCls.from_pretrained(base_edit, transformer=tf, torch_dtype=DTYPE)
+        mi = _json.load(open(hf_hub_download(base_edit, "model_index.json"), encoding="utf-8"))
+        comps = {"transformer": tf}
+        for name in ("scheduler", "vae", "text_encoder", "tokenizer", "processor"):
+            spec = mi.get(name)
+            if not (isinstance(spec, list) and len(spec) == 2):
+                continue
+            lib, cls_name = spec
+            Cls = getattr(importlib.import_module(lib), cls_name)
+            kw = {"torch_dtype": DTYPE} if name in ("vae", "text_encoder") else {}
+            # Charge UNIQUEMENT ce sous-dossier (encodeur ~17 Go, VAE...) ; le transformer
+            # 40 Go du repo n'est jamais telecharge.
+            comps[name] = Cls.from_pretrained(base_edit, subfolder=name, **kw)
+        pipe = EditCls(**comps)
     else:
         # repo diffusers complet (telechargement). 2509 -> QwenImageEditPlusPipeline
         # (multi-images) ; revision de base -> QwenImageEditPipeline. Repli automatique.
