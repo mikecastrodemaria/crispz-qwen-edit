@@ -9,6 +9,14 @@
     "ollama_vision_blocklist": [],
     "ollama_keep_alive": 0,
     "ollama_cpu": false,
+    "job_queue": {"enabled": true},
+    "_job_queue_help": "Job queue panel ('+ Queue' snapshots all settings incl. model; 'Run queue' chains them; Stop pauses). enabled=false removes the UI entirely (zero cost).",
+    "tag_autocomplete": {"enabled": true, "max_results": 8, "sources": ["https://raw.githubusercontent.com/DominikDoom/a1111-sd-webui-tagcomplete/main/tags/danbooru.csv"]},
+    "_tag_autocomplete_help": "Prompt/negative autocomplete. CSVs in sources are downloaded once to tags/ (any .csv dropped there is also used, rich 'name,cat,count,aliases' or one word per line) + local __wildcards__. enabled=false: no download, no JS injected (zero cost).",
+    "xyz_grid": {"enabled": true, "max_jobs": 100, "thumb": 512, "suggest": true},
+    "_xyz_grid_help": "X/Y/Z comparison grid (needs job_queue). Each combo becomes a queued job; an annotated contact sheet is assembled per Z value. max_jobs caps the combo count; thumb = cell size in px; suggest = contextual value suggestions (placeholder + fill button) per axis.",
+    "load_progress": {"enabled": true, "target_vram_gb": 14.0, "heartbeat_s": 2.0},
+    "_load_progress_help": "Live feedback while a model loads (first run downloads from HF = minutes of silence otherwise). Terminal shows a rewritten '[crispz][load] ... 45s | 3.2 GB in VRAM' line every heartbeat_s; the UI progress bar advances (VRAM allocated / target_vram_gb). enabled=false loads directly with no monitor thread (zero cost).",
     "caption_model": "blip-large",
     "_caption_model_help": "Local auto-describe model (no Ollama): blip-large (default) | blip-base",
     "improve_local_keywords": "highly detailed, sharp focus, professional photography, intricate details, natural lighting, high quality, 8k",
@@ -16,18 +24,38 @@
 
     "_performance_presets_help": "name -> [steps, guidance] or [steps, guidance, lora_file]. A 3rd value applies that LoRA (slot 1) when the preset is selected. A distilled Lightning LoRA enables 8 steps + guidance 1 (no CFG) = fast & good. Put the LoRA in loras_dir and set its filename here.",
     "performance_presets": {
-        "Lightning (8 steps)": [8, 1.0, "PUT_YOUR_LIGHTNING_LORA.safetensors"],
-        "Balanced (24 steps)": [24, 4.0],
-        "Quality (40 steps)": [40, 4.0]
+            "Lightning (8 steps)": [
+                    8,
+                    1.0,
+                    "PUT_YOUR_LIGHTNING_LORA.safetensors"
+            ],
+            "Balanced (24 steps)": [
+                    24,
+                    4.0
+            ],
+            "Quality (40 steps)": [
+                    40,
+                    4.0
+            ]
     },
-    "_default_loras_help": "LoRAs applied at startup (in loras_dir). Names or [name, weight]. Empty = none. Set a Lightning LoRA here + default_performance 'Lightning (8 steps)' + default_gen_steps 8 + default_guidance 1.0 for a fast default.",
-    "default_loras": [],
     "model_profiles": {
-        "qwen": {"steps": 30, "guidance": 4.0},
-        "edit": {"steps": 30, "guidance": 4.0}
+            "qwen": {
+                    "steps": 30,
+                    "guidance": 4.0
+            },
+            "edit": {
+                    "steps": 30,
+                    "guidance": 4.0
+            }
     },
     "default_model_profile": {"steps": 30, "guidance": 4.0},
 
+    "_default_loras_help": "LoRAs applied at startup (in loras_dir). Names or [name, weight]. Empty = none. Set a Lightning LoRA here + default_performance 'Lightning (8 steps)' + default_gen_steps 8 + default_guidance 1.0 for a fast default.",
+    "default_loras": [],
+    "_default_guidance_help": "Qwen 'guidance' = true_cfg_scale (real CFG, enables negative prompt). ~3-5 recommended.",
+    "_default_refine_help": "Upscale/refine pass OFF by default (txt2img only = fast startup). NB: the diffusion refine needs a non-quantized base; with a GGUF model it is skipped/limited. Enable per-run via the Upscale checkbox.",
+    "_zimage_omni_base_help": "Base edit repo providing text-encoder/VAE/processor when 'zimage_omni_model' is a .gguf transformer. Default Qwen/Qwen-Image-Edit-2509 (downloads ~17GB once).",
+    "zimage_omni_base": "Qwen/Qwen-Image-Edit-2509",
     "default_prompt": "",
     "default_negative_prompt": "",
     "default_styles": [],
@@ -39,7 +67,6 @@
     "default_height": 1024,
     "default_gen_steps": 24,
     "default_guidance": 4.0,
-    "_default_guidance_help": "Qwen 'guidance' = true_cfg_scale (real CFG, enables negative prompt). ~3-5 recommended.",
     "default_sampler": "euler",
     "default_schedule": "sgm_uniform",
     "default_image_number": 1,
@@ -47,7 +74,6 @@
 
     "default_factor": 2.0,
     "default_denoise": 0.30,
-    "_default_refine_help": "Upscale/refine pass OFF by default (txt2img only = fast startup). NB: the diffusion refine needs a non-quantized base; with a GGUF model it is skipped/limited. Enable per-run via the Upscale checkbox.",
     "default_refine": false,
     "default_refine_first": false,
     "default_refine_steps": 12,
@@ -65,10 +91,12 @@
     "loras_dir": "",
     "wildcards_dir": "",
     "default_lora_weight": 1.0,
-    "_zimage_omni_model_help": "Qwen-Image-Edit model for the Edit tab. A HF repo (e.g. Qwen/Qwen-Image-Edit-2509, full download) OR a local .gguf transformer path (quantized, ~13GB; the text-encoder/VAE then come from 'zimage_omni_base'). Empty -> Qwen/Qwen-Image-Edit-2509.",
+    "_default_lora_weight_help": "Weight a LoRA slot starts at. Must sit inside lora_weight_min..lora_weight_max (it is clamped into the range otherwise).",
+    "lora_weight_min": -2.0,
+    "lora_weight_max": 2.0,
+    "_lora_weight_range_help": "Min/max of the LoRA 'Weight' sliders (Models > LoRA). NEGATIVE weights are allowed and useful: a LoRA applied at a negative weight pushes AWAY from what it was trained on (e.g. a 'skinny slider' LoRA at -1 gives the opposite effect, an 'age slider' at -0.5 makes the subject younger/older the other way). 0 = LoRA has no effect. Typical range: -2..2; beyond ~±1.5 most LoRAs burn/deform the image. Set lora_weight_min to 0 if you never want negatives. If the values are not numbers, or min >= max, the app falls back to -2..2 and logs it.",
+    "lora_slots": 3,
     "zimage_omni_model": "Qwen/Qwen-Image-Edit-2509",
-    "_zimage_omni_base_help": "Base edit repo providing text-encoder/VAE/processor when 'zimage_omni_model' is a .gguf transformer. Default Qwen/Qwen-Image-Edit-2509 (downloads ~17GB once).",
-    "zimage_omni_base": "Qwen/Qwen-Image-Edit-2509",
     "faceswap_model_path": "",
     "faceswap_model_url": "",
     "faceswap_restore": false,
@@ -81,11 +109,19 @@
     "default_output_format": "png",
     "filename_pattern": "{date}_{tag}_seed{seed}_{w}x{h}{index}",
     "date_subfolders": true,
+    "metadata_scheme": "crispz",
+    "wildcards_in_order": false,
+    "save_pre_upscale": false,
+    "civitai_api_key": "",
+    "civitai_batch": {"enabled": true, "sleep": 0.5, "check_updates": true},
+    "_civitai_batch_help": "Batch CivitAI enrichment. enabled=true shows the '🔄 Fetch all missing' button on the Asset Browser LoRAs/Models tabs and lets cz_civitai_batch.py (civitai_index.bat/.sh) run. sleep = seconds between requests (rate-limit friendly); check_updates = also flag models that have a newer version on CivitAI. enabled=false hides the button (per-model 🔎 fetch still works).",
     "asset_browser": {
         "enabled": false,
         "generate_thumbnails": true,
         "thumbnail_size": 256,
         "thumbnail_quality": 85,
+        "thumb_workers": 0,
+        "_thumb_workers_help": "Threads used to generate thumbnails (0 = auto: min(8, CPU cores)). Thumbnails are made in parallel, both for background indexing and for the Asset Browser's 'Rebuild ALL thumbnails (force)' button. Lower it if indexing a huge folder makes the machine sluggish.",
         "blur_thumbnails": false
     },
 
