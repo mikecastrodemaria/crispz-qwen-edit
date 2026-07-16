@@ -38,7 +38,16 @@
                     4.0
             ]
     },
+    "_model_profiles_help": "Auto steps/guidance when a checkpoint is selected, matched by substring on the file name (first match wins, in order). Keep specific keys (rapid, lightning) BEFORE generic ones (qwen): Lightning/Rapid merges are distilled -> few steps, guidance 1.0 (CFG off).",
     "model_profiles": {
+            "rapid": {
+                    "steps": 8,
+                    "guidance": 1.0
+            },
+            "lightning": {
+                    "steps": 8,
+                    "guidance": 1.0
+            },
             "qwen": {
                     "steps": 30,
                     "guidance": 4.0
