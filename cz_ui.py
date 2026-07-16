@@ -340,7 +340,7 @@ def _format_timings(t, src_path=None, dst_path=None):
     parts = []
     if src_path:
         parts.append(f"Source: `{src_path}`")
-    parts.append(f"ESRGAN: **{t.get('esrgan', 0.0):.1f}s**  |  Z-Image refine: **{t.get('refine', 0.0):.1f}s**  |  Total: **{total:.1f}s**")
+    parts.append(f"ESRGAN: **{t.get('esrgan', 0.0):.1f}s**  |  Qwen refine: **{t.get('refine', 0.0):.1f}s**  |  Total: **{total:.1f}s**")
     if dst_path:
         parts.append(f"Saved: `{dst_path}`")
     return "  \n".join(parts)
@@ -2574,7 +2574,7 @@ def build_ui():
                             with gr.Accordion("ESRGAN tiling (VRAM)", open=False):
                                 tile = gr.Slider(0, 1024, value=DEFAULT_TILE, step=8, label="Tile (0 = off)")
                                 overlap = gr.Slider(0, 128, value=DEFAULT_OVERLAP, step=8, label="Overlap")
-                            with gr.Accordion("Z-Image tiling (4K+)", open=False):
+                            with gr.Accordion("Qwen tiling (4K+)", open=False):
                                 refine_tile = gr.Slider(0, 2048, value=DEFAULT_REFINE_TILE, step=16,
                                                         label="Diffusion tile (0 = whole image)")
                                 refine_overlap = gr.Slider(0, 256, value=DEFAULT_REFINE_OVERLAP, step=16,
@@ -2590,7 +2590,7 @@ def build_ui():
                         with gr.Tab("Vision Mix"):
                             gr.Markdown("*Vision Mix: a vision model looks at your reference images "
                                         "and an LLM blends them into ONE text prompt (e.g. a person + "
-                                        "an outfit + a setting), then Z-Image generates from it. "
+                                        "an outfit + a setting), then Qwen-Image generates from it. "
                                         "Needs Ollama with a vision model (Advanced > Prompt AI). "
                                         "It mixes ideas/style, not exact pixels.*")
                             with gr.Row():
@@ -2718,8 +2718,8 @@ def build_ui():
                         performance = gr.Radio(list(PERFORMANCE),
                                                value=CONFIG.get("default_performance", "Turbo (8 steps)"),
                                                label="Performance",
-                                               info="Sets steps + guidance. Turbo = your Turbo model; "
-                                                    "Base CFG = for a Z-Image Base checkpoint.")
+                                               info="Sets steps + guidance (Lightning also applies its LoRA). "
+                                                    "CFG presets = for the standard Qwen-Image base.")
                         aspect = gr.Dropdown(list(ASPECT_RATIOS),
                                              value=CONFIG.get("default_aspect_ratio", "1024 x 1024  (1:1)"),
                                              label="Aspect ratio")
@@ -2739,7 +2739,7 @@ def build_ui():
                         with gr.Row():
                             guidance = gr.Slider(0.0, 8.0, value=float(CONFIG.get("default_guidance", 0.0)),
                                                  step=0.5, label="CFG guidance", scale=2,
-                                                 info="0 = Z-Image Turbo. Z-Image Base: ~3.5-5.")
+                                                 info="1 = Lightning/Rapid merges (CFG off). Qwen-Image base: ~4.")
                             sampler_dd = gr.Dropdown(
                                 list(SAMPLER_CHOICES),
                                 value=(CONFIG.get("default_sampler") or "euler").strip().lower()
@@ -2747,14 +2747,14 @@ def build_ui():
                                 else "euler",
                                 label="Sampler", scale=1,
                                 info="euler = native flow. unipc = UniPC. (DPM++/DPM2a impossible: "
-                                     "Z-Image forces custom sigmas.)")
+                                     "Qwen-Image forces custom sigmas.)")
                             schedule_dd = gr.Dropdown(
                                 list(SCHEDULE_CHOICES),
                                 value=(CONFIG.get("default_schedule") or "sgm_uniform").strip().lower()
                                 if (CONFIG.get("default_schedule") or "sgm_uniform").strip().lower() in SCHEDULE_CHOICES
                                 else "sgm_uniform",
                                 label="Schedule", scale=1,
-                                info="sigma schedule (ComfyUI-style). sgm_uniform = native Z-Image. "
+                                info="sigma schedule (ComfyUI-style). sgm_uniform = native Qwen-Image. "
                                      "beta/karras/exponential remap the sigmas.")
                         image_number = gr.Slider(1, 30, value=int(CONFIG.get("default_image_number", 1)),
                                                  step=1, label="Image number (batch)")
@@ -2845,9 +2845,9 @@ def build_ui():
                                 transformer_tb = gr.Textbox(
                                     value="", scale=3,
                                     label="Transformer override (HF repo / diffusers folder)",
-                                    placeholder="e.g. RunDiffusion/Juggernaut-Z-Image",
-                                    info="For community models with an incomplete tokenizer (Juggernaut-Z): "
-                                         "loads only the transformer, keeps base VAE/encoder. Set base = Turbo.")
+                                    placeholder="HF repo with a Qwen-Image transformer",
+                                    info="For community models with an incomplete tokenizer: "
+                                         "loads only the transformer, keeps base VAE/encoder.")
                                 transformer_apply_btn = gr.Button("Apply override", size="sm", scale=1,
                                                                   variant="secondary")
 
@@ -2915,12 +2915,12 @@ def build_ui():
                             wild_status = gr.Markdown("")
 
                         with gr.Accordion("\U0001F5BC️ Omni / Edit (multi-reference)", open=False):
-                            gr.Markdown("*The Reference (Omni) tab stays hidden until a model is set "
-                                        "here (then restart). Z-Image-Omni-Base / Z-Image-Edit are not "
-                                        "released yet. For a reference image now, use img2img.*")
+                            gr.Markdown("*The Reference (Omni) tab uses Qwen-Image-Edit "
+                                        "(default: Qwen/Qwen-Image-Edit-2509, multi-image instruction "
+                                        "editing). Set another repo here, then restart.*")
                             omni_model_tb = gr.Textbox(value=CONFIG.get("zimage_omni_model", ""),
                                                        label="Omni model (HF repo or local folder)",
-                                                       info="Needs SigLIP. Set it then restart to enable "
+                                                       info="Qwen-Image-Edit repo. Set it then restart to enable "
                                                             "the Reference (Omni) tab.")
                             omni_check_btn = gr.Button("Check Omni availability (Hugging Face)", size="sm")
                             omni_status = gr.Markdown("")
