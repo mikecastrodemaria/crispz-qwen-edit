@@ -42,7 +42,7 @@ sentencepiece==0.1.96
 spandrel==0.4.1
 
 # UI / service
-gradio==5.50.0
+gradio==6.15.1
 fastapi==0.138.1
 uvicorn==0.35.0
 
