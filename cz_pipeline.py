@@ -550,6 +550,35 @@ def _gguf_arch(path, max_kv=64):
     return None
 
 
+# Prefixes de tenseurs du layout Qwen ORIGINAL (celui que le loader GGUF de diffusers
+# sait mapper — GGUF QuantStack/city96). Certains GGUF Civitai sont convertis avec un
+# schema compact renomme (blocks.N.attn.wq, txtmlp, tproj... — outil type
+# stable-diffusion.cpp): l'archi declaree est bien 'qwen_image' mais AUCUNE cle ne
+# matche -> tous les poids restent sur le device 'meta' et le .to(device) explose en
+# "Cannot copy out of meta tensor". On detecte ce cas a l'en-tete pour refuser proprement.
+_GGUF_OK_PREFIXES = ("transformer_blocks.", "img_in", "txt_in", "time_text_embed",
+                     "norm_out", "proj_out")
+
+
+def _gguf_layout_unsupported(path):
+    """Renvoie une raison (str) si le .gguf n'utilise PAS le layout de tenseurs Qwen
+    original attendu par diffusers, sinon None. Lecture d'en-tete seule (gguf mmap)."""
+    try:
+        from gguf import GGUFReader
+        r = GGUFReader(path)
+        names = [t.name for t in r.tensors]
+        if not names:
+            return None                      # illisible -> ne pas ecarter a tort
+        if any(n.startswith(_GGUF_OK_PREFIXES) for n in names):
+            return None
+        return ("GGUF with a non-standard tensor layout (e.g. stable-diffusion.cpp "
+                "conversion); diffusers cannot map it — use a QuantStack/city96-style "
+                "GGUF or the BF16/FP16 .safetensors build")
+    except Exception as e:
+        _dbg(f"gguf layout check failed {path}: {e}")
+        return None
+
+
 def _checkpoint_dirs():
     """Dossiers a scanner pour les checkpoints single-file: principal + extra (si defini),
     sans doublon de chemin."""
@@ -587,6 +616,10 @@ def list_checkpoints():
                     _log(f"checkpoint skipped (GGUF architecture '{a}', this build only "
                          f"loads '{GGUF_ARCH}'; that model needs its own pipeline and "
                          f"text encoder/VAE): {f}")
+                    continue
+                lay = _gguf_layout_unsupported(os.path.join(d, f))
+                if lay:
+                    _log(f"checkpoint skipped ({lay}): {f}")
                     continue
             seen.add(f)
             out.append(f)
@@ -849,6 +882,10 @@ def _load_transformer():
             if _is_gguf_path(ZIMAGE_TRANSFORMER):
                 # transformer Qwen GGUF (quantifie) -> tient en VRAM (~11 Go en Q4) et
                 # reste rapide. Le VAE + encodeur texte viennent du repo de base (cache).
+                lay = _gguf_layout_unsupported(ZIMAGE_TRANSFORMER)
+                if lay:
+                    raise RuntimeError(
+                        f"{os.path.basename(ZIMAGE_TRANSFORMER)}: {lay}.")
                 from diffusers import GGUFQuantizationConfig
                 _log(f"loading Qwen transformer (GGUF, quantized): {ZIMAGE_TRANSFORMER} ...")
                 # config/subfolder = archi du transformer depuis le repo de base (cache),
