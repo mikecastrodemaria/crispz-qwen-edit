@@ -3,6 +3,22 @@
 All notable changes to crispz-studio. One versioned entry per feature.
 The app version lives in `cz_core.py` (`APP_VERSION`) and is shown in the browser tab title.
 
+## Unreleased — GGUF: reject non-standard tensor layouts with a clear message
+
+**Why.** Some Civitai GGUFs (e.g. `realismByStableYogi_v15TurboGGUF.gguf`) declare
+`general.architecture=qwen_image` but were converted with a compact renamed tensor
+scheme (`blocks.0.attn.wq`, `txtmlp`, `tproj`… — a stable-diffusion.cpp-style layout).
+diffusers' GGUF loader can only map the ORIGINAL Qwen key names (QuantStack/city96-style
+GGUFs): with such a file zero keys match, every weight stays on the `meta` device and
+generation crashes with the cryptic *"Cannot copy out of meta tensor; no data!"*.
+
+**What.** New `_gguf_layout_unsupported()` header check (reads tensor names only, no
+weights): such files are now **skipped from the checkpoint list** with an explicit log
+line, and force-loading one raises a clear error naming the file and the fix (use a
+QuantStack/city96 GGUF or the BF16/FP16 `.safetensors` build). Validated on the real
+file (rejected) and the three standard-layout GGUFs (Edit-2509, Rapid-AIO, qwen-image —
+still listed); smoke 22/22.
+
 ## Unreleased — Thumbnail cache: app-folder default, UI field, and CLI flags for the new features
 
 - **New default location**: the Asset Browser thumbnail cache now lives in **`<app>/cache/`**
