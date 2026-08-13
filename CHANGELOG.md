@@ -3,6 +3,24 @@
 All notable changes to crispz-studio. One versioned entry per feature.
 The app version lives in `cz_core.py` (`APP_VERSION`) and is shown in the browser tab title.
 
+## Unreleased — FP8/INT8 "scaled" checkpoints loadable (dequantized at load)
+
+**Why.** Ported from crispz-studio: most CivitAI/HF Qwen-Image builds ship as ComfyUI
+**FP8/INT8 "scaled"** safetensors (e.g. `qwen_image_edit_2509_fp8_e4m3fn`, 19 GB vs
+38 GB bf16) and were skipped from the model list. GGUF was already supported here.
+
+**What.** ComfyUI-quantized safetensors (`X.weight` F8/I8 + `X.weight_scale` scalar or
+per-row + `X.comfy_quant` blob) are **dequantized in RAM to BF16** at load, then fed to
+`from_single_file` as a state dict (diffusers key conversion still applies). AIO bundles
+are filtered to `model.diffusion_model.*` (base VAE/text encoder reused). Tensors are
+read in file-offset order (HDD-friendly). Still refused with clear messages: misfiled
+LoRAs, SVDQuant/Nunchaku INT4, quantized checkpoints of a different architecture. Note:
+a dequantized FP8 has the RAM/VRAM footprint of the full BF16 build (~38 GB for
+Qwen-Image) — on this machine's 64 GB the GGUF builds remain the practical choice; the
+FP8 path mainly unlocks fine-tunes that ship in no other format. Validated: real-file
+detection (`fp8_e4m3fn` and `jibMixQwen` → dequant path, SVDQuant still rejected),
+synthetic dequant math + AIO filtering + guards (`tests/test_quant_formats.py`, 8 cases).
+
 ## Unreleased — Fix: a LoRA picked as checkpoint no longer hunts for an SD1.5 config
 
 **Why.** A LoRA file misfiled in a checkpoints folder (e.g. `ZITnsfwLoRAv3.safetensors`)
