@@ -3,6 +3,128 @@
 All notable changes to crispz-studio. One versioned entry per feature.
 The app version lives in `cz_core.py` (`APP_VERSION`) and is shown in the browser tab title.
 
+## 1.17.0 — Edit LoRA presets: task LoRAs on the edit pipe, fetched on first use
+
+The Reference (Omni) tab and the protocol op `edit` run on a SEPARATE pipe
+(Qwen-Image-Edit), and the LoRA slots only ever reached the base pipe:
+`_apply_loras` was called from `_ensure_base` / `_swap_transformer`, never from
+`_load_omni`. So `spec.loras` on an edit, or a LoRA slot while editing, was
+silently ignored - the edit came back without it and nothing said so.
+
+Now the edit pipe has its own LoRA set (`EDIT_LORAS`, `set_edit_loras`,
+`_apply_edit_loras`), hot-swapped in `generate_omni` through the same PEFT
+sync as the base (`_sync_adapters`, shared code). A failure there RAISES
+instead of degrading: the user asked for that LoRA, an edit without it is a
+wrong result, not a fallback.
+
+On top of it, the 19 task LoRAs of
+[Qwen-Image-Edit-2511-LoRAs-Fast-Lazy-Load](https://github.com/PRITHIVSAKTHIUR/Qwen-Image-Edit-2511-LoRAs-Fast-Lazy-Load)
+become presets (`cz_edit_loras.py`): Photo-to-Anime, Any-Light, Light-Migration,
+Upscaler (2K), Multiple-Angles, Style-Transfer, Polaroid, Pixar-3D, Noir comic,
+Studio-DeLight... Lazy: nothing is fetched at import; the first selection
+downloads the file from Hugging Face into `<loras_dir>/_hf-edit/<adapter>.safetensors`
+(ASCII name - two upstream files are named in Chinese), after which it is an
+ordinary LoRA file every existing path already understands. `config.txt
+edit_loras` adds/replaces/removes presets, `edit_loras_dir` moves the folder.
+
+- UI: a dropdown under the reference images (Reference (Omni) tab) lists the
+  presets (`✓` on disk, `⬇` to fetch), with a weight slider and a "Use example
+  prompt" button (the presets have no trigger word: the instruction is the
+  prompt). A checkbox "Edit LoRAs" in Models > LoRA switches the whole edit set
+  on/off without losing the selection - a one-click with/without comparison.
+- Protocol (v1, additive): `spec.loras` on op `edit` accepts a preset name
+  (`"Photo-to-Anime"`, `"upscale-2k:1.0"`) or a file, and lands on the edit
+  set, never on the base. `caps.edit_loras` lists the presets (name, prompt,
+  inputs, downloaded) and `supports.edit_presets` announces them. `guidance`
+  is now APPLIED on `edit` (a distilled Lightning/Rapid setup needs 1.0 while
+  the global slider stays at 4); on `gen` it keeps the v1 warning. An explicit
+  `width`/`height` on `edit` is passed to the pipe (`size_explicit`), so the
+  Upscaler preset can produce a 2x output; without it the edit keeps the
+  input size as before.
+
+Tests: `tests/test_edit_loras.py` (registry, lazy download under an ASCII
+name, separate set, hot-swap + checkbox, failure raises, protocol routing,
+caps), `test_protocol_edit.py` updated for the new `generate_omni` kwargs.
+
+## Unreleased — GGUF: the tensor layout outranks the declared architecture
+
+`general.architecture` is just a KV string, and conversion tools stamp it wrong:
+`chapel/hyphoria_qwen_v1.0` ships Qwen-Image GGUFs (1933 tensors, pure diffusers
+layout) declaring `wan`. The startup filter compared that string to `gguf_arch`
+and skipped them - 17 GB of a perfectly loadable model never reaching the
+dropdown, with a message blaming the wrong thing. The tensor NAMES are proof;
+the label is a hint. So the layout now decides:
+
+- Qwen-Image signature present -> accepted whatever the label says (a console
+  line reports the mismatch instead of hiding it);
+- foreign layout (stable-diffusion.cpp: `blocks.N.attn.wq`, `txtmlp`) ->
+  rejected as before, even when it declares `qwen_image` - still the real guard,
+  and still what catches `realismByStableYogi_v15TurboGGUF`;
+- layout undetermined -> the declared architecture keeps the last word.
+
+The existing `_GGUF_OK_PREFIXES` could NOT carry this: `transformer_blocks.`,
+`time_text_embed`, `norm_out` and `proj_out` are shared with FLUX, so trusting
+them over the label would have let a FLUX GGUF through. The new signature is
+`img_in.weight` + `txt_in.weight` + `txt_norm.weight`, which FLUX does not have
+(it uses `x_embedder`/`context_embedder`). Verified against the real files: both
+hyphoria GGUFs carry all three; the 7 local GGUFs are unchanged.
+
+Tests: `test_gguf_layout_beats_a_mislabelled_architecture`,
+`test_gguf_foreign_layout_still_rejected`,
+`test_gguf_flux_diffusers_layout_is_not_mistaken_for_qwen`,
+`test_list_checkpoints_accepts_the_mislabelled_gguf`.
+
+## Unreleased — the same fix on the non-quantized path + the crispz-krea2 loader methods
+
+Follow-up to the ComfyUI-prefix fix below, which only covered FP8/INT8 files.
+
+- **Non-quantized single-files too.** A plain bf16/fp16 `.safetensors` at the
+  ComfyUI layout hit the identical `Cannot copy out of meta tensor` crash: it
+  went straight to `from_single_file(path)`, and diffusers' identity mapping for
+  `QwenImageTransformer2DModel` never strips `model.diffusion_model.`. The layout
+  is now detected from the HEADER (`_safetensors_comfy_prefixed`, a few KB read)
+  and such files are read + un-prefixed before loading. No extra RAM cost -
+  `from_single_file` reads the whole checkpoint anyway - and NO dequant-cache
+  entry is written for them (nothing was dequantized; it would be a bf16 -> bf16
+  copy).
+- **Prefix stripped at READ time** (crispz-krea2 `_read_comfy_state_dict`
+  method), not on the way out: the arch guard, the weight-scale lookups and the
+  `comfy_quant` blobs all work on diffusers-layout keys now, and
+  `_quantization_metadata` layers are normalized once instead of being stored
+  under two variants.
+- **Dequant math on the GPU** (also from crispz-krea2): the cast + descale +
+  un-rotation is memory-bandwidth-bound on CPU (~9 min measured there on a 12.9B
+  INT8). It now runs tensor by tensor on the GPU when there is one - a few
+  hundred MB of VRAM at peak - and the state dict still comes back in RAM. New
+  config `convert_device`: `auto` (default) | `cpu`.
+
+Tests: `test_bf16_prefixed_is_detected_and_stripped`,
+`test_prefixed_single_file_is_loaded_as_a_state_dict` (proves the loader gets a
+state dict, not a path), `test_convert_device_cpu_is_respected`,
+`test_dequant_result_always_lands_on_cpu`.
+
+## Unreleased — FP8/INT8 checkpoints: strip the ComfyUI key prefix
+
+Every single-file Qwen checkpoint distributed by Comfy-Org / Civitai names its
+tensors `model.diffusion_model.*`. diffusers 0.39 registers
+`QwenImageTransformer2DModel` with an IDENTITY mapping function - it does no key
+conversion at all - so that prefix has to be gone before the state dict reaches
+`from_single_file`. The dequant loader filtered ON the prefix but never removed
+it: all 1933 keys landed as 'unexpected', not one weight was loaded, the model
+stayed on the 'meta' device and `dispatch_model` died with
+
+    NotImplementedError: Cannot copy out of meta tensor; no data!
+
+which read like a broken/incompatible checkpoint but hit EVERY FP8/INT8 Qwen
+single-file (qwen_image_edit_2509_fp8_e4m3fn, jibMixQwen_v60, ...). The prefix
+is now stripped on the way out of `_load_dequant_state_dict` (the internal
+lookups - weight scales, comfy_quant blobs - keep working on the raw keys).
+Verified against the real Edit-2509 FP8 file: stripped keys match
+`Qwen-Image`'s transformer state dict exactly, 1933/1933, no missing, no extra,
+no shape mismatch. Dequant-cache key bumped to `bf16-v2` so entries written
+before this fix (prefixed keys, unloadable) are never reused. Tests:
+`test_comfy_prefix_is_stripped` + `test_unprefixed_keys_left_alone`.
+
 ## Unreleased — prompt & negative boxes: capped growth + a visible scrollbar
 
 A long prompt used to grow the textarea unpredictably (Gradio-version

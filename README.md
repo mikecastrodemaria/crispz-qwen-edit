@@ -548,6 +548,22 @@ changing a weight is instant, swapping LoRA files takes ~1 s. Selecting LoRAs au
 merged **keywords / trigger words** (read from the file metadata); **Add to prompt**
 appends them.
 
+### Edit LoRA presets (Qwen-Image-Edit task LoRAs)
+
+The edit pipe (Reference (Omni) tab, protocol op `edit`) has its **own** LoRA set:
+the slots above only reach the txt2img/img2img transformer. Under the reference
+images, the **Edit LoRA** dropdown lists the 19 task LoRAs of
+[Qwen-Image-Edit-2511-LoRAs-Fast-Lazy-Load](https://github.com/PRITHIVSAKTHIUR/Qwen-Image-Edit-2511-LoRAs-Fast-Lazy-Load)
+(Photo-to-Anime, Any-Light, Light-Migration, Upscaler 2K, Multiple-Angles,
+Style-Transfer, Polaroid, Pixar-3D, noir comic, Studio-DeLight...). `⬇` = fetched
+from Hugging Face on first selection into `<loras_dir>/_hf-edit/<adapter>.safetensors`
+(then it is an ordinary LoRA file), `✓` = already on disk. They have **no trigger
+word**: the instruction is the prompt (**Use example prompt** fills the upstream
+example). Presets marked "2 images" want the image to edit in **Ref 1** and the
+reference (light, style) in **Ref 2**. The **Edit LoRAs** checkbox in Models → LoRA
+switches the whole edit set on/off without losing the selection. `config.txt`
+`edit_loras` adds/replaces/removes presets, `edit_loras_dir` moves the folder.
+
 ## Disabling the upscale (pure txt2img / pure img2img)
 
 - **txt2img only** (no upscale): the default. Don't pass `--upscale` (CLI), or leave
@@ -1071,6 +1087,15 @@ This tool speaks the crispz-family CLI protocol: `czp.bat gen --spec spec.json`
 one (hidden `cli_caps`/`cli_gen` endpoints - the app's queue serializes the
 GPU and the model stays warm) and only loads the pipeline itself when no
 instance answers (night batch; `--local`/`--remote URL` force a route).
+Ops: `gen`, `upscale` (`input` + `factor`/`denoise`; **`factor` 1 = pure img2img
+variation, no ESRGAN stage**), `edit` (image + instruction; needs an edit
+model - see `caps.supports.edit`). On `edit`, `spec.loras` accepts an edit preset
+name (`"Photo-to-Anime"`, `"upscale-2k:1.0"`, see `caps.edit_loras`) or a file, and
+lands on the edit pipe; `guidance` is applied there (distilled setups want 1.0),
+and an explicit `width`/`height` is passed to the pipe (Upscaler preset = 2x
+output). A broken `config.txt` (invalid JSON, e.g.
+single backslashes in a Windows path) is reported loudly at startup instead
+of silently falling back to the sample.
 `czp caps` prints capabilities and whether an instance is running. Exit codes:
 0 ok / 1 run error / 2 bad spec / 3 unsupported op or protocol / 4 no route.
 Config `cli_protocol.instance_url`. Contract + client reference:

@@ -43,7 +43,7 @@ import argparse
 import re
 import urllib.request
 
-from cz_core import CONFIG, APP_VERSION
+from cz_core import CONFIG, APP_VERSION, _log
 
 PROTOCOL = 1
 TOOL = "crispz-qwen-edit"
@@ -156,10 +156,24 @@ def caps_dict():
                          "faces": _faces_available(),
                          "detail_faces": _faces_available(),
                          "detail_hands": _hands_available(),
-                         "edit": _omni_configured()},
+                         "edit": _omni_configured(),
+                         "edit_presets": _omni_configured()},
             "model_loaded": _model_loaded(),
             "models": _list_model_files("checkpoints"),
-            "loras": _list_model_files("loras")}
+            "loras": _list_model_files("loras"),
+            # Presets d'edition (LoRA HF, telecharges a la demande): un appelant
+            # met leur `name` dans spec.loras sur l'op edit. `inputs` = 2 ->
+            # input + 1 ref (spec.refs). Listage leger, rien n'est telecharge.
+            "edit_loras": _edit_lora_catalog()}
+
+
+def _edit_lora_catalog():
+    try:
+        import cz_edit_loras
+        return cz_edit_loras.catalog()
+    except Exception as e:
+        _log(f"edit LoRA catalog unavailable: {e}")
+        return []
 
 
 # ----------------------------------------------------------------------------
@@ -238,6 +252,10 @@ def validate_spec(spec, op="gen"):
         out["input"] = inp
         spec = dict(spec)
         spec["refs"] = [inp]
+        # Taille DEMANDEE par l'appelant -> transmise au pipe d'edition
+        # (preset Upscaler: sortie 2x). Taille par defaut -> l'edition garde
+        # les dimensions natives de l'entree (comportement historique).
+        out["size_explicit"] = bool(spec.get("width") and spec.get("height"))
         if not spec.get("width") or not spec.get("height"):
             # taille par defaut = celle de l'image (alignee 32, bornee)
             try:
@@ -292,7 +310,15 @@ def validate_spec(spec, op="gen"):
             raise SpecError("invalid 'steps'")
     out["steps"] = steps
     if spec.get("guidance") is not None:
-        warnings.append("'guidance' not applied (v1: instance settings win)")
+        if op == "edit":
+            # Applique sur l'edition (surcharge par appel): un preset distille
+            # (Lightning / Rapid) veut 1.0 quand le curseur global reste a 4.
+            try:
+                out["guidance"] = float(spec["guidance"])
+            except (TypeError, ValueError):
+                raise SpecError("invalid 'guidance'")
+        else:
+            warnings.append("'guidance' not applied (v1: instance settings win)")
     refs = [str(r) for r in (spec.get("refs") or []) if str(r).strip()]
     if refs and not _omni_configured():
         warnings.append(f"{len(refs)} ref(s) ignored: no omni model "
@@ -351,7 +377,20 @@ def run_gen(spec, warnings=None, route="local"):
             slots.append((head, float(tail)))
         except ValueError:
             slots.append((str(s), cz_pipeline.LORA_WEIGHT))
-    if slots:
+    refs = spec.get("refs") or []
+    if refs and hasattr(cz_pipeline, "set_edit_loras"):
+        # Route omni/edit: les LoRA vont sur le pipe d'EDITION (jeu separe du
+        # base), un nom de preset cz_edit_loras y est resolu (telechargement
+        # a la demande). Sans loras -> le jeu d'edition est vide pour cet
+        # appel (la spec est autonome: elle ne subit pas les presets de l'UI).
+        cz_pipeline.set_edit_loras(slots)
+        cz_pipeline.set_edit_loras_enabled(True)
+    elif slots:
+        # Base, ou pipeline d'un outil de la famille sans jeu d'edition
+        # (cz_protocol.py est partage): ancien comportement, avec avertissement.
+        if refs:
+            warnings.append("loras applied on the base pipe (this pipeline "
+                            "has no edit LoRA set)")
         cz_pipeline.set_loras(slots)
     steps = spec.get("steps") or int(CONFIG.get("default_gen_steps", 8))
     # The seed is resolved HERE, the same way the UI does (cz_ui.run): a -1
@@ -371,9 +410,16 @@ def run_gen(spec, warnings=None, route="local"):
         t_o = time.time()
         imgs = [Image.open(r) for r in refs]
         try:
+            # kwargs seulement quand demandes: la signature historique de
+            # generate_omni (outils de la famille) reste valide sinon.
+            extra = {}
+            if spec.get("guidance") is not None:
+                extra["guidance"] = float(spec["guidance"])
+            if spec.get("size_explicit"):
+                extra["honor_size"] = True
             img = cz_pipeline.generate_omni(
                 imgs, spec["prompt"], spec.get("negative", ""),
-                spec["width"], spec["height"], steps, seed_used)
+                spec["width"], spec["height"], steps, seed_used, **extra)
         finally:
             for im in imgs:
                 try:
@@ -429,6 +475,24 @@ def run_gen(spec, warnings=None, route="local"):
             "warnings": warnings}
 
 
+def _pick_esrgan(models, factor):
+    """Default ESRGAN model for a factor when the spec names none: the config
+    default if present, else the first model whose name announces the closest
+    scale (4x for factor 4, 2x for 2...), else the first 4x/2x, else the first
+    one - never a 16x by accident."""
+    if not models:
+        return None
+    cfg = str(CONFIG.get("default_esrgan_model") or "").strip()
+    if cfg in models:
+        return cfg
+    want = max(2, min(8, int(round(factor))))
+    for scale in (want, 4, 2, 8):
+        for m in models:
+            if m.lower().startswith(f"{scale}x"):
+                return m
+    return models[0]
+
+
 def run_upscale(spec, warnings=None, route="local"):
     """Upscale UNE image (ESRGAN + refine, le pipeline de l'outil) depuis un
     spec VALIDE. Sortie print de la famille: les cases BD generees a ~1 MP
@@ -442,17 +506,23 @@ def run_upscale(spec, warnings=None, route="local"):
 
     warnings = list(warnings or [])
     t0 = time.time()
-    models = cz_esrgan.list_esrgan_models()
+    factor = float(spec.get("factor", 2.0) or 2.0)
+    # factor <= 1 = pure img2img (variation): NO ESRGAN stage at all. Picking
+    # the first model of the folder for a 1x pass once ran a 16x upscaler on a
+    # 1280x832 panel (10+ min, 32 GB VRAM) just to shrink it back.
+    do_esrgan = factor > 1.0
+    models = cz_esrgan.list_esrgan_models() if do_esrgan else []
     model = None
-    if spec.get("model"):
-        model = spec["model"] if spec["model"] in models else None
+    if do_esrgan:
+        if spec.get("model"):
+            model = spec["model"] if spec["model"] in models else None
+            if model is None:
+                warnings.append(f"ESRGAN model '{spec['model']}' not found - "
+                                f"using {_pick_esrgan(models, factor) or 'none'}")
         if model is None:
-            warnings.append(f"ESRGAN model '{spec['model']}' not found - "
-                            f"using {models[0] if models else 'none'}")
-    if model is None:
-        model = models[0] if models else None
-    if model is None:
-        raise RuntimeError(f"no ESRGAN model in {cz_esrgan.ESRGAN_DIR}")
+            model = _pick_esrgan(models, factor)
+        if model is None:
+            raise RuntimeError(f"no ESRGAN model in {cz_esrgan.ESRGAN_DIR}")
     denoise = spec.get("denoise")
     if denoise is None:
         denoise = float(CONFIG.get("default_denoise", 0.30))
@@ -461,10 +531,10 @@ def run_upscale(spec, warnings=None, route="local"):
                                                            12)))
     with Image.open(spec["input"]) as im:
         img, timings = cz_pipeline.process_one(
-            im.convert("RGB"), model, spec.get("factor", 2.0), denoise,
+            im.convert("RGB"), model, factor, denoise,
             steps, spec.get("prompt", ""), spec.get("seed", -1),
             int(CONFIG.get("default_tile", 0)),
-            int(CONFIG.get("default_overlap", 16)))
+            int(CONFIG.get("default_overlap", 16)), do_esrgan=do_esrgan)
     path = build_output_path(None, "local", spec.get("out_dir"), "png",
                              tag="czp_upscale", seed=spec.get("seed", -1),
                              size=img.size)
