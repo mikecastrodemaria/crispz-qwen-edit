@@ -792,6 +792,54 @@ def _apply_loras(*vals):
             + " (applied on next run — no model reload).")
 
 
+def _edit_lora_choices():
+    """Libelles du dropdown des presets d'edition ('Nom ✓' sur disque, 'Nom ⬇' a
+    telecharger). Recalcule a chaque appel: un telechargement change le libelle."""
+    import cz_edit_loras
+    return ["None"] + [cz_edit_loras.status_label(n) for n in cz_edit_loras.names()]
+
+
+def _ui_edit_lora_apply(label, weight, progress=gr.Progress()):
+    """Dropdown / poids du preset d'edition -> cz_pipeline.set_edit_loras (telecharge le
+    LoRA du hub a la premiere selection). Renvoie (update dropdown, statut)."""
+    import cz_edit_loras
+    name = cz_edit_loras.strip_label(label)
+    if not name or name == "None":
+        cz_pipeline.set_edit_loras([])
+        return gr.update(), "Edit LoRA: none."
+    try:
+        if not cz_edit_loras.is_downloaded(name):
+            progress(0.0, desc=f"Downloading {name} from Hugging Face...")
+        cz_pipeline.set_edit_loras([(name, float(weight))])
+    except Exception as e:
+        _log(f"edit LoRA apply failed: {e}")
+        return gr.update(), f"Edit LoRA error: {e}"
+    s = cz_edit_loras.spec(name)
+    on = cz_pipeline.EDIT_LORAS_ENABLED
+    note = (f"Edit LoRA: **{name}**@{float(weight):g}"
+            + ("" if on else " (checkbox *Edit LoRAs* is OFF in Models > LoRA: not applied)")
+            + (". Needs **Ref 1 + Ref 2** (input + reference)." if int(s.get("inputs", 1)) == 2
+               else ". Put the image to edit in **Ref 1**.")
+            + f"  \nExample prompt: *{s.get('prompt', '')}*")
+    return gr.update(choices=_edit_lora_choices(),
+                     value=cz_edit_loras.status_label(name)), note
+
+
+def _ui_edit_lora_prompt(label, current):
+    """Bouton 'Use example prompt': met l'instruction d'exemple du preset dans le prompt
+    (le prompt courant est garde s'il n'y a pas de preset)."""
+    import cz_edit_loras
+    s = cz_edit_loras.spec(cz_edit_loras.strip_label(label))
+    if not s or not s.get("prompt"):
+        return gr.update(value=current)
+    return gr.update(value=s["prompt"])
+
+
+def _ui_edit_loras_enabled(on):
+    cz_pipeline.set_edit_loras_enabled(on)
+    return f"Edit LoRAs {'ON' if on else 'OFF'} (applied on the next edit, no reload)."
+
+
 def _path_for_lora(name):
     if not name or name in ("None", "none", ""):
         return None
@@ -3264,6 +3312,26 @@ def build_ui():
                             with gr.Row():
                                 ref3 = _crop_input("Ref 3", 220)
                                 ref4 = _crop_input("Ref 4", 220)
+                            # Presets d'edition (LoRA HF "Qwen-Image-Edit-2511 fast lazy
+                            # load"): poses sur le pipe d'EDITION seulement, telecharges a
+                            # la premiere selection. Case ON/OFF dans Models > LoRA.
+                            with gr.Row():
+                                edit_lora_dd = gr.Dropdown(
+                                    choices=_edit_lora_choices(), value="None",
+                                    label="Edit LoRA (Qwen-Image-Edit-2511 fast presets)",
+                                    info="✓ = on disk, ⬇ = fetched from Hugging Face on first "
+                                         "use. Photo-to-Anime, Any-Light, Upscaler, "
+                                         "Multiple-Angles... No trigger word: describe the edit.",
+                                    scale=3)
+                                edit_lora_w = gr.Slider(cz_pipeline.LORA_WEIGHT_MIN,
+                                                        cz_pipeline.LORA_WEIGHT_MAX,
+                                                        value=1.0, step=0.05,
+                                                        label="Edit LoRA weight", scale=2,
+                                                        elem_classes="cz-lora-weight")
+                            with gr.Row():
+                                edit_lora_prompt_btn = gr.Button("Use example prompt", size="sm")
+                                edit_lora_refresh_btn = gr.Button("Refresh presets", size="sm")
+                            edit_lora_status = gr.Markdown("")
 
                         with gr.Tab("Face Swap"):
                             gr.Markdown("*Post-process: replace the face in the result with this "
@@ -3522,6 +3590,12 @@ def build_ui():
                                 lora_kw_btn = gr.Button("Get keywords", size="sm")
                                 lora_kw_to_prompt_btn = gr.Button("Add to prompt", size="sm", variant="primary")
                             lora_status = gr.Markdown("")
+                            edit_loras_cb = gr.Checkbox(
+                                value=cz_pipeline.EDIT_LORAS_ENABLED,
+                                label="Edit LoRAs (Qwen-Image-Edit presets)",
+                                info="Applies the edit LoRA chosen under the reference images "
+                                     "(Reference (Omni) tab) on the EDIT pipe. Off = the preset "
+                                     "is kept but not applied (with/without comparison).")
 
                         with gr.Accordion("\U0001F3B2 Wildcards", open=False):
                             gr.Markdown("*`__name__` in the prompt -> a random line from name.txt "
@@ -3759,6 +3833,16 @@ def build_ui():
                              [omni_model_tb], [omni_status])
         omni_check_btn.click(_ui_check_omni, None, [omni_status])
         omni_check_btn2.click(_ui_check_omni, None, [omni_status2])
+        # Presets d'edition: .input (action utilisateur) et non .change, car la
+        # reponse met a jour le dropdown lui-meme (libelle ⬇ -> ✓ apres telechargement).
+        edit_lora_dd.input(_ui_edit_lora_apply, [edit_lora_dd, edit_lora_w],
+                           [edit_lora_dd, edit_lora_status])
+        edit_lora_w.release(_ui_edit_lora_apply, [edit_lora_dd, edit_lora_w],
+                            [edit_lora_dd, edit_lora_status])
+        edit_lora_prompt_btn.click(_ui_edit_lora_prompt, [edit_lora_dd, prompt], [prompt])
+        edit_lora_refresh_btn.click(lambda: gr.update(choices=_edit_lora_choices()),
+                                    None, [edit_lora_dd])
+        edit_loras_cb.change(_ui_edit_loras_enabled, [edit_loras_cb], [edit_lora_status])
         ab_reindex_btn.click(_ui_ab_reindex,
                              [output_dir, ab_thumb_size, ab_quality, ab_blur, ab_gen_thumbs],
                              [ab_open_link, ab_status])

@@ -32,7 +32,7 @@ import torch
 from PIL import Image
 
 # Version de l'application (affichee dans le titre; entrees CHANGELOG.md par version).
-APP_VERSION = "1.16.0"
+APP_VERSION = "1.17.0"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PREFS_PATH = os.path.join(HERE, "preferences.json")
@@ -66,8 +66,15 @@ def _load_config():
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     return json.load(f) or {}
-            except Exception:
-                pass
+            except Exception as e:
+                # Never silent: a broken config.txt used to fall back to the
+                # sample without a word (wrong offload, wrong models, hours
+                # lost). Windows paths are the classic cause.
+                print(f"[crispz] WARNING: {os.path.basename(path)} is not valid "
+                      f"JSON ({e}) -> IGNORED, falling back to the next config. "
+                      f"Hint: in JSON, write Windows paths with forward slashes "
+                      f"(D:/models/x.gguf) or doubled backslashes (D:\\models).",
+                      flush=True)
     return {}
 
 

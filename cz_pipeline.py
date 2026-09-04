@@ -124,6 +124,13 @@ _LOADED_KEY = None
 # LoRA reellement posees sur _BASE_PIPE (liste de (chemin, poids)). Sert a echanger les
 # LoRA a chaud sans recharger le modele: si ca diverge de LORAS, _apply_loras resynchronise.
 _APPLIED_LORAS = []
+# LoRA d'EDITION (pipe omni / Qwen-Image-Edit): jeu SEPARE du base, car le transformer
+# d'edition est un autre modele (les presets cz_edit_loras visent 2509/2511). Meme
+# format (chemin, poids). EDIT_LORAS_ENABLED = la case "Edit LoRAs" de l'UI: OFF -> le
+# jeu est memorise mais pas pose (permet de comparer avec/sans en un clic).
+EDIT_LORAS = []
+EDIT_LORAS_ENABLED = bool(CONFIG.get("edit_loras_enabled", True))
+_APPLIED_EDIT_LORAS = []
 
 # Palier 2 (cohabitation VRAM): offload CPU de la passe diffusion. none = tout en VRAM.
 # model = decharge par sous-module (bon compromis). sequential = plus agressif, plus lent.
@@ -249,10 +256,13 @@ def set_guidance(g):
     GUIDANCE = float(g)
 
 
-def _cfg(negative=None):
+def _cfg(negative=None, guidance=None):
     """kwargs CFG communs a tous les pipelines Qwen : `true_cfg_scale` = curseur guidance
-    de l'UI (vrai CFG, active le negative prompt), `guidance_scale` distille fixe a 1.0."""
-    return {"true_cfg_scale": float(GUIDANCE), "guidance_scale": 1.0,
+    de l'UI (vrai CFG, active le negative prompt), `guidance_scale` distille fixe a 1.0.
+    `guidance` = surcharge par appel (protocole edit: un modele distille veut 1.0 quand
+    le curseur global reste a 4.0)."""
+    g = float(GUIDANCE) if guidance is None else float(guidance)
+    return {"true_cfg_scale": g, "guidance_scale": 1.0,
             "negative_prompt": (negative or None)}
 
 
@@ -559,6 +569,13 @@ def _safetensors_dequant(path):
 # architecture (il chargerait des poids incoherents).
 _QWEN_KEY_MARKERS = ("transformer_blocks.", "img_in", "txt_in", "time_text_embed")
 
+# Prefixe ComfyUI/LDM des checkpoints diffusion single-file. diffusers 0.39 mappe
+# QwenImageTransformer2DModel avec une fonction IDENTITE (aucune conversion de cles):
+# le state dict doit donc arriver AU LAYOUT DIFFUSERS, prefixe retire. Sinon toutes les
+# cles sont "unexpected", aucun poids n'est charge, le modele reste sur 'meta' et
+# dispatch_model casse sur "Cannot copy out of meta tensor; no data!".
+_COMFY_PREFIX = "model.diffusion_model."
+
 
 # ----------------------------------------------------------------------------
 # Cache disque des transformers dequantifies (FP8/INT8 ComfyUI -> bf16), porte
@@ -606,7 +623,8 @@ def _dequant_cache_path(src):
         p, size, mtime = _file_key(src)
     except OSError:
         return None
-    h = _dqhash.sha1(f"{p.lower()}|{size}|{mtime}|bf16".encode("utf-8")).hexdigest()[:16]
+    h = _dqhash.sha1(
+        f"{p.lower()}|{size}|{mtime}|bf16-v2".encode("utf-8")).hexdigest()[:16]
     base = os.path.splitext(os.path.basename(src))[0][:48]
     return os.path.join(d, f"{base}.{h}.safetensors")
 
@@ -687,9 +705,21 @@ def _hadamard_ortho(n):
     return H / (float(n) ** 0.5)
 
 
+def _safetensors_comfy_prefixed(path):
+    """True si le .safetensors est au layout ComfyUI ('model.diffusion_model.*').
+    Lit juste l'en-tete. Un tel fichier ne peut PAS partir tel quel dans
+    from_single_file (mapping identite cote diffusers, cf. _COMFY_PREFIX)."""
+    try:
+        return any(k.startswith(_COMFY_PREFIX)
+                   for k in _safetensors_header(path) if k != "__metadata__")
+    except Exception:
+        return False
+
+
 def _load_dequant_state_dict(path):
-    """Charge en RAM un checkpoint 'scaled' ComfyUI (FP8/INT8) et le dequantifie en
-    DTYPE (bf16), tenseur par tenseur:
+    """Charge en RAM un single-file ComfyUI et le rend au LAYOUT DIFFUSERS, dequantifie
+    en DTYPE (bf16) tenseur par tenseur. Sert les deux cas: quantifie (FP8/INT8 'scaled')
+    et simplement PREFIXE (bf16/fp16 -- rien a dequantifier, juste le prefixe a retirer):
       - bundle AIO (transformer + encodeur texte + VAE): seules les cles
         'model.diffusion_model.*' sont gardees (VAE + encodeur = repo de base);
       - X.weight (F8/I8) * X.weight_scale (scalaire ou par ligne) -> bf16;
@@ -707,13 +737,16 @@ def _load_dequant_state_dict(path):
     entries = [(k, v) for k, v in hdr.items()
                if k != "__metadata__" and isinstance(v, dict)]
     # Bundle AIO: ne garder que le transformer. (Sans prefixe ComfyUI = fichier
-    # transformer-only au layout original -> pas de filtre.)
-    if any(k.startswith("model.diffusion_model.") for k, _ in entries):
-        entries = [(k, v) for k, v in entries
-                   if k.startswith("model.diffusion_model.")]
+    # transformer-only au layout original -> pas de filtre.) Methode crispz-krea2:
+    # le prefixe est retire des la LECTURE, tout l'aval (scales, qcfg, garde d'archi,
+    # state dict rendu) travaille donc sur des cles au layout diffusers, sans variante.
+    prefix = ""
+    if any(k.startswith(_COMFY_PREFIX) for k, _ in entries):
+        prefix = _COMFY_PREFIX
+        entries = [(k, v) for k, v in entries if k.startswith(prefix)]
     # Garde d'architecture: un checkpoint quantifie d'un AUTRE modele (cles sans
     # aucun marqueur Qwen-Image) chargerait des poids incoherents -> refus clair.
-    if not any(any(m in k for m in _QWEN_KEY_MARKERS) for k, _ in entries):
+    if not any(any(m in k[len(prefix):] for m in _QWEN_KEY_MARKERS) for k, _ in entries):
         raise RuntimeError(
             f"{os.path.basename(path)}: quantized checkpoint does not look like a "
             "Qwen-Image transformer (different architecture); this build only loads "
@@ -734,23 +767,33 @@ def _load_dequant_state_dict(path):
             "_quantization_metadata") or "{}")
         for lk, lv in (qm.get("layers") or {}).items():
             if isinstance(lv, dict):
-                qcfg[lk] = lv
-                qcfg["model.diffusion_model." + lk] = lv   # variante AIO prefixee
+                qcfg[lk[len(prefix):] if prefix and lk.startswith(prefix) else lk] = lv
         if qcfg:
-            _dbg(f"quantization metadata: {len(qm.get('layers') or {})} layer(s) "
-                 "declared in header")
+            _dbg(f"quantization metadata: {len(qcfg)} layer(s) declared in header")
     except Exception as e:
         _dbg(f"_quantization_metadata unreadable: {e}")
     with safe_open(path, framework="pt", device="cpu") as f:
         for k, _ in entries:
-            if k.endswith(".comfy_quant"):   # blob JSON: format + convrot eventuels
+            kk = k[len(prefix):]
+            if kk.endswith(".comfy_quant"):  # blob JSON: format + convrot eventuels
                 try:
-                    qcfg[k[:-len(".comfy_quant")]] = json.loads(
+                    qcfg[kk[:-len(".comfy_quant")]] = json.loads(
                         bytes(f.get_tensor(k).tolist()).decode("utf-8"))
                 except Exception as e:
                     _dbg(f"comfy_quant blob unreadable {k}: {e}")
                 continue
-            raw[k] = f.get_tensor(k)
+            raw[kk] = f.get_tensor(k)
+    # Le calcul de dequantification (cast fp32 + scales + un-rotation) est limite par la
+    # BANDE PASSANTE MEMOIRE en CPU (mesure crispz-krea2: ~9 min sur un INT8 12.9B): on le
+    # fait sur le GPU quand il y en a un, tenseur par tenseur (quelques centaines de Mo de
+    # VRAM au plus), retour bf16 en RAM. config convert_device: auto (defaut) | cpu.
+    dev = "cpu"
+    try:
+        if (torch.cuda.is_available()
+                and str(CONFIG.get("convert_device", "auto")).lower() != "cpu"):
+            dev = "cuda"
+    except Exception:
+        pass
     _had = {}                                # cache Hadamard par taille de groupe
     sd = {}
     n_dq = n_rot = 0
@@ -769,9 +812,9 @@ def _load_dequant_state_dict(path):
                 if cand and cand in raw:
                     s = raw[cand]
                     break
-            t = t.to(torch.float32)
+            t = t.to(dev).to(torch.float32)
             if s is not None:                # scalaire ou [out,1] -> broadcast
-                t = t * s.to(torch.float32)
+                t = t * s.to(dev).to(torch.float32)
             # ConvRot (int8_tensorwise comfy-quants): les poids stockes ont ete tournes
             # W_rot = (W.view(out, in/g, g) @ H.T).reshape(...) AVANT quantification ->
             # reconstruction = re-multiplier par H (orthonormee, symetrique) par groupe.
@@ -780,16 +823,23 @@ def _load_dequant_state_dict(path):
                 g = int(cfg.get("convrot_groupsize", 256) or 256)
                 if t.dim() == 2 and g > 1 and t.shape[1] % g == 0:
                     if g not in _had:
-                        _had[g] = _hadamard_ortho(g)
+                        _had[g] = _hadamard_ortho(g).to(dev)
                     t = (t.view(t.shape[0], -1, g) @ _had[g]).reshape(t.shape[0], -1)
                     n_rot += 1
-            t = t.to(DTYPE)
+            t = t.to(DTYPE).cpu()
             n_dq += 1
         elif t.is_floating_point() and t.dtype != DTYPE:
             t = t.to(DTYPE)
         sd[k] = t
     raw.clear()
-    _log(f"dequantized {n_dq} tensors ({len(sd)} kept"
+    if dev != "cpu":
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+    _log((f"dequantized {n_dq} tensors on {dev}" if n_dq
+          else "read (already bf16/fp16, no dequant)")
+         + f" ({len(sd)} kept"
          + (f", {n_rot} un-rotated (ConvRot)" if n_rot else "")
          + f") to bf16 in {time.time() - t0:.1f}s")
     return sd
@@ -858,24 +908,45 @@ def _gguf_arch(path, max_kv=64):
 _GGUF_OK_PREFIXES = ("transformer_blocks.", "img_in", "txt_in", "time_text_embed",
                      "norm_out", "proj_out")
 
+# Signature qui identifie POSITIVEMENT un transformer Qwen-Image, par opposition aux
+# autres DiT diffusers. Les prefixes ci-dessus sont trop laches pour ca: 'transformer_
+# blocks.', 'time_text_embed', 'norm_out' et 'proj_out' existent AUSSI chez FLUX (qui
+# nomme ses entrees x_embedder/context_embedder). Ces trois cles-la, non:
+_QWEN_GGUF_SIGNATURE = ("img_in.weight", "txt_in.weight", "txt_norm.weight")
+
+
+def _gguf_layout(path):
+    """Etat du layout de tenseurs d'un .gguf, lu a l'en-tete (gguf mmap):
+      'qwen'    -> signature Qwen-Image presente: c'est une PREUVE, bien plus fiable que
+                   le 'general.architecture' declare (des outils de conversion tamponnent
+                   n'importe quoi -- vu 'wan' sur des Qwen-Image parfaitement valides);
+      'foreign' -> des noms lisibles, mais aucun marqueur diffusers connu (conversion
+                   type stable-diffusion.cpp: blocks.N.attn.wq, txtmlp, tproj...);
+      'unknown' -> en-tete illisible ou layout diffusers sans la signature Qwen: on ne
+                   tranche pas ici, l'archi declaree reste le juge."""
+    try:
+        from gguf import GGUFReader
+        names = [t.name for t in GGUFReader(path).tensors]
+        if not names:
+            return "unknown"
+        if all(any(n == sig for n in names) for sig in _QWEN_GGUF_SIGNATURE):
+            return "qwen"
+        if any(n.startswith(_GGUF_OK_PREFIXES) for n in names):
+            return "unknown"
+        return "foreign"
+    except Exception as e:
+        _dbg(f"gguf layout check failed {path}: {e}")
+        return "unknown"
+
 
 def _gguf_layout_unsupported(path):
     """Renvoie une raison (str) si le .gguf n'utilise PAS le layout de tenseurs Qwen
-    original attendu par diffusers, sinon None. Lecture d'en-tete seule (gguf mmap)."""
-    try:
-        from gguf import GGUFReader
-        r = GGUFReader(path)
-        names = [t.name for t in r.tensors]
-        if not names:
-            return None                      # illisible -> ne pas ecarter a tort
-        if any(n.startswith(_GGUF_OK_PREFIXES) for n in names):
-            return None
-        return ("GGUF with a non-standard tensor layout (e.g. stable-diffusion.cpp "
-                "conversion); diffusers cannot map it — use a QuantStack/city96-style "
-                "GGUF or the BF16/FP16 .safetensors build")
-    except Exception as e:
-        _dbg(f"gguf layout check failed {path}: {e}")
+    attendu par diffusers, sinon None. Lecture d'en-tete seule."""
+    if _gguf_layout(path) != "foreign":
         return None
+    return ("GGUF with a non-standard tensor layout (e.g. stable-diffusion.cpp "
+            "conversion); diffusers cannot map it — use a QuantStack/city96-style "
+            "GGUF or the BF16/FP16 .safetensors build")
 
 
 def _checkpoint_dirs():
@@ -888,10 +959,12 @@ def _checkpoint_dirs():
 
 
 def list_checkpoints():
-    """Modeles Z-Image single-file (.safetensors) des dossiers checkpoints (principal +
-    extra, fusionnes dans une seule liste). Exclut les checkpoints FP8 (non charges par
-    diffusers; prendre la version BF16/FP16). En cas de meme nom de fichier, le dossier
-    principal a la priorite."""
+    """Modeles Qwen-Image single-file (.safetensors / .gguf) des dossiers checkpoints
+    (principal + extra, fusionnes dans une seule liste). Les FP8/INT8 'scaled' ComfyUI
+    sont acceptes (loader dequant, cf. _safetensors_dequant); seuls restent ecartes,
+    avec leur raison: LoRA egarees, SVDQuant/Nunchaku INT4, GGUF d'une autre archi ou
+    au layout sd.cpp. En cas de meme nom de fichier, le dossier principal a la
+    priorite."""
     out = []
     seen = set()
     for d in _checkpoint_dirs():
@@ -908,16 +981,24 @@ def list_checkpoints():
                     _log(f"checkpoint skipped ({reason}): {f}")
                     continue
             if f.lower().endswith(".gguf"):
-                a = _gguf_arch(os.path.join(d, f))
-                # a=None -> en-tete illisible: on laisse passer (ne pas ecarter a tort).
-                if a and a != GGUF_ARCH:
+                fp = os.path.join(d, f)
+                lay, a = _gguf_layout(fp), _gguf_arch(fp)
+                # Le LAYOUT prime sur l'archi declaree: les noms de tenseurs sont une
+                # preuve, le KV 'general.architecture' une simple etiquette -- et des
+                # outils de conversion la tamponnent faux (Qwen-Image publies en 'wan').
+                if lay == "foreign":
+                    _log(f"checkpoint skipped ({_gguf_layout_unsupported(fp)}): {f}")
+                    continue
+                if lay == "qwen":
+                    if a and a != GGUF_ARCH:
+                        _log(f"GGUF declares architecture '{a}' but its tensors ARE a "
+                             f"Qwen-Image transformer (mislabelled by the conversion "
+                             f"tool) -> loaded anyway: {f}")
+                # layout indetermine -> l'archi declaree reste le juge.
+                elif a and a != GGUF_ARCH:
                     _log(f"checkpoint skipped (GGUF architecture '{a}', this build only "
                          f"loads '{GGUF_ARCH}'; that model needs its own pipeline and "
                          f"text encoder/VAE): {f}")
-                    continue
-                lay = _gguf_layout_unsupported(os.path.join(d, f))
-                if lay:
-                    _log(f"checkpoint skipped ({lay}): {f}")
                     continue
             seen.add(f)
             out.append(f)
@@ -1035,13 +1116,47 @@ def set_loras(slots):
              + " -> applied on next run (hot-swap, no model reload)")
 
 
+def set_edit_loras(slots):
+    """Definit les LoRA d'EDITION (pipe omni). slots = liste de (nom_ou_None, poids);
+    un nom est un preset cz_edit_loras (telecharge a la demande), un chemin absolu, ou un
+    fichier relatif a LORAS_DIR. Ignore les None. Applique a chaud au prochain
+    generate_omni (_apply_edit_loras). Leve si un preset ne peut pas etre telecharge."""
+    global EDIT_LORAS
+    import cz_edit_loras
+    new = []
+    for name, weight in slots:
+        if not name or name in ("None", "none", ""):
+            continue
+        name = cz_edit_loras.strip_label(name) if isinstance(name, str) else name
+        if cz_edit_loras.spec(name) is not None:
+            p = cz_edit_loras.resolve(name)
+        else:
+            p = name if os.path.isabs(name) else os.path.join(LORAS_DIR, name)
+        new.append((p, float(weight)))
+    if new != EDIT_LORAS:
+        EDIT_LORAS = new
+        _log("edit LoRAs -> " + (", ".join(f"{os.path.basename(p)}@{w}" for p, w in new)
+                                or "(none)") + " -> applied on next edit (hot-swap)")
+
+
+def set_edit_loras_enabled(on):
+    """Case 'Edit LoRAs': ON = le jeu EDIT_LORAS est pose sur le pipe omni, OFF = retire
+    (le jeu reste memorise). Sans rechargement."""
+    global EDIT_LORAS_ENABLED
+    on = bool(on)
+    if on != EDIT_LORAS_ENABLED:
+        EDIT_LORAS_ENABLED = on
+        _log(f"edit LoRAs {'enabled' if on else 'disabled'}")
+
+
 def set_omni_model(repo):
     """Definit le modele Omni/Edit (repo HF ou dossier). Invalide le pipe omni."""
-    global OMNI_MODEL
+    global OMNI_MODEL, _APPLIED_EDIT_LORAS
     repo = (repo or "").strip()
     if repo != OMNI_MODEL:
         OMNI_MODEL = repo
         _DERIVED.pop("omni", None)
+        _APPLIED_EDIT_LORAS = []
         _log(f"Omni model -> {repo or '(none)'}")
 
 
@@ -1272,6 +1387,21 @@ def _load_transformer():
             # config/subfolder = archi du transformer depuis le repo de base (deja en cache),
             # comme pour le GGUF: sans ca, from_single_file ne sait pas la structure et va
             # chercher un repo par defaut -> echec en mode offline (HF_HUB_OFFLINE=1).
+            if _safetensors_comfy_prefixed(ZIMAGE_TRANSFORMER):
+                # Layout ComfyUI SANS quantification: diffusers ne convertit pas les cles
+                # Qwen (mapping identite), un passage direct du chemin laisserait le modele
+                # sur 'meta'. On lit et on deprefixe nous-memes -- meme cout RAM, puisque
+                # from_single_file charge de toute facon tout le checkpoint. Pas de cache
+                # disque ici: il n'y a rien de dequantifie a memoriser, ce serait une
+                # copie bf16 -> bf16.
+                _log(f"loading Qwen transformer (single-file, ComfyUI layout -> "
+                     f"diffusers): {ZIMAGE_TRANSFORMER} ...")
+                sd = _load_dequant_state_dict(ZIMAGE_TRANSFORMER)
+                return _load_monitor(
+                    f"transformer {os.path.basename(ZIMAGE_TRANSFORMER)}",
+                    lambda: QwenImageTransformer2DModel.from_single_file(
+                        sd, config=BASE_REPO, subfolder="transformer",
+                        torch_dtype=DTYPE))
             _log(f"loading Qwen transformer (single-file): {ZIMAGE_TRANSFORMER} ...")
             return _load_monitor(
                 f"transformer {os.path.basename(ZIMAGE_TRANSFORMER)}",
@@ -1317,34 +1447,35 @@ def _clear_loras(pipe):
         _dbg(f"delete_adapters: {e}")
 
 
-def _apply_loras(pipe, force=False):
-    """Synchronise les adaptateurs LoRA du pipe avec LORAS, SANS recharger le modele.
+def _sync_adapters(pipe, wanted, applied, force=False, tag="LoRA"):
+    """Synchronise les adaptateurs PEFT d'un pipe avec le jeu `wanted`, SANS recharger
+    le modele. `applied` = jeu reellement pose sur ce pipe (liste de (chemin, poids)).
 
     Le transformer reste en VRAM; seuls les adaptateurs PEFT bougent:
       - memes fichiers, poids differents -> set_adapters (immediat)
       - jeu de LoRA different            -> unload_lora_weights + reload des LoRA (~1s)
     Les pipes derives (from_pipe) partagent ce transformer -> ils suivent automatiquement.
-    Renvoie True si applique, False si echec (le caller retombe sur un reload complet)."""
-    global _APPLIED_LORAS
-    if not force and _APPLIED_LORAS == LORAS:
-        return True
-    old_paths = [p for p, _ in _APPLIED_LORAS]
-    new_paths = [p for p, _ in LORAS]
+    Renvoie (ok, applied): ok=False si echec (le caller decide: reload complet pour le
+    base, erreur franche pour l'edition), applied = nouveau jeu pose ([] si echec)."""
+    wanted = list(wanted)
+    if not force and applied == wanted:
+        return True, applied
+    old_paths = [p for p, _ in applied]
+    new_paths = [p for p, _ in wanted]
     try:
         if not force and old_paths and old_paths == new_paths:
             # Seuls les poids changent -> re-ponderation instantanee.
-            pipe.set_adapters(_lora_names(LORAS), [float(w) for _, w in LORAS])
-            _APPLIED_LORAS = list(LORAS)
-            _log("LoRA weights updated in place (no reload): "
-                 + ", ".join(f"{os.path.basename(p)}@{w}" for p, w in LORAS))
-            return True
+            pipe.set_adapters(_lora_names(wanted), [float(w) for _, w in wanted])
+            _log(f"{tag} weights updated in place (no reload): "
+                 + ", ".join(f"{os.path.basename(p)}@{w}" for p, w in wanted))
+            return True, wanted
         if old_paths or force:
             _clear_loras(pipe)
         names, weights = [], []
-        for i, (p, w) in enumerate(LORAS):
+        for i, (p, w) in enumerate(wanted):
             if os.path.isfile(p):
                 an = f"cz_lora_{i}"
-                _log(f"applying LoRA: {os.path.basename(p)} (weight {w})")
+                _log(f"applying {tag}: {os.path.basename(p)} (weight {w})")
                 # Passer le dossier + weight_name (et non le chemin complet) : sinon
                 # diffusers en mode offline (HF_HUB_OFFLINE) refuse "must specify a
                 # weight_name". Marche aussi online et avec un fichier local direct.
@@ -1353,17 +1484,38 @@ def _apply_loras(pipe, force=False):
                 names.append(an)
                 weights.append(float(w))
             else:
-                _log(f"LoRA file not found, ignored: {p}")
+                _log(f"{tag} file not found, ignored: {p}")
         if names:
             pipe.set_adapters(names, weights)
-        _APPLIED_LORAS = list(LORAS)
         if not force:
-            _log("LoRAs hot-swapped (no model reload)")
-        return True
+            _log(f"{tag}s hot-swapped (no model reload)")
+        return True, wanted
     except Exception as e:
-        _log(f"LoRA hot-swap failed ({e}); falling back to a full reload")
-        _APPLIED_LORAS = []
-        return False
+        _log(f"{tag} hot-swap failed ({e})")
+        return False, []
+
+
+def _apply_loras(pipe, force=False):
+    """LoRA du BASE (txt2img/img2img): synchronise le pipe avec LORAS via _sync_adapters.
+    Renvoie True si applique, False si echec (le caller retombe sur un reload complet)."""
+    global _APPLIED_LORAS
+    ok, _APPLIED_LORAS = _sync_adapters(pipe, LORAS, _APPLIED_LORAS, force=force)
+    if not ok:
+        _log("falling back to a full reload")
+    return ok
+
+
+def _apply_edit_loras(pipe):
+    """LoRA d'EDITION: synchronise le pipe omni avec EDIT_LORAS (ou [] si la case
+    'Edit LoRAs' est decochee). Un echec est une erreur franche: l'utilisateur a
+    demande ce preset, une edition SANS lui serait un faux resultat."""
+    global _APPLIED_EDIT_LORAS
+    wanted = EDIT_LORAS if EDIT_LORAS_ENABLED else []
+    ok, _APPLIED_EDIT_LORAS = _sync_adapters(pipe, wanted, _APPLIED_EDIT_LORAS,
+                                             tag="edit LoRA")
+    if not ok:
+        raise RuntimeError("edit LoRA could not be applied on the edit pipe "
+                           "(see log); nothing was generated")
 
 
 def _swap_transformer(pipe):
@@ -1518,12 +1670,17 @@ def get_pipe(kind="img2img"):
     """Renvoie le pipeline demande. txt2img/img2img/inpaint derivent du base via
     from_pipe (poids partages). Omni a besoin de composants en plus (SigLIP) ->
     charge separement depuis un modele Omni dedie (CONFIG['zimage_omni_model'])."""
+    if kind == "omni":
+        # Qwen-Image-Edit est un modele SEPARE: ne PAS charger le base (txt2img,
+        # ~8 min + RAM/VRAM en double) juste pour editer une image.
+        if "omni" in _DERIVED:
+            _dbg("get_pipe('omni'): reuse derived")
+            return _DERIVED["omni"]
+        return _load_omni()
     base = _ensure_base()
     if kind in _DERIVED:
         _dbg(f"get_pipe('{kind}'): reuse derived")
         return _DERIVED[kind]
-    if kind == "omni":
-        return _load_omni()
     from diffusers import QwenImageImg2ImgPipeline, QwenImageInpaintPipeline
     cls = {"img2img": QwenImageImg2ImgPipeline, "inpaint": QwenImageInpaintPipeline}.get(kind)
     if cls is None:
@@ -1570,8 +1727,9 @@ def _load_omni():
     """Charge le pipeline d'edition Qwen-Image-Edit (onglet Omni/Edit). Modele SEPARE du
     base (defaut 'Qwen/Qwen-Image-Edit-2509', multi-images). 2509 -> QwenImageEditPlus ;
     revision de base -> QwenImageEdit. Pipeline separe (ne partage pas avec le base)."""
-    global _DERIVED
+    global _DERIVED, _APPLIED_EDIT_LORAS
     import diffusers
+    _APPLIED_EDIT_LORAS = []        # pipe neuf: aucun adaptateur d'edition pose dessus
     repo = (OMNI_MODEL or os.environ.get("ZIMAGE_OMNI_MODEL")
             or CONFIG.get("zimage_omni_model") or DEFAULT_OMNI_REPO).strip()
     if not repo:
@@ -1624,9 +1782,15 @@ def _load_omni():
                 raise
             _log(f"{EditCls.__name__} failed ({e}); falling back to {alt.__name__}")
             pipe = alt.from_pretrained(repo, torch_dtype=DTYPE)
-    if DEVICE == "cuda" and OFFLOAD_MODE == "model":
+    # Meme regle que le base: un transformer GGUF ne va sur le GPU QUE via
+    # enable_model_cpu_offload (sinon il reste sur CPU: ~800 s/step observes).
+    _off = _effective_offload(repo)
+    if _off != OFFLOAD_MODE:
+        _log(f"GGUF edit: offload '{OFFLOAD_MODE}' force a '{_off}' (un GGUF ne tourne pas "
+             f"sur GPU en none/sequential -> sinon CPU, ~800s/step)")
+    if DEVICE == "cuda" and _off == "model":
         pipe.enable_model_cpu_offload()
-    elif DEVICE == "cuda" and OFFLOAD_MODE == "sequential":
+    elif DEVICE == "cuda" and _off == "sequential":
         pipe.enable_sequential_cpu_offload()
     else:
         pipe = pipe.to(DEVICE)
@@ -1641,27 +1805,40 @@ def _load_omni():
 
 
 @_gpu_serial
-def generate_omni(refs, prompt, negative, width, height, steps, seed):
+def generate_omni(refs, prompt, negative, width, height, steps, seed,
+                  guidance=None, honor_size=False):
     """Edition par instruction Qwen-Image-Edit: edite une (ou plusieurs, via 2509) image(s)
     d'entree selon le prompt d'instruction. Conserve la signature de l'upstream (cz_ui).
-    width/height sont ignores: l'edition preserve les dimensions de l'image d'entree."""
+    width/height sont ignores par defaut (l'edition preserve les dimensions de l'entree);
+    honor_size=True les transmet au pipe (protocole edit avec taille explicite, ex. le
+    preset Upscaler qui veut une sortie 2x). guidance = surcharge du CFG global.
+    Les LoRA d'edition (EDIT_LORAS, case 'Edit LoRAs') sont posees a chaud ici."""
     refs = [r.convert("RGB") for r in (refs or []) if r is not None]
     if not refs:
         raise ValueError("Edit needs at least one input image.")
     pipe = get_pipe("omni")
-    _log(f"edit: {len(refs)} image(s), {int(steps)} steps, cfg {GUIDANCE:.1f} ...")
+    _apply_edit_loras(pipe)
+    g = float(GUIDANCE) if guidance is None else float(guidance)
+    lora_info = (", edit LoRA " + "+".join(os.path.basename(p) for p, _ in EDIT_LORAS)
+                 if EDIT_LORAS and EDIT_LORAS_ENABLED else "")
+    _log(f"edit: {len(refs)} image(s), {int(steps)} steps, cfg {g:.1f}{lora_info} ...")
     _progress(0.1, f"Editing ({len(refs)} image(s))...")
     _set_slicing(pipe, max(max(r.size) for r in refs))
     t0 = time.time()
     # 2509/Plus accepte une liste d'images; la revision de base prend une seule image.
     image_arg = refs if len(refs) > 1 else refs[0]
+    size_kw = {}
+    if honor_size and width and height:
+        size_kw = {"width": round_to_multiple(int(width)), "height": round_to_multiple(int(height))}
+        _dbg(f"edit: explicit output size {size_kw['width']}x{size_kw['height']}")
     out = _qwen_call(
         pipe,
         image=image_arg,
         prompt=prompt or "",
         num_inference_steps=int(steps),
         generator=_make_generator(seed),
-        **_cfg(negative),
+        **size_kw,
+        **_cfg(negative, guidance),
     ).images[0]
     _log(f"edit done in {time.time() - t0:.1f}s")
     gc.collect()

@@ -84,9 +84,92 @@ def test_model_state_roundtrip_keys():
     assert set(ms) == {"base_repo", "transformer", "loras", "sampler", "schedule"}
 
 
+# ---------------------------------------------------- pause / stop semantics ---
+
+def _fake_jobs(n):
+    return [{"label": f"j{i + 1}", "ms": {}, "vals": _stub_vals()} for i in range(n)]
+
+
+def _run_with(stub_generate):
+    """Execute _ui_queue_run avec un _ui_generate stub, sans toucher au modele
+    NI au queue.json sur disque (l'instance de l'utilisateur s'en sert)."""
+    import cz_pipeline
+    saved = (cz_ui._ui_generate, cz_ui._q_restore_model_state, cz_ui._q_persist,
+             cz_pipeline._STOP, cz_ui._QUEUE_PAUSE)
+    ran = []
+    try:
+        cz_ui._ui_generate = stub_generate
+        cz_ui._q_restore_model_state = lambda ms: None
+        cz_ui._q_persist = lambda items: None
+        cz_pipeline._STOP = False
+        items = _fake_jobs(3)
+        out = cz_ui._ui_queue_run(items, [])
+        return items, out
+    finally:
+        (cz_ui._ui_generate, cz_ui._q_restore_model_state, cz_ui._q_persist,
+         cz_pipeline._STOP, cz_ui._QUEUE_PAUSE) = saved
+
+
+def test_pause_finishes_current_job_then_halts():
+    calls = []
+
+    def gen(*vals, progress=None):
+        calls.append(1)
+        if len(calls) == 1:                       # pause demandee PENDANT le job 1
+            cz_ui._QUEUE_PAUSE = True
+        return [], "ok", [], []
+
+    items, out = _run_with(gen)
+    assert len(calls) == 1, "pause must let the current job FINISH, then halt"
+    assert [j["label"] for j in items] == ["j2", "j3"], \
+        "the finished job leaves the queue; the rest stays"
+    assert "paused" in out[-3].lower()
+
+
+def test_stop_keeps_the_interrupted_job_queued():
+    import cz_pipeline
+    calls = []
+
+    def gen(*vals, progress=None):
+        calls.append(1)
+        if len(calls) == 1:                       # Stop en plein job 1
+            cz_pipeline._STOP = True
+        return [], "interrupted", [], []
+
+    items, out = _run_with(gen)
+    assert len(calls) == 1
+    assert [j["label"] for j in items] == ["j1", "j2", "j3"], \
+        "an interrupted job must STAY at the head of the queue (it did not finish)"
+    assert "interrupted job stays queued" in out[-3]
+
+
+def test_without_pause_or_stop_the_queue_drains():
+    def gen(*vals, progress=None):
+        return [], "ok", [], []
+
+    items, out = _run_with(gen)
+    assert items == [] and "done: 3 job(s)" in out[-3]
+
+
+def test_request_pause_sets_the_flag_and_reports():
+    saved = cz_ui._QUEUE_PAUSE
+    try:
+        cz_ui._QUEUE_PAUSE = False
+        msg = cz_ui._q_request_pause()
+        assert cz_ui._QUEUE_PAUSE is True
+        assert "Pause requested" in msg
+    finally:
+        cz_ui._QUEUE_PAUSE = saved
+
+
+
 if __name__ == "__main__":
     for fn in (test_label, test_move, test_remove, test_render,
-               test_model_state_roundtrip_keys):
+               test_model_state_roundtrip_keys,
+               test_pause_finishes_current_job_then_halts,
+               test_stop_keeps_the_interrupted_job_queued,
+               test_without_pause_or_stop_the_queue_drains,
+               test_request_pause_sets_the_flag_and_reports):
         fn()
         print(f"OK {fn.__name__}")
     print("All queue tests passed.")
