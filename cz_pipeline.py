@@ -77,6 +77,55 @@ CHECKPOINTS_EXTRA_DIR = (os.environ.get("CHECKPOINTS_EXTRA_DIR") or _prefs.get("
                          or CONFIG.get("checkpoints_extra_dir") or "").strip()
 LORAS_DIR = (os.environ.get("LORAS_DIR") or _prefs.get("loras_dir")
              or CONFIG.get("loras_dir") or os.path.join(HERE, "loras"))
+
+
+def _split_dirs(spec):
+    """Liste de dossiers depuis une liste JSON ou une chaine 'a;b' (os.pathsep ou ';')."""
+    if not spec:
+        return []
+    if isinstance(spec, str):
+        parts = [p for chunk in spec.split(os.pathsep) for p in chunk.split(";")]
+    else:
+        parts = list(spec)
+    out = []
+    for p in parts:
+        p = str(p or "").strip()
+        if p and p not in out:
+            out.append(p)
+    return out
+
+
+# Dossiers LoRA SUPPLEMENTAIRES (ex. la bibliotheque Civitai partagee avec d'autres
+# outils): env LORAS_EXTRA_DIRS ('a;b') > preferences > config 'loras_extra_dirs'.
+# Fusionnes avec LORAS_DIR dans une seule liste; en cas de meme nom, LORAS_DIR gagne.
+LORAS_EXTRA_DIRS = _split_dirs(os.environ["LORAS_EXTRA_DIRS"] if "LORAS_EXTRA_DIRS" in os.environ
+                               else (_prefs.get("loras_extra_dirs")
+                                     or CONFIG.get("loras_extra_dirs")))
+
+
+def _lora_dirs():
+    """Dossiers LoRA a scanner: principal + extras, sans doublon, dans l'ordre de priorite."""
+    dirs = [LORAS_DIR]
+    for d in LORAS_EXTRA_DIRS:
+        if d and d not in dirs:
+            dirs.append(d)
+    return dirs
+
+
+def resolve_lora_path(name):
+    """Chemin d'une LoRA depuis un nom de slot: chemin absolu tel quel, sinon nom relatif
+    (avec sous-dossiers) cherche dans LORAS_DIR puis les extras. Si absent partout, le
+    chemin dans LORAS_DIR (le caller signale 'not found')."""
+    name = str(name or "")
+    if os.path.isabs(name):
+        return name
+    for d in _lora_dirs():
+        p = os.path.join(d, name)
+        if os.path.isfile(p):
+            return p
+    return os.path.join(LORAS_DIR, name)
+
+
 # LoRA actives: liste de (chemin, poids). Plusieurs LoRA combinables (multi-slots).
 LORAS = []
 LORA_WEIGHT = float(CONFIG.get("default_lora_weight", 1.0))  # poids par defaut des slots
@@ -107,13 +156,13 @@ for _spec in (CONFIG.get("default_loras") or []):
     _nm, _w = (_spec if isinstance(_spec, (list, tuple)) and len(_spec) == 2
                else (_spec, LORA_WEIGHT))
     if _nm and _nm not in ("None", "none"):
-        _p = _nm if os.path.isabs(_nm) else os.path.join(LORAS_DIR, _nm)
+        _p = resolve_lora_path(_nm)
         if os.path.isfile(_p):
             LORAS.append((_p, float(_w)))
 # Modele Omni/Edit (Qwen-Image-Edit, multi-images). Defaut = DEFAULT_OMNI_REPO pour que
 # l'onglet Edit marche sans config. Reglable via config.txt (zimage_omni_model) ou l'UI.
-OMNI_MODEL = (os.environ.get("ZIMAGE_OMNI_MODEL") or CONFIG.get("zimage_omni_model")
-              or DEFAULT_OMNI_REPO).strip()
+OMNI_MODEL = (os.environ.get("ZIMAGE_OMNI_MODEL") or _prefs.get("zimage_omni_model")
+              or CONFIG.get("zimage_omni_model") or DEFAULT_OMNI_REPO).strip()
 
 # Caches process-wide. Un pipeline "base" (txt2img ZImagePipeline) detient les
 # composants; img2img / inpaint en derivent via from_pipe -> poids partages, pas de
@@ -131,6 +180,11 @@ _APPLIED_LORAS = []
 EDIT_LORAS = []
 EDIT_LORAS_ENABLED = bool(CONFIG.get("edit_loras_enabled", True))
 _APPLIED_EDIT_LORAS = []
+# Mode RAPIDE de l'edition (dropdown 'Edit speed'): None = off (steps/guidance des
+# Settings), sinon {"name", "steps", "guidance", "path"} - path = LoRA Lightning a
+# empiler sur le pipe d'edition (None pour 'Auto': un modele deja distille, Rapid-AIO
+# ou merge Lightning, dont le profil model_profiles fixe steps/guidance).
+EDIT_SPEED = None
 
 # Palier 2 (cohabitation VRAM): offload CPU de la passe diffusion. none = tout en VRAM.
 # model = decharge par sous-module (bon compromis). sequential = plus agressif, plus lent.
@@ -262,8 +316,12 @@ def _cfg(negative=None, guidance=None):
     `guidance` = surcharge par appel (protocole edit: un modele distille veut 1.0 quand
     le curseur global reste a 4.0)."""
     g = float(GUIDANCE) if guidance is None else float(guidance)
-    return {"true_cfg_scale": g, "guidance_scale": 1.0,
-            "negative_prompt": (negative or None)}
+    # guidance_scale n'est plus passe: Qwen-Image n'est pas guidance-distilled, diffusers
+    # l'ignore (1.0 est deja sa valeur par defaut) et le signalait a chaque appel.
+    # true_cfg <= 1 = CFG coupe (Lightning/Rapid): le negative n'aurait aucun effet, on ne
+    # le transmet pas plutot que de laisser diffusers avertir qu'il est ignore.
+    return {"true_cfg_scale": g,
+            "negative_prompt": (negative or None) if g > 1.0 else None}
 
 
 def _qwen_call(pipe, **kw):
@@ -511,11 +569,20 @@ def _safetensors_unsupported(path):
         hdr = _safetensors_header(path)
         has_qweight = False
         lora_keys = 0
+        te_keys = 0
+        dit_keys = 0
         for k, v in hdr.items():
             if k == "__metadata__" or not isinstance(v, dict):
                 continue
             if k.endswith(".qweight"):
                 has_qweight = True
+            # Encodeur texte Qwen2.5-VL (fichier ComfyUI 'qwen_2.5_vl_7b_fp8_scaled'):
+            # couches LLM + tour visuelle, jamais de blocs de diffusion.
+            if k.startswith(("model.layers.", "visual.", "lm_head.", "model.embed_tokens",
+                             "language_model.", "model.language_model.")):
+                te_keys += 1
+            if "transformer_blocks" in k or k.startswith(("img_in", "txt_in")):
+                dit_keys += 1
             if (".lora_down." in k or ".lora_up." in k or ".lora_A." in k
                     or ".lora_B." in k or k.startswith(("lora_unet_", "lora_te"))):
                 lora_keys += 1
@@ -524,6 +591,12 @@ def _safetensors_unsupported(path):
         # 404 'stable-diffusion-v1-5 does not appear to have a file named config.json'.
         if lora_keys >= 4:
             return "LoRA file, not a checkpoint - move it to the LoRA folder and pick it in Models > LoRA"
+        # Encodeur texte range avec les checkpoints (telechargement Civitai 'text encoder'):
+        # ce n'est pas un modele d'image, le dequantifier gaspillerait ~15 Go de cache et
+        # le charger en transformer echouerait. Le pipe prend son encodeur du repo de base.
+        if te_keys >= 4 and dit_keys == 0:
+            return ("text encoder (Qwen2.5-VL), not an image model - the pipeline takes its "
+                    "text encoder from the base repo; nothing to do with this file")
         # '*.qweight' = poids pre-quantifies (SVDQuant/Nunchaku, GPTQ-like). Signal net:
         # un checkpoint BF16/FP16 normal n'a jamais de 'qweight'.
         if has_qweight:
@@ -1022,15 +1095,18 @@ def list_loras():
     """LoRA (.safetensors / .ckpt / .pt) du dossier loras, RECURSIF (sous-dossiers inclus).
     Renvoie des chemins RELATIFS a LORAS_DIR avec des '/' (ex. 'sous-dossier/ma_lora.safetensors')
     -> set_loras / resolve les resolvent via os.path.join(LORAS_DIR, name)."""
-    if not os.path.isdir(LORAS_DIR):
-        return []
     exts = (".safetensors", ".ckpt", ".pt")
-    out = []
-    for root, _dirs, files in os.walk(LORAS_DIR):
-        for f in files:
-            if f.lower().endswith(exts):
-                rel = os.path.relpath(os.path.join(root, f), LORAS_DIR).replace(os.sep, "/")
-                out.append(rel)
+    out, seen = [], set()
+    for d in _lora_dirs():          # principal puis extras: meme nom -> le principal gagne
+        if not os.path.isdir(d):
+            continue
+        for root, _dirs, files in os.walk(d):
+            for f in files:
+                if f.lower().endswith(exts):
+                    rel = os.path.relpath(os.path.join(root, f), d).replace(os.sep, "/")
+                    if rel.lower() not in seen:
+                        seen.add(rel.lower())
+                        out.append(rel)
     return sorted(out)
 
 
@@ -1050,6 +1126,13 @@ def set_loras_dir(path):
     global LORAS_DIR
     if path:
         LORAS_DIR = path
+
+
+def set_loras_extra_dirs(spec):
+    """Definit (ou efface avec '' / [] / None) les dossiers LoRA supplementaires.
+    spec = liste ou chaine 'a;b'."""
+    global LORAS_EXTRA_DIRS
+    LORAS_EXTRA_DIRS = _split_dirs(spec)
 
 
 def _read_safetensors_metadata(path):
@@ -1108,8 +1191,7 @@ def set_loras(slots):
     new = []
     for name, weight in slots:
         if name and name not in ("None", "none", ""):
-            p = name if os.path.isabs(name) else os.path.join(LORAS_DIR, name)
-            new.append((p, float(weight)))
+            new.append((resolve_lora_path(name), float(weight)))
     if new != LORAS:
         LORAS = new
         _log("LoRAs -> " + (", ".join(f"{os.path.basename(p)}@{w}" for p, w in new) or "(none)")
@@ -1131,12 +1213,45 @@ def set_edit_loras(slots):
         if cz_edit_loras.spec(name) is not None:
             p = cz_edit_loras.resolve(name)
         else:
-            p = name if os.path.isabs(name) else os.path.join(LORAS_DIR, name)
+            p = resolve_lora_path(name)
         new.append((p, float(weight)))
     if new != EDIT_LORAS:
         EDIT_LORAS = new
         _log("edit LoRAs -> " + (", ".join(f"{os.path.basename(p)}@{w}" for p, w in new)
                                 or "(none)") + " -> applied on next edit (hot-swap)")
+
+
+def edit_speed_choices():
+    """Libelles du dropdown 'Edit speed' (Off, Auto, Lightning N steps...)."""
+    import cz_edit_loras
+    return ["Off"] + cz_edit_loras.speed_names()
+
+
+def set_edit_speed(name):
+    """Mode rapide de l'edition. 'Off'/None -> steps/guidance des Settings, pas de LoRA
+    de vitesse. 'Auto' -> profil model_profiles du modele d'edition (Rapid-AIO / merge
+    Lightning: deja distille, 4-8 steps, CFG off), sans LoRA. 'Lightning N steps' ->
+    LoRA Lightning (2509 ou 2511 selon le modele d'edition; cherchee dans les dossiers
+    LoRA, sinon telechargee) + N steps + guidance 1.0. Renvoie le dict applique."""
+    global EDIT_SPEED
+    import cz_edit_loras
+    name = (name or "Off").strip()
+    if name.lower() in ("off", "none", ""):
+        if EDIT_SPEED is not None:
+            _log("edit speed -> off (Settings steps/guidance)")
+        EDIT_SPEED = None
+        return None
+    if name.lower().startswith("auto"):
+        from cz_core import profile_for_model
+        steps, guidance = profile_for_model(os.path.basename(OMNI_MODEL or ""))
+        EDIT_SPEED = {"name": name, "steps": int(steps), "guidance": float(guidance),
+                      "path": None}
+    else:
+        EDIT_SPEED = cz_edit_loras.resolve_speed(name, OMNI_MODEL)
+    _log(f"edit speed -> {EDIT_SPEED['name']}: {EDIT_SPEED['steps']} steps, "
+         f"cfg {EDIT_SPEED['guidance']:g}"
+         + (f", LoRA {os.path.basename(EDIT_SPEED['path'])}" if EDIT_SPEED.get("path") else ""))
+    return EDIT_SPEED
 
 
 def set_edit_loras_enabled(on):
@@ -1160,11 +1275,52 @@ def set_omni_model(repo):
         _log(f"Omni model -> {repo or '(none)'}")
 
 
+def list_edit_models():
+    """Modeles d'EDITION locaux (chemins complets) dans les dossiers checkpoints: fichiers
+    single-file (.gguf / .safetensors) dont le nom contient 'edit', 'aio' ou 'rapid'
+    (Qwen-Image-Edit 2509/2511, Rapid-AIO), hors LoRA egarees et formats non charges.
+    Alimente le dropdown 'Omni model' (le texte libre reste possible)."""
+    out, seen = [], set()
+    for d in _checkpoint_dirs():
+        if not os.path.isdir(d):
+            continue
+        for f in sorted(os.listdir(d), key=str.lower):
+            low = f.lower()
+            if not low.endswith((".gguf", ".safetensors")) or f in seen:
+                continue
+            if not any(k in low for k in ("edit", "aio", "rapid")):
+                continue
+            # encodeur texte (Qwen2.5-VL) / VAE ranges a cote: pas des transformers
+            if any(k in low for k in ("qwen25vl", "qwen2.5", "qwen2_5", "text_encoder",
+                                      "textencoder", "vae", "clip")):
+                continue
+            p = os.path.join(d, f)
+            if low.endswith(".safetensors") and _safetensors_unsupported(p):
+                continue           # LoRA Lightning d'edition rangee la, SVDQuant...
+            seen.add(f)
+            out.append(p)
+    return out
+
+
 def check_omni_available():
     """Onglet Edit = Qwen-Image-Edit (modele d'edition par instruction). Verifie que le
     repo d'edition configure existe sur Hugging Face (API publique)."""
     import urllib.request
     repo = (OMNI_MODEL or DEFAULT_OMNI_REPO).strip()
+    looks_local = (repo.lower().endswith((".gguf", ".safetensors")) or os.path.isdir(repo)
+                   or os.path.isabs(repo))
+    if looks_local:
+        # Fichier/dossier LOCAL: rien a verifier sur le Hub. Seul le reste du pipe
+        # (encodeur texte, VAE) vient du repo de base au premier usage.
+        if os.path.exists(repo):
+            base_edit = (os.environ.get("QWEN_EDIT_BASE") or CONFIG.get("zimage_omni_base")
+                         or DEFAULT_OMNI_REPO).strip()
+            kind = "GGUF" if _is_gguf_path(repo) else "single-file"
+            rev = "2511" if "2511" in repo else "2509"
+            return (f"**Edit model ready (local {kind}, {rev}):** `{repo}` "
+                    f"({os.path.getsize(repo) / 1024**3:.1f} GB). Text encoder / VAE come "
+                    f"from `{base_edit}` on first use.")
+        return f"Edit model `{repo}` **not found on disk**. Fix config.txt `zimage_omni_model`."
     try:
         req = urllib.request.Request("https://huggingface.co/api/models/" + repo,
                                      headers={"User-Agent": "crispz-qwen-edit"})
@@ -1320,48 +1476,53 @@ def _effective_offload(tpath=None):
     return off
 
 
-def _load_transformer():
+def _load_transformer(path=None, base=None):
     """Charge UNIQUEMENT le transformer courant (sans le reste du pipeline):
       - GGUF quantifie -> from_single_file + GGUFQuantizationConfig (archi = repo de base)
       - single-file .safetensors -> from_single_file
       - repo HF / dossier diffusers -> sous-dossier 'transformer'
       - pas d'override -> transformer du repo de base
-    Utilise au chargement complet ET pour l'echange a chaud (_swap_transformer)."""
+    Utilise au chargement complet ET pour l'echange a chaud (_swap_transformer).
+    path/base: par defaut le transformer du BASE (ZIMAGE_TRANSFORMER / BASE_REPO);
+    le pipe d'EDITION passe son propre fichier (GGUF, FP8 Rapid-AIO...) + son repo
+    d'edition (zimage_omni_base) pour l'architecture."""
     from diffusers import QwenImageTransformer2DModel
-    if ZIMAGE_TRANSFORMER:
-        if _is_single_file(ZIMAGE_TRANSFORMER):
+    path = ZIMAGE_TRANSFORMER if path is None else path
+    base = BASE_REPO if base is None else base
+    if path:
+        if _is_single_file(path):
             # Garde: un fichier non chargeable (LoRA egaree, FP8, quantifie) doit
             # echouer avec un message actionnable, pas partir chercher une config
             # par defaut sur le Hub. (Sans effet sur les .gguf: header illisible -> None.)
-            bad = _safetensors_unsupported(ZIMAGE_TRANSFORMER)
+            bad = _safetensors_unsupported(path)
             if bad:
-                raise RuntimeError(f"{os.path.basename(ZIMAGE_TRANSFORMER)}: {bad}.")
-            if _is_gguf_path(ZIMAGE_TRANSFORMER):
+                raise RuntimeError(f"{os.path.basename(path)}: {bad}.")
+            if _is_gguf_path(path):
                 # transformer Qwen GGUF (quantifie) -> tient en VRAM (~11 Go en Q4) et
                 # reste rapide. Le VAE + encodeur texte viennent du repo de base (cache).
-                lay = _gguf_layout_unsupported(ZIMAGE_TRANSFORMER)
+                lay = _gguf_layout_unsupported(path)
                 if lay:
                     raise RuntimeError(
-                        f"{os.path.basename(ZIMAGE_TRANSFORMER)}: {lay}.")
+                        f"{os.path.basename(path)}: {lay}.")
                 from diffusers import GGUFQuantizationConfig
-                _log(f"loading Qwen transformer (GGUF, quantized): {ZIMAGE_TRANSFORMER} ...")
+                _log(f"loading Qwen transformer (GGUF, quantized): {path} ...")
                 # config/subfolder = archi du transformer depuis le repo de base (cache),
                 # sinon from_single_file ne sait pas la structure et tente un repo par defaut.
                 return _load_monitor(
-                    f"transformer {os.path.basename(ZIMAGE_TRANSFORMER)} (GGUF)",
+                    f"transformer {os.path.basename(path)} (GGUF)",
                     lambda: QwenImageTransformer2DModel.from_single_file(
-                        ZIMAGE_TRANSFORMER,
+                        path,
                         quantization_config=GGUFQuantizationConfig(compute_dtype=DTYPE),
-                        config=BASE_REPO, subfolder="transformer",
+                        config=base, subfolder="transformer",
                         torch_dtype=DTYPE))
-            dq = _safetensors_dequant(ZIMAGE_TRANSFORMER)
+            dq = _safetensors_dequant(path)
             if dq:
                 # FP8/INT8 'scaled' ComfyUI (builds Civitai legers) -> dequant en RAM
                 # puis chargement du dict (conversion de cles diffusers incluse).
                 # Deja dequantifie une fois ? -> relire le bf16 du cache
                 # disque: un single-file normal (secondes) au lieu de reconvertir
                 # tout le fichier (minutes sur HDD).
-                cached = _dequant_cache_path(ZIMAGE_TRANSFORMER)
+                cached = _dequant_cache_path(path)
                 if cached and os.path.isfile(cached):
                     _log(f"loading Qwen transformer ({dq} -> bf16, from dequant "
                          f"cache): {os.path.basename(cached)}")
@@ -1370,24 +1531,24 @@ def _load_transformer():
                     except OSError:
                         pass
                     return _load_monitor(
-                        f"transformer {os.path.basename(ZIMAGE_TRANSFORMER)} (cached bf16)",
+                        f"transformer {os.path.basename(path)} (cached bf16)",
                         lambda: QwenImageTransformer2DModel.from_single_file(
-                            cached, config=BASE_REPO, subfolder="transformer",
+                            cached, config=base, subfolder="transformer",
                             torch_dtype=DTYPE))
                 _log(f"loading Qwen transformer (single-file, {dq} ComfyUI -> "
-                     f"dequantized to bf16): {ZIMAGE_TRANSFORMER} ...")
-                sd = _load_dequant_state_dict(ZIMAGE_TRANSFORMER)
-                _dequant_cache_store(ZIMAGE_TRANSFORMER, sd)
+                     f"dequantized to bf16): {path} ...")
+                sd = _load_dequant_state_dict(path)
+                _dequant_cache_store(path, sd)
                 return _load_monitor(
-                    f"transformer {os.path.basename(ZIMAGE_TRANSFORMER)} ({dq})",
+                    f"transformer {os.path.basename(path)} ({dq})",
                     lambda: QwenImageTransformer2DModel.from_single_file(
-                        sd, config=BASE_REPO, subfolder="transformer",
+                        sd, config=base, subfolder="transformer",
                         torch_dtype=DTYPE))
             # checkpoint Qwen single-file (.safetensors bf16/fp16) -> override transformer.
             # config/subfolder = archi du transformer depuis le repo de base (deja en cache),
             # comme pour le GGUF: sans ca, from_single_file ne sait pas la structure et va
             # chercher un repo par defaut -> echec en mode offline (HF_HUB_OFFLINE=1).
-            if _safetensors_comfy_prefixed(ZIMAGE_TRANSFORMER):
+            if _safetensors_comfy_prefixed(path):
                 # Layout ComfyUI SANS quantification: diffusers ne convertit pas les cles
                 # Qwen (mapping identite), un passage direct du chemin laisserait le modele
                 # sur 'meta'. On lit et on deprefixe nous-memes -- meme cout RAM, puisque
@@ -1395,30 +1556,30 @@ def _load_transformer():
                 # disque ici: il n'y a rien de dequantifie a memoriser, ce serait une
                 # copie bf16 -> bf16.
                 _log(f"loading Qwen transformer (single-file, ComfyUI layout -> "
-                     f"diffusers): {ZIMAGE_TRANSFORMER} ...")
-                sd = _load_dequant_state_dict(ZIMAGE_TRANSFORMER)
+                     f"diffusers): {path} ...")
+                sd = _load_dequant_state_dict(path)
                 return _load_monitor(
-                    f"transformer {os.path.basename(ZIMAGE_TRANSFORMER)}",
+                    f"transformer {os.path.basename(path)}",
                     lambda: QwenImageTransformer2DModel.from_single_file(
-                        sd, config=BASE_REPO, subfolder="transformer",
+                        sd, config=base, subfolder="transformer",
                         torch_dtype=DTYPE))
-            _log(f"loading Qwen transformer (single-file): {ZIMAGE_TRANSFORMER} ...")
+            _log(f"loading Qwen transformer (single-file): {path} ...")
             return _load_monitor(
-                f"transformer {os.path.basename(ZIMAGE_TRANSFORMER)}",
+                f"transformer {os.path.basename(path)}",
                 lambda: QwenImageTransformer2DModel.from_single_file(
-                    ZIMAGE_TRANSFORMER, config=BASE_REPO, subfolder="transformer",
+                    path, config=base, subfolder="transformer",
                     torch_dtype=DTYPE))
         # repo HF / dossier diffusers -> charge le sous-dossier 'transformer'.
-        _log(f"loading Qwen transformer (repo subfolder): {ZIMAGE_TRANSFORMER} ...")
+        _log(f"loading Qwen transformer (repo subfolder): {path} ...")
         return _load_monitor(
-            f"transformer {ZIMAGE_TRANSFORMER}",
+            f"transformer {path}",
             lambda: QwenImageTransformer2DModel.from_pretrained(
-                ZIMAGE_TRANSFORMER, subfolder="transformer", torch_dtype=DTYPE))
-    _log(f"loading Qwen transformer (base repo): {BASE_REPO} ...")
+                path, subfolder="transformer", torch_dtype=DTYPE))
+    _log(f"loading Qwen transformer (base repo): {base} ...")
     return _load_monitor(
-        f"transformer {BASE_REPO}",
+        f"transformer {base}",
         lambda: QwenImageTransformer2DModel.from_pretrained(
-            BASE_REPO, subfolder="transformer", torch_dtype=DTYPE))
+            base, subfolder="transformer", torch_dtype=DTYPE))
 
 
 def _lora_names(loras):
@@ -1479,8 +1640,13 @@ def _sync_adapters(pipe, wanted, applied, force=False, tag="LoRA"):
                 # Passer le dossier + weight_name (et non le chemin complet) : sinon
                 # diffusers en mode offline (HF_HUB_OFFLINE) refuse "must specify a
                 # weight_name". Marche aussi online et avec un fichier local direct.
-                pipe.load_lora_weights(os.path.dirname(p) or ".",
-                                       weight_name=os.path.basename(p), adapter_name=an)
+                # A partir du 2e adaptateur, peft avertit "Already found a peft_config"
+                # : empiler plusieurs LoRA est justement le but, on tait ce message.
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", message=".*Already found a `peft_config`.*")
+                    pipe.load_lora_weights(os.path.dirname(p) or ".",
+                                           weight_name=os.path.basename(p), adapter_name=an)
                 names.append(an)
                 weights.append(float(w))
             else:
@@ -1510,7 +1676,11 @@ def _apply_edit_loras(pipe):
     'Edit LoRAs' est decochee). Un echec est une erreur franche: l'utilisateur a
     demande ce preset, une edition SANS lui serait un faux resultat."""
     global _APPLIED_EDIT_LORAS
-    wanted = EDIT_LORAS if EDIT_LORAS_ENABLED else []
+    wanted = list(EDIT_LORAS) if EDIT_LORAS_ENABLED else []
+    # LoRA Lightning du mode rapide: empilee APRES les presets (independante de la
+    # case 'Edit LoRAs', qui ne concerne que les presets de tache).
+    if EDIT_SPEED and EDIT_SPEED.get("path"):
+        wanted.append((EDIT_SPEED["path"], 1.0))
     ok, _APPLIED_EDIT_LORAS = _sync_adapters(pipe, wanted, _APPLIED_EDIT_LORAS,
                                              tag="edit LoRA")
     if not ok:
@@ -1736,25 +1906,24 @@ def _load_omni():
         raise RuntimeError("No Qwen-Image-Edit model set (config.txt 'zimage_omni_model').")
     EditPlus = getattr(diffusers, "QwenImageEditPlusPipeline", None)
     t0 = time.time()
-    if repo.lower().endswith(".gguf"):
-        # GGUF: transformer d'edition quantifie (local, ~13 Go) + le RESTE (encodeur texte
+    if _is_single_file(repo):
+        # Single-file: transformer d'edition local (GGUF quantifie ~13 Go, ou .safetensors
+        # FP8/bf16 type Rapid-AIO = 2511 + Lightning fusionnes) + le RESTE (encodeur texte
         # ~17 Go, VAE, processor) tire du repo d'edition de base (zimage_omni_base, defaut
         # Qwen-Image-Edit-2509). Fait tenir l'edition en VRAM 32 Go, sans le transformer 40 Go.
         import importlib, json as _json
         from huggingface_hub import hf_hub_download
-        from diffusers import QwenImageTransformer2DModel, GGUFQuantizationConfig
         base_edit = (os.environ.get("QWEN_EDIT_BASE") or CONFIG.get("zimage_omni_base")
                      or DEFAULT_OMNI_REPO).strip()
         EditCls = EditPlus or diffusers.QwenImageEditPipeline
-        _log(f"loading Qwen-Image-Edit transformer (GGUF): {repo} + base {base_edit} "
+        _log(f"loading Qwen-Image-Edit transformer (single-file): {repo} + base {base_edit} "
              f"via {EditCls.__name__} (offload={OFFLOAD_MODE}) ...")
-        # Transformer depuis le GGUF (archi tiree du repo de base, pas de download du
-        # transformer bf16). NB: from_pretrained(base, transformer=tf) telechargerait QUAND
-        # MEME le transformer 40 Go du repo -> on construit donc le pipeline composant par
-        # composant. Les classes viennent du model_index.json du repo de base.
-        tf = QwenImageTransformer2DModel.from_single_file(
-            repo, config=base_edit, subfolder="transformer",
-            quantization_config=GGUFQuantizationConfig(compute_dtype=DTYPE), torch_dtype=DTYPE)
+        # Transformer depuis le fichier (archi tiree du repo de base, pas de download du
+        # transformer bf16): meme loader que le base (GGUF, FP8/INT8 scaled dequantifie +
+        # cache disque, layout ComfyUI). NB: from_pretrained(base, transformer=tf)
+        # telechargerait QUAND MEME le transformer 40 Go du repo -> on construit donc le
+        # pipeline composant par composant. Les classes viennent du model_index.json.
+        tf = _load_transformer(repo, base_edit)
         mi = _json.load(open(hf_hub_download(base_edit, "model_index.json"), encoding="utf-8"))
         comps = {"transformer": tf}
         for name in ("scheduler", "vae", "text_encoder", "tokenizer", "processor"):
@@ -1771,7 +1940,7 @@ def _load_omni():
     else:
         # repo diffusers complet (telechargement). 2509 -> QwenImageEditPlusPipeline
         # (multi-images) ; revision de base -> QwenImageEditPipeline. Repli automatique.
-        plus = "2509" in repo or "plus" in repo.lower()
+        plus = "2509" in repo or "2511" in repo or "plus" in repo.lower()
         EditCls = (EditPlus if plus else None) or diffusers.QwenImageEditPipeline
         _log(f"loading Qwen-Image-Edit: {repo} via {EditCls.__name__} (offload={OFFLOAD_MODE}) ...")
         try:
@@ -1806,7 +1975,7 @@ def _load_omni():
 
 @_gpu_serial
 def generate_omni(refs, prompt, negative, width, height, steps, seed,
-                  guidance=None, honor_size=False):
+                  guidance=None, honor_size=False, steps_explicit=False):
     """Edition par instruction Qwen-Image-Edit: edite une (ou plusieurs, via 2509) image(s)
     d'entree selon le prompt d'instruction. Conserve la signature de l'upstream (cz_ui).
     width/height sont ignores par defaut (l'edition preserve les dimensions de l'entree);
@@ -1818,9 +1987,16 @@ def generate_omni(refs, prompt, negative, width, height, steps, seed,
         raise ValueError("Edit needs at least one input image.")
     pipe = get_pipe("omni")
     _apply_edit_loras(pipe)
+    # Mode rapide: ses steps/guidance priment sur les Settings; un appelant qui les
+    # a fixes explicitement (protocole spec.steps / spec.guidance) garde la main.
+    if EDIT_SPEED:
+        if not steps_explicit:
+            steps = EDIT_SPEED["steps"]
+        if guidance is None:
+            guidance = EDIT_SPEED["guidance"]
     g = float(GUIDANCE) if guidance is None else float(guidance)
-    lora_info = (", edit LoRA " + "+".join(os.path.basename(p) for p, _ in EDIT_LORAS)
-                 if EDIT_LORAS and EDIT_LORAS_ENABLED else "")
+    lora_info = ", edit LoRA " + "+".join(os.path.basename(p) for p, _ in _APPLIED_EDIT_LORAS) \
+        if _APPLIED_EDIT_LORAS else ""            # presets + LoRA Lightning reellement poses
     _log(f"edit: {len(refs)} image(s), {int(steps)} steps, cfg {g:.1f}{lora_info} ...")
     _progress(0.1, f"Editing ({len(refs)} image(s))...")
     _set_slicing(pipe, max(max(r.size) for r in refs))

@@ -770,15 +770,19 @@ def _ui_set_lora_slots(n):
     return [gr.update(visible=(i < n)) for i in range(MAX_LORA_SLOTS)]
 
 
-def _refresh_loras(new_dir):
-    """Change le dossier loras + rafraichit TOUS les slots (N configurable) + persiste."""
+def _refresh_loras(new_dir, extra_dirs=""):
+    """Change le dossier loras (+ extras 'a;b') + rafraichit TOUS les slots (N
+    configurable) + persiste."""
     set_loras_dir(new_dir)
+    cz_pipeline.set_loras_extra_dirs(extra_dirs)
     try:
-        _save_prefs_keys({"loras_dir": cz_pipeline.LORAS_DIR})   # persiste -> survit au reboot
+        _save_prefs_keys({"loras_dir": cz_pipeline.LORAS_DIR,      # persiste -> survit au reboot
+                          "loras_extra_dirs": list(cz_pipeline.LORAS_EXTRA_DIRS)})
     except Exception:
         pass
     lr = ["None"] + list_loras()
-    status = f"{len(lr) - 1} LoRA(s) in {cz_pipeline.LORAS_DIR} (saved)."
+    locs = " + ".join(cz_pipeline._lora_dirs())
+    status = f"{len(lr) - 1} LoRA(s) in {locs} (saved)."
     return tuple(gr.update(choices=lr) for _ in range(MAX_LORA_SLOTS)) + (status,)
 
 
@@ -796,7 +800,8 @@ def _edit_lora_choices():
     """Libelles du dropdown des presets d'edition ('Nom ✓' sur disque, 'Nom ⬇' a
     telecharger). Recalcule a chaque appel: un telechargement change le libelle."""
     import cz_edit_loras
-    return ["None"] + [cz_edit_loras.status_label(n) for n in cz_edit_loras.names()]
+    idx = cz_edit_loras.local_index()          # un seul parcours disque pour les 19
+    return ["None"] + [cz_edit_loras.status_label(n, index=idx) for n in cz_edit_loras.names()]
 
 
 def _ui_edit_lora_apply(label, weight, progress=gr.Progress()):
@@ -835,6 +840,70 @@ def _ui_edit_lora_prompt(label, current):
     return gr.update(value=s["prompt"])
 
 
+def _initial_edit_speed():
+    """Valeur initiale du dropdown 'Edit speed' (config 'edit_fast'), appliquee au
+    demarrage. Un mode Lightning dont la LoRA manque partout telecharge ici; en cas
+    d'echec (hors ligne, token) on retombe sur Off avec un log, jamais un crash."""
+    want = str(CONFIG.get("edit_fast") or "Off").strip()
+    choices = cz_pipeline.edit_speed_choices()
+    match = next((c for c in choices if c.lower() == want.lower()), None)
+    if not match or match == "Off":
+        return "Off"
+    try:
+        cz_pipeline.set_edit_speed(match)
+        return match
+    except Exception as e:
+        _log(f"edit_fast '{want}' not applied at startup ({e}); Off")
+        return "Off"
+
+
+def _ui_edit_speed(name, progress=gr.Progress()):
+    """Dropdown 'Edit speed' -> cz_pipeline.set_edit_speed (telecharge la LoRA Lightning
+    si elle n'est dans aucun dossier LoRA). Renvoie le statut."""
+    try:
+        if name and not name.lower().startswith(("off", "auto")):
+            progress(0.0, desc=f"Resolving {name} LoRA...")
+        sp = cz_pipeline.set_edit_speed(name)
+    except Exception as e:
+        _log(f"edit speed failed: {e}")
+        return f"Edit speed error: {e}"
+    if not sp:
+        return "Edit speed: off (steps/guidance from Settings)."
+    lora = f", LoRA `{os.path.basename(sp['path'])}`" if sp.get("path") else ", no LoRA"
+    return (f"Edit speed: **{sp['name']}** -> {sp['steps']} steps, cfg {sp['guidance']:g}"
+            f"{lora}.")
+
+
+def _ui_set_omni_model(repo):
+    """Dropdown Omni model -> pipeline (pipe omni invalide, recharge au prochain edit) +
+    preferences.json (survit au redemarrage). Le mode Edit speed Lightning depend de la
+    revision (2509/2511): on le re-resout pour prendre le bon fichier."""
+    set_omni_model(repo)
+    try:
+        _save_prefs_keys({"zimage_omni_model": cz_pipeline.OMNI_MODEL})
+    except Exception:
+        pass
+    note = f"Omni model set: `{repo or '(none)'}` (applied on the next edit, saved)."
+    sp = cz_pipeline.EDIT_SPEED
+    if sp and sp.get("path"):
+        try:
+            sp = cz_pipeline.set_edit_speed(sp["name"])
+            note += "  \nEdit speed re-resolved: `" + os.path.basename(sp["path"]) + "`."
+        except Exception as e:
+            note += "  \nEdit speed LoRA not re-resolved: " + str(e)
+    return note
+
+
+def _ui_edit_generate(*args, progress=gr.Progress(track_tqdm=True)):
+    """Bouton 'Edit' de l'onglet Reference (Omni): meme run que Generate, mais force
+    use_input=True et input_mode='Reference (Omni)' (positions 4 et 6 de _ui_generate)
+    -> plus besoin de cocher Input Image ni de changer le mode au-dessus."""
+    args = list(args)
+    args[4] = True
+    args[6] = "Reference (Omni)"
+    return _ui_generate(*args, progress=progress)
+
+
 def _ui_edit_loras_enabled(on):
     cz_pipeline.set_edit_loras_enabled(on)
     return f"Edit LoRAs {'ON' if on else 'OFF'} (applied on the next edit, no reload)."
@@ -843,7 +912,7 @@ def _ui_edit_loras_enabled(on):
 def _path_for_lora(name):
     if not name or name in ("None", "none", ""):
         return None
-    return name if os.path.isabs(name) else os.path.join(cz_pipeline.LORAS_DIR, name)
+    return cz_pipeline.resolve_lora_path(name)     # principal puis loras_extra_dirs
 
 
 def _lora_keywords_for(names):
@@ -3300,9 +3369,12 @@ def build_ui():
                             inpaint_status = gr.Markdown("")
 
                         with gr.Tab("Reference (Omni)", visible=omni_on):
-                            gr.Markdown("*Compose from up to 4 reference images + a prompt. "
-                                        "Set **Input mode = Reference (Omni)** above. "
-                                        "Uses width/height/steps/guidance from Settings.*")
+                            gr.Markdown("*Edit an image from an instruction: put it in **Ref 1** "
+                                        "(Ref 2 = light/style reference for 2-image presets, up to "
+                                        "4 refs to compose), pick an Edit LoRA preset if you want, "
+                                        "write the instruction in the prompt, then click **Edit** "
+                                        "below (or Generate with Input mode = Reference (Omni)). "
+                                        "Steps/guidance: Settings, unless Edit speed is on.*")
                             with gr.Row():
                                 omni_check_btn2 = gr.Button("Check Omni model availability", size="sm")
                                 omni_status2 = gr.Markdown("")
@@ -3332,6 +3404,21 @@ def build_ui():
                                 edit_lora_prompt_btn = gr.Button("Use example prompt", size="sm")
                                 edit_lora_refresh_btn = gr.Button("Refresh presets", size="sm")
                             edit_lora_status = gr.Markdown("")
+                            # Mode rapide de l'edition: Lightning (LoRA empilee, 4/8 steps,
+                            # CFG off) ou Auto (modele deja distille: Rapid-AIO, merge).
+                            with gr.Row():
+                                edit_speed_dd = gr.Dropdown(
+                                    choices=cz_pipeline.edit_speed_choices(),
+                                    value=_initial_edit_speed(),
+                                    label="Edit speed",
+                                    info="Lightning N steps = stacks the Lightning edit LoRA "
+                                         "(2509/2511 picked from the edit model), N steps, "
+                                         "CFG off. Auto = steps/guidance from the model "
+                                         "profile (Rapid-AIO, Lightning merges). Off = Settings.",
+                                    scale=3)
+                                edit_speed_status = gr.Markdown("", elem_classes="cz-inline-status")
+                            omni_edit_btn = gr.Button("✏️ Edit (Ref 1 + prompt -> image)",
+                                                      variant="primary")
 
                         with gr.Tab("Face Swap"):
                             gr.Markdown("*Post-process: replace the face in the result with this "
@@ -3526,30 +3613,39 @@ def build_ui():
                                 refresh_btn = gr.Button("Refresh ESRGAN", size="sm")
                                 save_paths_btn = gr.Button("Save paths", size="sm")
                             paths_status = gr.Markdown("")
-                            with gr.Row():
+                            with gr.Column():
                                 _ckpt_choices = ZIMAGE_BASE_REPOS + list_checkpoints()
                                 _ckpt_value = cz_pipeline.BASE_REPO if cz_pipeline.BASE_REPO in _ckpt_choices else ZIMAGE_BASE_REPOS[0]
                                 ckpt_dd = gr.Dropdown(choices=_ckpt_choices,
                                                       value=_ckpt_value, label="Qwen checkpoint", scale=3)
-                                ckpt_open_btn = gr.Button("\U0001F5BC️", size="sm", scale=0, min_width=44,
-                                                          elem_id="cz_ckpt_open")
-                                ckpt_refresh_btn = gr.Button("Refresh", size="sm", scale=1)
+                                with gr.Row():      # boutons SOUS le dropdown (pleine largeur au-dessus)
+                                    ckpt_open_btn = gr.Button("\U0001F5BC️ Browse", size="sm", scale=1,
+                                                              elem_id="cz_ckpt_open")
+                                    ckpt_refresh_btn = gr.Button("Refresh", size="sm", scale=1)
                             civitai_reco_btn = gr.Button(
                                 "📊 Apply CivitAI recommended settings", size="sm",
                                 variant="secondary")
                             ckpt_status = gr.Markdown("")
-                            with gr.Row():
+                            with gr.Column():
                                 transformer_tb = gr.Textbox(
                                     value="", scale=3,
                                     label="Transformer override (HF repo / diffusers folder)",
                                     placeholder="HF repo with a Qwen-Image transformer",
                                     info="For community models with an incomplete tokenizer: "
                                          "loads only the transformer, keeps base VAE/encoder.")
-                                transformer_apply_btn = gr.Button("Apply override", size="sm", scale=1,
-                                                                  variant="secondary")
+                                with gr.Row():
+                                    transformer_apply_btn = gr.Button("Apply override", size="sm",
+                                                                      variant="secondary")
 
                         with gr.Accordion("\U0001F9E9 LoRA (combinable)", open=False):
                             lora_dir_tb = gr.Textbox(value=cz_pipeline.LORAS_DIR, label="LoRA folder")
+                            lora_extra_dirs_tb = gr.Textbox(
+                                value=";".join(cz_pipeline.LORAS_EXTRA_DIRS),
+                                label="Extra LoRA folders (optional, ';' separated)",
+                                placeholder="e.g. F:\\sdlibs\\models\\Lora\\_Qwen",
+                                info="Merged into the LoRA lists (slots, edit presets, "
+                                     "protocol caps). Same file name: the main folder wins. "
+                                     "Config `loras_extra_dirs`.")
                             gr.Markdown(
                                 "*Number of slots is set in Advanced > Generation "
                                 "(LoRA slots), or config `lora_slots`. Weight range is "
@@ -3622,11 +3718,26 @@ def build_ui():
                             gr.Markdown("*The Reference (Omni) tab uses Qwen-Image-Edit "
                                         "(default: Qwen/Qwen-Image-Edit-2509, multi-image instruction "
                                         "editing). Set another repo here, then restart.*")
-                            omni_model_tb = gr.Textbox(value=CONFIG.get("zimage_omni_model", ""),
-                                                       label="Omni model (HF repo or local folder)",
-                                                       info="Qwen-Image-Edit repo. Set it then restart to enable "
-                                                            "the Reference (Omni) tab.")
-                            omni_check_btn = gr.Button("Check Omni availability (Hugging Face)", size="sm")
+                            # Liste = repos HF d'edition + fichiers d'edition locaux (checkpoints
+                            # dir + extra: *edit*, *aio*, *rapid* en .gguf/.safetensors). Texte
+                            # libre accepte (autre repo / chemin). Applique a chaud (pipe omni
+                            # rechargee au prochain edit); le restart ne sert qu'a faire
+                            # apparaitre l'onglet quand aucun modele n'etait configure.
+                            _omni_cur = (cz_pipeline.OMNI_MODEL or CONFIG.get("zimage_omni_model") or "")
+                            _omni_choices = ["Qwen/Qwen-Image-Edit-2511", "Qwen/Qwen-Image-Edit-2509"] \
+                                + cz_pipeline.list_edit_models()
+                            if _omni_cur and _omni_cur not in _omni_choices:
+                                _omni_choices.insert(0, _omni_cur)
+                            omni_model_tb = gr.Dropdown(
+                                choices=_omni_choices, value=_omni_cur or None,
+                                allow_custom_value=True,
+                                label="Omni / Edit model (HF repo or local .gguf/.safetensors)",
+                                info="Local edit checkpoints (*edit*, *aio*, *rapid*) from the checkpoints "
+                                     "folders + HF repos. Type any other repo/path. Applied on the next "
+                                     "edit (no restart, except to reveal the tab the first time).")
+                            with gr.Row():
+                                omni_check_btn = gr.Button("Check Omni availability", size="sm")
+                                omni_refresh_btn = gr.Button("Refresh list", size="sm")
                             omni_status = gr.Markdown("")
 
                     with gr.Tab("Save"):
@@ -3805,7 +3916,8 @@ def build_ui():
             .then(set_schedule, [schedule_dd], None)
         transformer_apply_btn.click(_apply_transformer_repo, [transformer_tb],
                                     [ckpt_status, gen_steps, guidance, performance])
-        lora_refresh_btn.click(_refresh_loras, [lora_dir_tb], lora_dds + [lora_status])
+        lora_refresh_btn.click(_refresh_loras, [lora_dir_tb, lora_extra_dirs_tb],
+                               lora_dds + [lora_status])
         # slots entrelaces: dd1, lw1, dd2, lw2, ... (attendu par _apply_loras/_ui_loras_apply)
         _lora_slots = [c for _pair in zip(lora_dds, lora_lws) for c in _pair]
         for _c in lora_dds:
@@ -3829,9 +3941,13 @@ def build_ui():
         preset_save_btn.click(_ui_preset_save, [preset_name_tb] + _preset_io, [preset_dd, preset_status])
         preset_update_btn.click(_ui_preset_save, [preset_dd] + _preset_io, [preset_dd, preset_status])
         preset_delete_btn.click(_ui_preset_delete, [preset_dd], [preset_dd, preset_status])
-        omni_model_tb.change(lambda r: (set_omni_model(r), f"Omni model set: {r or '(none)'}")[1],
-                             [omni_model_tb], [omni_status])
+        omni_model_tb.change(_ui_set_omni_model, [omni_model_tb], [omni_status])
         omni_check_btn.click(_ui_check_omni, None, [omni_status])
+        omni_refresh_btn.click(
+            lambda cur: gr.update(choices=(([cur] if cur else [])
+                                           + ["Qwen/Qwen-Image-Edit-2511", "Qwen/Qwen-Image-Edit-2509"]
+                                           + [m for m in cz_pipeline.list_edit_models() if m != cur])),
+            [omni_model_tb], [omni_model_tb])
         omni_check_btn2.click(_ui_check_omni, None, [omni_status2])
         # Presets d'edition: .input (action utilisateur) et non .change, car la
         # reponse met a jour le dropdown lui-meme (libelle ⬇ -> ✓ apres telechargement).
@@ -3843,6 +3959,7 @@ def build_ui():
         edit_lora_refresh_btn.click(lambda: gr.update(choices=_edit_lora_choices()),
                                     None, [edit_lora_dd])
         edit_loras_cb.change(_ui_edit_loras_enabled, [edit_loras_cb], [edit_lora_status])
+        edit_speed_dd.change(_ui_edit_speed, [edit_speed_dd], [edit_speed_status])
         ab_reindex_btn.click(_ui_ab_reindex,
                              [output_dir, ab_thumb_size, ab_quality, ab_blur, ab_gen_thumbs],
                              [ab_open_link, ab_status])
@@ -3914,6 +4031,8 @@ def build_ui():
                        history, auto_upscale_cb]
         _gen_outputs = [out, report, history, history_gallery]
         btn.click(_ui_generate, inputs=_gen_inputs, outputs=_gen_outputs)
+        # Bouton Edit de l'onglet Reference (Omni): memes entrees/sorties, routage force.
+        omni_edit_btn.click(_ui_edit_generate, inputs=_gen_inputs, outputs=_gen_outputs)
         if JOB_QUEUE_ENABLED:
             _q_panel = [queue_state, queue_sel, queue_md, queue_add_btn]
             queue_add_btn.click(_ui_queue_add, [*_gen_inputs, queue_state], _q_panel)
