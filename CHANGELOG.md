@@ -42,9 +42,35 @@ edit_loras` adds/replaces/removes presets, `edit_loras_dir` moves the folder.
   Upscaler preset can produce a 2x output; without it the edit keeps the
   input size as before.
 
+Fast edit mode and shared LoRA libraries, same release:
+
+- **Edit speed** (dropdown under the edit presets): `Lightning 4 steps` /
+  `Lightning 8 steps` stack the lightx2v Lightning edit LoRA on the edit pipe
+  (the 2509 or 2511 file is picked from the edit model name, looked up in the
+  LoRA folders first, downloaded otherwise) and force N steps + CFG off;
+  `Auto (model profile)` takes steps/guidance from `model_profiles` for an
+  already-distilled edit model (Rapid-AIO, new `aio` profile = 4 steps,
+  guidance 1.0); `Off` = Settings. The speed LoRA stacks AFTER the task
+  presets and is independent of the "Edit LoRAs" checkbox. Protocol:
+  `spec.fast` (`off|auto|lightning-4|lightning-8`) on op `edit`,
+  `caps.edit_fast`; an explicit `spec.steps` is never overridden.
+- **Rapid-AIO as the edit model**: `zimage_omni_model` now accepts any
+  single-file transformer, `.gguf` OR `.safetensors` (FP8/INT8 scaled ComfyUI
+  builds go through the same dequant + disk cache as the base). `_load_transformer`
+  takes `(path, base)` so the edit pipe reuses the base loader instead of its own
+  GGUF-only branch; `2511` repos select the Plus pipeline like `2509`.
+- **`loras_extra_dirs`** (config, env `LORAS_EXTRA_DIRS`, prefs, UI textbox
+  under the LoRA folder, CLI `--loras-extra-dir`): extra LoRA folders merged
+  into every list (slots, XYZ, protocol `caps.loras`); on a duplicate name the
+  main folder wins. `resolve_lora_path` searches them in order. Edit presets
+  reuse a file already there (Civitai name for Multiple-Angles) instead of
+  downloading a second copy.
+
 Tests: `tests/test_edit_loras.py` (registry, lazy download under an ASCII
 name, separate set, hot-swap + checkbox, failure raises, protocol routing,
-caps), `test_protocol_edit.py` updated for the new `generate_omni` kwargs.
+caps, extra dirs merge + protocol listing, preset reuse from a library,
+Lightning revision pick + stacking + Auto profile, `fast` aliases),
+`test_protocol_edit.py` updated for the new `generate_omni` kwargs.
 
 ## Unreleased — GGUF: the tensor layout outranks the declared architecture
 

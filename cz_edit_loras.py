@@ -33,7 +33,9 @@ EDIT_LORA_SPECS = {
         "weights": "镜头转换.safetensors",
         "adapter_name": "multiple-angles",
         "prompt": "Rotate the camera 45 degrees to the right.",
-        "inputs": 1, "base": "2509"},
+        "inputs": 1, "base": "2509",
+        # meme fichier tel que Civitai le nomme (bibliotheques existantes)
+        "local_names": ["Qwen-Edit-2509-Multiple-angles.safetensors"]},
     "Photo-to-Anime": {
         "repo": "autoweeb/Qwen-Image-Edit-2509-Photo-to-Anime",
         "weights": "Qwen-Image-Edit-2509-Photo-to-Anime_000001000.safetensors",
@@ -228,9 +230,26 @@ def local_path(name):
     return os.path.join(edit_loras_dir(), s["adapter_name"] + ".safetensors")
 
 
-def is_downloaded(name):
+def _candidates(s):
+    """Noms de fichier sous lesquels un preset peut deja exister dans une bibliotheque."""
+    return ([s["adapter_name"] + ".safetensors", os.path.basename(s["weights"])]
+            + list(s.get("local_names") or []))
+
+
+def available_path(name, index=None):
+    """Chemin local du preset s'il est deja sur disque (dossier _hf-edit OU une
+    bibliotheque LoRA, ex. copie Civitai), sinon None. Ne telecharge jamais."""
+    s = spec(name)
+    if s is None:
+        return None
     p = local_path(name)
-    return bool(p) and os.path.isfile(p)
+    if os.path.isfile(p):
+        return p
+    return find_local(_candidates(s), index=index)
+
+
+def is_downloaded(name, index=None):
+    return available_path(name, index=index) is not None
 
 
 def resolve(name, download=True, progress=None):
@@ -243,9 +262,127 @@ def resolve(name, download=True, progress=None):
     dst = local_path(name)
     if os.path.isfile(dst):
         return dst
+    # Deja dans une bibliotheque LoRA (principal ou extras, ex. copie Civitai) ?
+    # -> on l'utilise sans rien telecharger.
+    found = find_local(_candidates(s))
+    if found:
+        _dbg(f"edit LoRA {name}: using existing file {found}")
+        return found
     if not download:
         raise FileNotFoundError(dst)
     return _download(s, dst, progress)
+
+
+def lora_dirs():
+    """Dossiers LoRA (principal + extras) SANS importer cz_pipeline si absent (torch):
+    memes priorites env > preferences > config que cz_pipeline."""
+    import sys
+    cp = sys.modules.get("cz_pipeline")
+    if cp is not None and hasattr(cp, "_lora_dirs"):
+        return cp._lora_dirs()
+    from cz_core import HERE, _prefs
+    main = (os.environ.get("LORAS_DIR") or _prefs.get("loras_dir")
+            or CONFIG.get("loras_dir") or os.path.join(HERE, "loras"))
+    extra = (os.environ["LORAS_EXTRA_DIRS"] if "LORAS_EXTRA_DIRS" in os.environ
+             else (_prefs.get("loras_extra_dirs") or CONFIG.get("loras_extra_dirs") or []))
+    if isinstance(extra, str):
+        extra = [p for chunk in extra.split(os.pathsep) for p in chunk.split(";")]
+    dirs = [main]
+    for d in extra:
+        d = str(d or "").strip()
+        if d and d not in dirs:
+            dirs.append(d)
+    return dirs
+
+
+def local_index():
+    """{nom_de_fichier_minuscule: chemin} de tous les .safetensors des dossiers LoRA
+    (principal d'abord: il gagne sur un meme nom). Un seul parcours disque, a passer
+    a find_local / is_downloaded / catalog quand on interroge plusieurs presets."""
+    idx = {}
+    for d in lora_dirs():
+        if not os.path.isdir(d):
+            continue
+        for root, _dirs, files in os.walk(d):
+            for f in files:
+                k = f.lower()
+                if k.endswith(".safetensors") and k not in idx:
+                    idx[k] = os.path.join(root, f)
+    return idx
+
+
+def find_local(filenames, index=None):
+    """Premier fichier dont le nom (insensible a la casse) figure dans `filenames`,
+    cherche dans les dossiers LoRA (index = local_index() deja construit). None si absent."""
+    if index is None:
+        index = local_index()
+    for f in filenames:
+        p = index.get(str(f).lower()) if f else None
+        if p:
+            return p
+    return None
+
+
+# ----------------------------------------------------------------------------
+# Mode rapide: LoRA Lightning (distillation) pour l'edition, 4 ou 8 steps, CFG off.
+# Le fichier depend de la revision du modele d'edition (2509 / 2511): choisi d'apres
+# le nom du modele omni. Cherche d'abord dans les dossiers LoRA (les bibliotheques
+# Civitai ont souvent deja la 8-steps), sinon telecharge (repo lightx2v, 2509 = gated:
+# un hf_token est necessaire).
+# ----------------------------------------------------------------------------
+AUTO_SPEED = "Auto (model profile)"
+SPEED_SPECS = {
+    "Lightning 4 steps": {
+        "steps": 4, "guidance": 1.0,
+        "files": {
+            "2509": ("lightx2v/Qwen-Image-Edit-2509-Lightning",
+                     "Qwen-Image-Edit-2509-Lightning-4steps-V1.0-bf16.safetensors"),
+            "2511": ("lightx2v/Qwen-Image-Edit-2511-Lightning",
+                     "Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors")}},
+    "Lightning 8 steps": {
+        "steps": 8, "guidance": 1.0,
+        "files": {
+            "2509": ("lightx2v/Qwen-Image-Edit-2509-Lightning",
+                     "Qwen-Image-Edit-2509-Lightning-8steps-V1.0-bf16.safetensors"),
+            "2511": ("lightx2v/Qwen-Image-Edit-2511-Lightning",
+                     "Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors")}},
+}
+
+
+def speed_names():
+    """Choix du dropdown 'Edit speed' (sans 'Off', ajoute par cz_pipeline)."""
+    return [AUTO_SPEED] + list(SPEED_SPECS)
+
+
+def edit_base_revision(omni_model):
+    """'2511' si le modele d'edition est un 2511, sinon '2509' (Plus)."""
+    return "2511" if "2511" in str(omni_model or "") else "2509"
+
+
+def resolve_speed(name, omni_model, download=True):
+    """{"name", "steps", "guidance", "path", "base"} pour un mode Lightning: la LoRA
+    est prise dans les dossiers LoRA si presente, sinon telechargee dans edit_loras_dir.
+    KeyError si le nom est inconnu."""
+    key = None
+    for k in SPEED_SPECS:
+        if k.lower() == str(name or "").strip().lower():
+            key = k
+    if key is None:
+        raise KeyError(f"unknown edit speed: {name!r} (known: {', '.join(SPEED_SPECS)})")
+    sp = SPEED_SPECS[key]
+    base = edit_base_revision(omni_model)
+    repo, fname = sp["files"][base]
+    path = find_local([fname])
+    if path is None:
+        dst = os.path.join(edit_loras_dir(), fname)
+        if os.path.isfile(dst):
+            path = dst
+        elif download:
+            path = _download({"repo": repo, "weights": fname}, dst)
+        else:
+            raise FileNotFoundError(dst)
+    return {"name": key, "steps": int(sp["steps"]), "guidance": float(sp["guidance"]),
+            "path": path, "base": base}
 
 
 def _download(s, dst, progress=None):
@@ -271,9 +408,10 @@ def _download(s, dst, progress=None):
     return dst
 
 
-def status_label(name):
-    """Libelle pour l'UI: 'Nom ✓' si deja sur disque, 'Nom ⬇' sinon."""
-    return f"{name} {'✓' if is_downloaded(name) else '⬇'}"
+def status_label(name, index=None):
+    """Libelle pour l'UI: 'Nom ✓' si deja sur disque (dossier _hf-edit ou une
+    bibliotheque LoRA), 'Nom ⬇' sinon."""
+    return f"{name} {'✓' if is_downloaded(name, index=index) else '⬇'}"
 
 
 def strip_label(label):
@@ -286,7 +424,8 @@ def strip_label(label):
 def catalog():
     """Liste legere pour caps / UI: [{name, adapter_name, repo, prompt, inputs,
     base, downloaded}] - sans rien telecharger."""
+    idx = local_index()
     return [{"name": n, "adapter_name": s["adapter_name"], "repo": s["repo"],
              "prompt": s.get("prompt", ""), "inputs": int(s.get("inputs", 1)),
-             "base": s.get("base", ""), "downloaded": is_downloaded(n)}
+             "base": s.get("base", ""), "downloaded": is_downloaded(n, index=idx)}
             for n, s in SPECS.items()]

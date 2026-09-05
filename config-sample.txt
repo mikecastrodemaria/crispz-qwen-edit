@@ -40,6 +40,10 @@
     },
     "_model_profiles_help": "Auto steps/guidance when a checkpoint is selected, matched by substring on the file name (first match wins, in order). Keep specific keys (rapid, lightning) BEFORE generic ones (qwen): Lightning/Rapid merges are distilled -> few steps, guidance 1.0 (CFG off).",
     "model_profiles": {
+            "aio": {
+                    "steps": 4,
+                    "guidance": 1.0
+            },
             "rapid": {
                     "steps": 8,
                     "guidance": 1.0
@@ -67,6 +71,8 @@
     "edit_loras_dir": "",
     "_edit_loras_enabled_help": "Initial state of the 'Edit LoRAs' checkbox (Models > LoRA). Off = the chosen preset is kept but not applied (quick with/without comparison).",
     "edit_loras_enabled": true,
+    "_edit_fast_help": "Initial 'Edit speed' (Reference (Omni) tab): Off | Auto (model profile) | Lightning 4 steps | Lightning 8 steps. Lightning stacks the lightx2v Lightning edit LoRA (2509/2511 picked from the edit model name) and forces N steps / CFG off. Auto = model_profiles of the edit model (Rapid-AIO 'aio' -> 4 steps).",
+    "edit_fast": "Off",
     "_default_guidance_help": "Qwen 'guidance' = true_cfg_scale (real CFG, enables negative prompt). ~3-5 recommended.",
     "_default_refine_help": "Upscale/refine pass OFF by default (txt2img only = fast startup). NB: the diffusion refine needs a non-quantized base; with a GGUF model it is skipped/limited. Enable per-run via the Upscale checkbox.",
     "_zimage_omni_base_help": "Base edit repo providing text-encoder/VAE/processor when 'zimage_omni_model' is a .gguf transformer. Default Qwen/Qwen-Image-Edit-2509 (downloads ~17GB once).",
@@ -111,6 +117,8 @@
 
     "checkpoints_dir": "",
     "loras_dir": "",
+    "_loras_extra_dirs_help": "Extra LoRA folders merged with loras_dir (list, or 'a;b'). Same file name: loras_dir wins. Edit presets and Lightning LoRAs already present there are reused instead of downloaded.",
+    "loras_extra_dirs": [],
     "wildcards_dir": "",
     "default_lora_weight": 1.0,
     "_default_lora_weight_help": "Weight a LoRA slot starts at. Must sit inside lora_weight_min..lora_weight_max (it is clamped into the range otherwise).",

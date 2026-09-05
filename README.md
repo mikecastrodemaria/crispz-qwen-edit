@@ -564,6 +564,19 @@ reference (light, style) in **Ref 2**. The **Edit LoRAs** checkbox in Models →
 switches the whole edit set on/off without losing the selection. `config.txt`
 `edit_loras` adds/replaces/removes presets, `edit_loras_dir` moves the folder.
 
+**Edit speed** (next dropdown): `Lightning 4 steps` / `Lightning 8 steps` stack the
+lightx2v Lightning edit LoRA (2509 or 2511, chosen from the edit model name; taken
+from your LoRA folders when already there, downloaded otherwise) and force N steps
+with CFG off. `Auto (model profile)` is for an already-distilled edit model such as
+a Rapid-AIO single file set as `zimage_omni_model` (`.gguf` or `.safetensors`, the
+FP8 builds are dequantized like the base): steps/guidance come from
+`model_profiles` (`aio` = 4 steps). `Off` keeps the Settings values. Initial value:
+`config.txt` `edit_fast`.
+
+**Extra LoRA folders**: `loras_extra_dirs` (config, or the textbox under the LoRA
+folder, or `--loras-extra-dir`) merges other libraries, e.g. a shared Civitai
+folder, into every LoRA list. On a duplicate file name the main folder wins.
+
 ## Disabling the upscale (pure txt2img / pure img2img)
 
 - **txt2img only** (no upscale): the default. Don't pass `--upscale` (CLI), or leave
@@ -1093,7 +1106,9 @@ model - see `caps.supports.edit`). On `edit`, `spec.loras` accepts an edit prese
 name (`"Photo-to-Anime"`, `"upscale-2k:1.0"`, see `caps.edit_loras`) or a file, and
 lands on the edit pipe; `guidance` is applied there (distilled setups want 1.0),
 and an explicit `width`/`height` is passed to the pipe (Upscaler preset = 2x
-output). A broken `config.txt` (invalid JSON, e.g.
+output). `fast` (`off|auto|lightning-4|lightning-8`, see `caps.edit_fast`) sets
+the edit speed mode; an explicit `steps` is never overridden by it. A broken
+`config.txt` (invalid JSON, e.g.
 single backslashes in a Windows path) is reported loudly at startup instead
 of silently falling back to the sample.
 `czp caps` prints capabilities and whether an instance is running. Exit codes:

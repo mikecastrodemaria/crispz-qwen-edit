@@ -385,6 +385,9 @@ def cli_main(argv=None):
                         help="Apply a LoRA (file in the loras dir, or a path), optional :weight "
                              "(default 1.0). Repeatable, e.g. --lora a.safetensors:0.8 --lora b")
     parser.add_argument("--loras-dir", help="Override the LoRA folder (for --lora names)")
+    parser.add_argument("--loras-extra-dir", action="append", default=[], metavar="DIR",
+                        help="Extra LoRA folder(s) merged with the main one (config "
+                             "loras_extra_dirs). Repeatable.")
     parser.add_argument("--remove-bg", action="store_true",
                         help="Remove the background of -i (rembg) -> transparent PNG, then exit.")
     parser.add_argument("--provenance", action="store_true",
@@ -510,6 +513,8 @@ def cli_main(argv=None):
     # LoRA(s) en CLI: --lora NAME[:WEIGHT] (repetable)
     if args.loras_dir:
         set_loras_dir(args.loras_dir)
+    if args.loras_extra_dir:
+        cz_pipeline.set_loras_extra_dirs(args.loras_extra_dir)
     if args.lora:
         slots = []
         for spec in args.lora:

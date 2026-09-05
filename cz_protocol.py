@@ -54,11 +54,18 @@ OPS = ("caps", "gen", "upscale", "edit")
 SPEC_FIELDS = ("protocol", "op", "prompt", "negative", "width", "height",
                "seed", "steps", "guidance", "refs", "loras", "model", "input",
                "out_dir", "count", "detail_faces", "detail_hands",
-               "factor", "denoise")
+               "factor", "denoise", "fast")
 
 _DEF_URL = "http://127.0.0.1:7860"
 
 MAX_REFS = 4                      # Omni pipeline limit (same as the UI)
+
+# spec.fast (op edit) -> nom du mode cote cz_pipeline.set_edit_speed
+_FAST_ALIASES = {"off": "Off", "none": "Off", "auto": "Auto (model profile)",
+                 "lightning-4": "Lightning 4 steps", "lightning4": "Lightning 4 steps",
+                 "lightning 4 steps": "Lightning 4 steps",
+                 "lightning-8": "Lightning 8 steps", "lightning8": "Lightning 8 steps",
+                 "lightning 8 steps": "Lightning 8 steps"}
 
 # Whether this model family has a multi-reference/omni pipeline AT ALL.
 # crispz-krea / crispz-krea2 hard-set this to False (their _load_omni raises:
@@ -77,7 +84,8 @@ def _omni_configured():
     stay light)."""
     if not OMNI_SUPPORTED:
         return False
-    return bool((os.environ.get("ZIMAGE_OMNI_MODEL")
+    from cz_core import _prefs
+    return bool((os.environ.get("ZIMAGE_OMNI_MODEL") or _prefs.get("zimage_omni_model")
                  or CONFIG.get("zimage_omni_model") or OMNI_DEFAULT).strip())
 
 
@@ -108,16 +116,34 @@ def _list_model_files(kind, exts=(".safetensors", ".gguf")):
     """Fichiers modeles disponibles (chemins relatifs POSIX, tries). Simple
     listage disque - la SOURCE DE VERITE des modeles reste chaque outil, les
     appelants (wizard comics2crispz) ne configurent aucun chemin."""
-    d = _models_dir(kind)
-    out = []
-    if os.path.isdir(d):
+    dirs_to_scan = [_models_dir(kind)]
+    if kind == "loras":
+        # dossiers LoRA supplementaires (loras_extra_dirs), meme regle que
+        # cz_pipeline: fusionnes, le principal gagne sur un meme nom.
+        from cz_core import _prefs
+        # env explicite (meme vide) > preferences > config
+        extra = (os.environ["LORAS_EXTRA_DIRS"] if "LORAS_EXTRA_DIRS" in os.environ
+                 else (_prefs.get("loras_extra_dirs") or CONFIG.get("loras_extra_dirs") or []))
+        if isinstance(extra, str):
+            extra = [p for c in extra.split(os.pathsep) for p in c.split(";")]
+        for x in extra:
+            x = str(x or "").strip()
+            if x and x not in dirs_to_scan:
+                dirs_to_scan.append(x)
+    out, seen = [], set()
+    for d in dirs_to_scan:
+        if not os.path.isdir(d):
+            continue
         for root, dirs, files in os.walk(d):
             dirs[:] = [x for x in dirs
                        if x not in ("_index", ".cache", "recipes")]
             for f in files:
                 if f.lower().endswith(exts):
-                    out.append(os.path.relpath(os.path.join(root, f), d)
-                               .replace("\\", "/"))
+                    rel = (os.path.relpath(os.path.join(root, f), d)
+                           .replace("\\", "/"))
+                    if rel.lower() not in seen:
+                        seen.add(rel.lower())
+                        out.append(rel)
     return sorted(out, key=str.lower)
 
 
@@ -164,7 +190,9 @@ def caps_dict():
             # Presets d'edition (LoRA HF, telecharges a la demande): un appelant
             # met leur `name` dans spec.loras sur l'op edit. `inputs` = 2 ->
             # input + 1 ref (spec.refs). Listage leger, rien n'est telecharge.
-            "edit_loras": _edit_lora_catalog()}
+            "edit_loras": _edit_lora_catalog(),
+            # Modes rapides acceptes par spec.fast sur l'op edit.
+            "edit_fast": ["off", "auto", "lightning-4", "lightning-8"]}
 
 
 def _edit_lora_catalog():
@@ -256,6 +284,15 @@ def validate_spec(spec, op="gen"):
         # (preset Upscaler: sortie 2x). Taille par defaut -> l'edition garde
         # les dimensions natives de l'entree (comportement historique).
         out["size_explicit"] = bool(spec.get("width") and spec.get("height"))
+        # fast = mode rapide de l'edition: "off" | "auto" (profil du modele,
+        # Rapid-AIO / merge Lightning) | "lightning-4" | "lightning-8" (LoRA
+        # Lightning empilee). Absent -> le reglage de l'instance reste.
+        if spec.get("fast") is not None:
+            f = str(spec["fast"]).strip().lower()
+            if f not in _FAST_ALIASES:
+                raise SpecError(f"invalid 'fast' {spec['fast']!r} (expected one of "
+                                f"{', '.join(sorted(_FAST_ALIASES))})")
+            out["fast"] = _FAST_ALIASES[f]
         if not spec.get("width") or not spec.get("height"):
             # taille par defaut = celle de l'image (alignee 32, bornee)
             try:
@@ -417,6 +454,10 @@ def run_gen(spec, warnings=None, route="local"):
                 extra["guidance"] = float(spec["guidance"])
             if spec.get("size_explicit"):
                 extra["honor_size"] = True
+            if spec.get("steps") is not None:
+                extra["steps_explicit"] = True     # le mode rapide ne les ecrase pas
+            if spec.get("fast") and hasattr(cz_pipeline, "set_edit_speed"):
+                cz_pipeline.set_edit_speed(spec["fast"])
             img = cz_pipeline.generate_omni(
                 imgs, spec["prompt"], spec.get("negative", ""),
                 spec["width"], spec["height"], steps, seed_used, **extra)
