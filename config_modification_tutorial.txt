@@ -1,4 +1,4 @@
-crispz-studio - config tutorial
+crispz-qwen-edit - config tutorial
 ================================
 
 HOW IT WORKS
