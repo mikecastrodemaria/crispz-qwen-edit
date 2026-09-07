@@ -72,6 +72,29 @@ caps, extra dirs merge + protocol listing, preset reuse from a library,
 Lightning revision pick + stacking + Auto profile, `fast` aliases),
 `test_protocol_edit.py` updated for the new `generate_omni` kwargs.
 
+## Unreleased — the hand detailer was declared missing while it was ready to run
+
+`_hands_available()` tested for the `ultralytics` package. But at run time the
+detailer needs only **onnxruntime** plus the detector exported once to
+`cache/*.onnx`; ultralytics is required solely for that export, which
+`cz_detailer._ensure_hand_onnx()` deliberately runs in a **subprocess** — its
+docstring records why, with checksums: YOLO merely resident in the diffusion
+process corrupts shared weights during offload transfers, and renders come out
+tiled, then NaN.
+
+So the check punished exactly the people who had followed that advice and
+exported the `.onnx` from a throwaway venv without installing ultralytics in the
+app: the detector was in place, and the app answered `detail_hands: false`. It
+now reports available when onnxruntime is there and either ultralytics can do the
+export on demand **or** the `.onnx` already exists.
+
+Strictly more permissive: an install that already had the capability keeps it,
+and one that genuinely cannot run the detailer still reports `false`.
+
+Found on crispz-klein, where the case actually happened; propagated across the
+family, which shares `cz_protocol.py` by copy. Regression test:
+`tests/test_hands_available.py`.
+
 ## Unreleased — GGUF: the tensor layout outranks the declared architecture
 
 `general.architecture` is just a KV string, and conversion tools stamp it wrong:
