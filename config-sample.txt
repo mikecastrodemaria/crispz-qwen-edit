@@ -118,6 +118,10 @@
     "refine_tile_prompt": "",
 
     "checkpoints_dir": "",
+    "_text_encoder_help": "Replace the text encoder (Qwen2.5-VL-7B) on BOTH pipes, base and edit: a transformers FOLDER (config.json + .safetensors) or a Hugging Face repo id ('owner/repo', or 'owner/repo/subfolder' when the weights sit in a sub-folder). Empty = each repo's own. It must match the repo it replaces - same model type (qwen2_5_vl), hidden size 3584, 28 layers - and each pipe checks it against its own repo (zimage_omni_base or the edit repo for the edit pipe); anything else is refused with the reason, and a pipe whose check or load fails keeps its own encoder. GGUF and single files are refused: give the folder. Tokenizer and processor stay the repo's. Also in Models > Checkpoints > Text encoder. Changing it reloads both pipes and clears the prompt-embedding cache. Env QWEN_TEXT_ENCODER.",
+    "text_encoder": "",
+    "_text_encoders_dir_help": "Folder scanned for the Text encoder list (one sub-folder per encoder, with a config.json at its root or in text_encoder/). Empty = 'text_encoders', 'text_encoder' or 'clip' next to the checkpoints folder or its parent.",
+    "text_encoders_dir": "",
     "loras_dir": "",
     "_loras_extra_dirs_help": "Extra LoRA folders merged with loras_dir (list, or 'a;b'). Same file name: loras_dir wins. Edit presets and Lightning LoRAs already present there are reused instead of downloaded.",
     "loras_extra_dirs": [],

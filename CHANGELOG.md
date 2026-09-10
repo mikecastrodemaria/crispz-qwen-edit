@@ -72,6 +72,84 @@ caps, extra dirs merge + protocol listing, preset reuse from a library,
 Lightning revision pick + stacking + Auto profile, `fast` aliases),
 `test_protocol_edit.py` updated for the new `generate_omni` kwargs.
 
+## Unreleased — swap the text encoder, on the base and the edit pipe
+
+Models > Checkpoints gets a **Text encoder** picker, ported from crispz-klein
+1.34.0. Default is each repo's own Qwen2.5-VL-7B, as before. Otherwise a
+transformers folder (config.json + safetensors) or a Hugging Face repo id
+(`owner/repo`, or `owner/repo/subfolder` when the weights sit in a sub-folder),
+for instance an abliterated Qwen2.5-VL-7B. Only the encoder changes: tokenizer,
+processor, VAE and transformer still come from the repo.
+
+It applies to **both** pipes, which load separately:
+
+- the base pipe (`QwenImagePipeline`, shared by img2img and inpaint through
+  `from_pipe`) receives it as `text_encoder=`;
+- the edit pipe receives it in place of `comps['text_encoder']` when it is
+  assembled component by component around a single-file edit transformer (the base
+  edit repo's ~17 GB encoder is then never read), and as `text_encoder=` when a
+  full edit repo loads.
+
+Each pipe checks the candidate against **its own** repo's encoder config before
+anything loads — `BASE_REPO` for the base pipe, `zimage_omni_base` or the edit repo
+for the edit pipe: same model type (`qwen2_5_vl`), same hidden size (3584), same
+layer count (28), read from `text_config` when the config nests it. Qwen-Image
+feeds the encoder's last hidden state through `txt_norm` + `txt_in`, both 3584
+wide, so a Qwen2.5-VL-3B (2048) cannot drive it; the refusal names both numbers. A
+text-only Qwen2.5-7B (`qwen2`) has the right size but is refused by type: the edit
+pipe shows the encoder the input image. GGUF and single files are refused with the
+reason: there is no config.json, give the folder.
+
+Changing the encoder frees both pipes (the encoder loads with them) and clears the
+prompt-embedding cache. The cache key now carries the encoder as well: `id(enc)`
+alone was not enough, since CPython reuses the id of a freed object. An encoder
+that turns out not to fit at load time, or fails to load, is set aside with a log
+line and the repo's own encoder runs: a generation never fails over it. The image
+says which: `text_encoder` in the metadata names the encoder that actually ran —
+for an edit, the edit pipe's — by folder name and never by path;
+`text_encoder_not_applied` names one that was asked for and skipped. The A1111
+`parameters` line gains `Text encoder:`. The queue snapshot keeps the encoder, so a
+replayed job runs with its own; a job queued before this option leaves the current
+encoder alone.
+
+Choosing **Default** saves an empty `text_encoder` in the preferences, and that empty
+value wins over a `text_encoder` set in config.txt at the next start (an empty string used
+to count as absent); the environment variable still wins over both.
+
+Config: `text_encoder`, `text_encoders_dir` (the list scans its sub-folders;
+default `text_encoders`, `text_encoder` or `clip` next to the checkpoints folder or
+its parent). Env `QWEN_TEXT_ENCODER`.
+
+Checked against the real Qwen2.5-VL-7B, on CPU: the stock encoder loaded through this
+path is the same class with bit-identical weights (729 tensors), and a text-only Qwen3
+is refused with the reason. A full GPU render was not run: Qwen-Image (20B, ~40 GB in
+bf16) spills the 32 GB card under model offload. Regression tests in
+`tests/test_text_encoder.py`; `tests/test_queue.py` expects the new snapshot key.
+
+## Unreleased — edits were encoded without their input image
+
+Since the prompt-embedding cache (entry below), every edit ran on **text-only**
+embeddings. `_cached_prompt_embeds` calls `pipe.encode_prompt(prompt=...,
+device=...)`, with no `image`. On `QwenImageEditPlusPipeline` (and
+`QwenImageEditPipeline`) the image is part of the encoding: `encode_prompt(prompt,
+image)` prefixes the instruction with
+`Picture 1: <|vision_start|><|image_pad|><|vision_end|>` and Qwen2.5-VL reads the
+picture along with the words. And `__call__` skips its own encoding as soon as it
+is handed `prompt_embeds`. So the Reference (Omni) tab and the protocol op `edit`
+still gave the transformer the image latents, but the text encoder never saw the
+picture it was asked to edit.
+
+`_qwen_call` now bypasses the cache when the call carries an `image` **and** the
+pipeline's `encode_prompt` takes an `image` parameter — read with
+`inspect.signature`, not from a class list. The img2img and inpaint pipes also
+receive an `image`, but it is their init image and their `encode_prompt` has no
+such parameter: they keep the cache, and the detailer keeps its gain. An edit
+encodes its prompt on every call again, as it did before the cache.
+
+Introduced by 736e0ce. Regression test: `tests/test_edit_prompt_image.py` (fake
+pipes with and without `image` in `encode_prompt`, plus the signatures of the
+installed diffusers pipelines).
+
 ## Unreleased — cache the encoded prompt: stop moving the text encoder per call
 
 Encoding a prompt walks the text encoder onto the GPU. Under

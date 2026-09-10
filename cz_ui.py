@@ -686,6 +686,41 @@ def _apply_transformer_repo(repo):
             gr.update(value=st), gr.update(value=g), _perf_update(st, g))
 
 
+def _te_choices():
+    """Choix du dropdown 'Text encoder': le defaut (valeur ''), les dossiers trouves, et
+    la valeur courante si elle vient d'ailleurs (chemin colle, repo HF)."""
+    ch = [("Default (repo's own)", "")]
+    for p in cz_pipeline.list_text_encoders():
+        ch.append((cz_pipeline._encoder_label(p), p))
+    cur = cz_pipeline.TEXT_ENCODER
+    if cur and cur not in [v for _lab, v in ch]:
+        ch.append((cz_pipeline._encoder_label(cur), cur))
+    return ch
+
+
+def _ui_set_text_encoder(src):
+    """Applique et memorise l'encodeur choisi (pipes base ET edition) -- sauf s'il ne
+    convient pas au repo de base: refus nomme, rien de change, rien d'ecrit dans les
+    preferences. Le pipe d'edition refait sa propre verification a son chargement."""
+    src = (src or "").strip()
+    why = cz_pipeline._text_encoder_problem(src) if src else None
+    if why:
+        return f"⚠️ Text encoder not applied: {why}."
+    changed = src != cz_pipeline.TEXT_ENCODER
+    cz_pipeline.set_text_encoder(src)
+    _save_prefs_keys({cz_pipeline.CFG_TEXT_ENCODER_KEY: src})
+    reload = (" Base and edit pipes reload on next run; the prompt cache was cleared."
+              if changed else "")
+    if not src:
+        return "Text encoder: each repo's own." + reload
+    return (f"Text encoder: **{cz_pipeline._encoder_label(src)}** on the base and edit "
+            f"pipes. Tokenizer, processor, VAE and transformer stay the repo's." + reload)
+
+
+def _ui_refresh_text_encoders():
+    return gr.update(choices=_te_choices())
+
+
 def _wild_sanitize(name):
     return "".join(c for c in (name or "").strip() if c.isalnum() or c in "_-")[:64]
 
@@ -1914,7 +1949,8 @@ def _q_model_state():
             "transformer": cz_pipeline.ZIMAGE_TRANSFORMER,
             "loras": list(cz_pipeline.LORAS),
             "sampler": cz_pipeline.SAMPLER,
-            "schedule": cz_pipeline.SCHEDULE}
+            "schedule": cz_pipeline.SCHEDULE,
+            "text_encoder": cz_pipeline.TEXT_ENCODER}
 
 
 def _q_restore_model_state(ms):
@@ -1923,6 +1959,9 @@ def _q_restore_model_state(ms):
     if ms.get("base_repo"):
         set_zimage_model(ms["base_repo"])
     set_zimage_transformer(ms.get("transformer") or "")
+    # Encodeur texte: 'text_encoder' absent = snapshot d'avant l'option -> on n'y touche pas.
+    if "text_encoder" in ms:
+        cz_pipeline.set_text_encoder(ms.get("text_encoder") or "")
     set_loras([(p, w) for p, w in (ms.get("loras") or [])])
     set_sampler(ms.get("sampler") or "euler")
     set_schedule(ms.get("schedule") or "sgm_uniform")
@@ -3662,6 +3701,18 @@ def build_ui():
                                 with gr.Row():
                                     transformer_apply_btn = gr.Button("Apply override", size="sm",
                                                                       variant="secondary")
+                            with gr.Column():
+                                te_dd = gr.Dropdown(
+                                    choices=_te_choices(), value=cz_pipeline.TEXT_ENCODER or "",
+                                    allow_custom_value=True, label="Text encoder",
+                                    info="Default: each repo's own Qwen2.5-VL-7B. Or a transformers "
+                                         "folder (config.json + weights) or HF repo of the SAME "
+                                         "size, e.g. an abliterated Qwen2.5-VL-7B. Used by the base "
+                                         "AND edit pipes. Pick or paste a path; changing it reloads "
+                                         "the model and clears the prompt cache.")
+                                with gr.Row():
+                                    te_refresh_btn = gr.Button("Refresh encoders", size="sm", scale=1)
+                                te_status = gr.Markdown("")
 
                         with gr.Accordion("\U0001F9E9 LoRA (combinable)", open=False):
                             lora_dir_tb = gr.Textbox(value=cz_pipeline.LORAS_DIR, label="LoRA folder")
@@ -3942,6 +3993,8 @@ def build_ui():
             .then(set_schedule, [schedule_dd], [sampler_status])
         transformer_apply_btn.click(_apply_transformer_repo, [transformer_tb],
                                     [ckpt_status, gen_steps, guidance, performance])
+        te_dd.change(_ui_set_text_encoder, [te_dd], [te_status])
+        te_refresh_btn.click(_ui_refresh_text_encoders, None, [te_dd])
         lora_refresh_btn.click(_refresh_loras, [lora_dir_tb, lora_extra_dirs_tb],
                                lora_dds + [lora_status])
         # slots entrelaces: dd1, lw1, dd2, lw2, ... (attendu par _apply_loras/_ui_loras_apply)

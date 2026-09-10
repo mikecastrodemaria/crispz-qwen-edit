@@ -81,7 +81,8 @@ def test_render():
 
 def test_model_state_roundtrip_keys():
     ms = cz_ui._q_model_state()
-    assert set(ms) == {"base_repo", "transformer", "loras", "sampler", "schedule"}
+    assert set(ms) == {"base_repo", "transformer", "loras", "sampler", "schedule",
+                       "text_encoder"}
 
 
 # ---------------------------------------------------- pause / stop semantics ---

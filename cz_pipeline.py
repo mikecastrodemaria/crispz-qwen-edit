@@ -68,6 +68,36 @@ if _is_single_file(_zmodel):
 else:
     BASE_REPO = _zmodel
 
+# Encodeur texte de remplacement (Models > Checkpoints > Text encoder). Vide = celui du
+# repo, comme avant. Sinon un DOSSIER au format transformers (config.json + poids) ou un
+# repo HF ('owner/repo', 'owner/repo/sous-dossier') -- ex. un Qwen2.5-VL-7B "abliterated".
+# Vaut pour les DEUX pipes, base et edition. Seul l'encodeur change: tokenizer,
+# processor, VAE et transformer restent ceux du repo.
+CFG_TEXT_ENCODER_KEY = "text_encoder"
+
+
+def _resolve_text_encoder(env, prefs, config):
+    """Encodeur au demarrage: env > preferences > config. Une cle PRESENTE dans les
+    preferences gagne meme vide: c'est le choix "Default" fait dans l'UI, et une valeur
+    de config.txt ne doit pas le defaire au redemarrage (un "" passait pour absent)."""
+    v = str(env.get("QWEN_TEXT_ENCODER") or "").strip()
+    if v:
+        return v
+    if CFG_TEXT_ENCODER_KEY in prefs:
+        return str(prefs.get(CFG_TEXT_ENCODER_KEY) or "").strip()
+    return str(config.get(CFG_TEXT_ENCODER_KEY) or "").strip()
+
+
+TEXT_ENCODER = _resolve_text_encoder(os.environ, _prefs, CONFIG)
+# Celui qui est REELLEMENT charge ('' = celui du repo), par pipe: le base (txt2img et ses
+# derives img2img / inpaint) et le pipe d'edition, charge a part et qui peut l'ecarter
+# seul. Distinct de TEXT_ENCODER: un encodeur qui ne convient pas est ecarte au
+# chargement, et les metadonnees disent ce qui a tourne, pas ce qui etait demande.
+_TEXT_ENCODER_ACTIVE = ""
+_TEXT_ENCODER_ACTIVE_EDIT = ""
+TEXT_ENCODERS_DIR = str(os.environ.get("TEXT_ENCODERS_DIR") or _prefs.get("text_encoders_dir")
+                        or CONFIG.get("text_encoders_dir") or "").strip()
+
 # Dossiers de modeles Z-Image: checkpoints single-file a switcher + LoRA a appliquer.
 CHECKPOINTS_DIR = (os.environ.get("CHECKPOINTS_DIR") or _prefs.get("checkpoints_dir")
                    or CONFIG.get("checkpoints_dir") or os.path.join(HERE, "checkpoints"))
@@ -366,7 +396,10 @@ def _cached_prompt_embeds(pipe, prompt, kw):
             return None
         # Les LoRA font partie de la clef: certaines touchent l'encodeur de texte,
         # et un embedding calcule sans elles serait faux.
-        key = (BASE_REPO, id(enc), prompt, kw.get("max_sequence_length"),
+        # L'encodeur de remplacement aussi: id(enc) seul ne suffit pas, CPython
+        # recycle l'id d'un objet libere -- et un autre encodeur encode autrement.
+        key = (BASE_REPO, _TEXT_ENCODER_ACTIVE, id(enc), prompt,
+               kw.get("max_sequence_length"),
                tuple(sorted((p, float(w)) for p, w in _APPLIED_LORAS)))
         hit = _EMBED_CACHE.get(key)
         if hit is None:
@@ -390,13 +423,31 @@ def _cached_prompt_embeds(pipe, prompt, kw):
         return None
 
 
+def _encodes_with_image(pipe):
+    """Vrai si encode_prompt de ce pipeline prend l'image. Le pipe d'EDITION
+    (QwenImageEdit / EditPlus) prefixe le prompt des jetons de vision de l'image
+    ('Picture 1: <|vision_start|><|image_pad|><|vision_end|>') et Qwen2.5-VL lit l'image
+    avec l'instruction: un embedding calcule sans elle est un embedding texte seul.
+    img2img / inpaint recoivent aussi `image`, mais c'est l'image de depart: leur
+    encode_prompt n'a pas ce parametre. Signature illisible -> Vrai, donc pas de cache:
+    un encodage de trop coute du temps, un encodage faux coute l'image."""
+    import inspect
+    try:
+        return "image" in inspect.signature(pipe.encode_prompt).parameters
+    except (AttributeError, TypeError, ValueError):
+        return True
+
+
 def _qwen_call(pipe, **kw):
     """Appelle un pipeline Qwen en tolerant les variations d'API diffusers : si la version
     installee ne connait pas `true_cfg_scale` / `negative_prompt`, on retire ces kwargs et
     on relance plutot que de crasher la generation."""
     # Reutilise les embeddings si ce prompt a deja ete encode (cf. _EMBED_CACHE).
     # Les passer fait sauter l'encodeur de texte: c'est tout le gain.
-    if isinstance(kw.get("prompt"), str) and not any(k in kw for k in _EMBED_OUTS):
+    # Sauf quand l'encodage depend de l'image (pipe d'edition): __call__ ne re-encode
+    # jamais quand on lui passe prompt_embeds, l'edition tournerait sans son image.
+    if (isinstance(kw.get("prompt"), str) and not any(k in kw for k in _EMBED_OUTS)
+            and not (kw.get("image") is not None and _encodes_with_image(pipe))):
         _emb = _cached_prompt_embeds(pipe, kw["prompt"], kw)
         if _emb:
             kw.update(_emb)
@@ -620,6 +671,241 @@ def set_zimage_transformer(path):
         ZIMAGE_TRANSFORMER = path
         _log(f"Qwen transformer -> {path or '(repo de base)'} "
              "-> transformer swap on next run (base components kept)")
+
+
+# --- Encodeur texte de remplacement ---------------------------------------------------
+# Qwen-Image lit le DERNIER etat cache de l'encodeur (hidden_states[-1]) dans txt_norm +
+# txt_in, larges de 3584 (joint_attention_dim): un encodeur ne convient que s'il a la
+# meme famille (qwen2_5_vl -- le pipe d'edition lui montre l'image), la meme largeur et
+# le meme nombre de couches que celui du repo qu'il remplace. Un Qwen2.5-VL-7B
+# "abliterated" ou fine-tune se branche tel quel. On le verifie a la config, AVANT de
+# lire 16 Go -- et pour CHAQUE pipe contre SON repo (base, ou repo d'edition).
+_SINGLE_FILE_EXTS = (".safetensors", ".ckpt", ".pt", ".sft", ".gguf")
+
+
+def _looks_single_file(p):
+    """Vrai si le NOM est celui d'un checkpoint single-file, qu'il existe ou non
+    (_is_single_file exige en plus que le fichier soit la)."""
+    return bool(p) and str(p).lower().endswith(_SINGLE_FILE_EXTS)
+
+
+def _split_hf_src(src):
+    """'owner/repo/sous/dossier' -> ('owner/repo', 'sous/dossier'). Les poids d'un
+    encodeur publie sur HF sont souvent dans un sous-dossier du repo."""
+    parts = [p for p in str(src).replace("\\", "/").split("/") if p]
+    if len(parts) > 2:
+        return "/".join(parts[:2]), "/".join(parts[2:])
+    return str(src), None
+
+
+def _enc_dims(cfg):
+    """(largeur, couches, famille) d'une config transformers. Qwen2.5-VL range la partie
+    texte sous 'text_config' (en plus du premier niveau depuis transformers 4.53, et
+    seulement la dans les configs recentes); T5 dit d_model / num_layers."""
+    c = cfg.get("text_config") if isinstance(cfg.get("text_config"), dict) else cfg
+    h = c.get("hidden_size") or c.get("d_model")
+    n = c.get("num_hidden_layers") or c.get("num_layers")
+    return (int(h) if h else None, int(n) if n else None, cfg.get("model_type"))
+
+
+def _base_text_encoder_config(base=None):
+    """config.json de l'encodeur du repo `base` (BASE_REPO par defaut), ou None si
+    illisible."""
+    base = (base or BASE_REPO or "").strip()
+    try:
+        cfg = os.path.join(base, "text_encoder", "config.json")
+        if not os.path.isfile(cfg):
+            from huggingface_hub import hf_hub_download
+            try:
+                cfg = hf_hub_download(base, "text_encoder/config.json", local_files_only=True)
+            except Exception:
+                cfg = hf_hub_download(base, "text_encoder/config.json")
+        with open(cfg, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        _dbg(f"cannot read {base}'s text encoder config: {e}")
+        return None
+
+
+def _text_encoder_source(src):
+    """Localise l'encodeur `src`: (config, dossier ou repo, sous-dossier) ou None.
+    Dossier local: config.json a la racine ou dans text_encoder/. Repo HF: idem, ou le
+    sous-dossier nomme dans l'id."""
+    src = (src or "").strip()
+    if not src:
+        return None
+    if os.path.isdir(src):
+        for sub in (None, "text_encoder"):
+            p = os.path.join(src, sub, "config.json") if sub else os.path.join(src, "config.json")
+            if os.path.isfile(p):
+                try:
+                    with open(p, encoding="utf-8") as f:
+                        return json.load(f), src, sub
+                except Exception:
+                    return None
+        return None
+    if os.path.exists(src) or _looks_single_file(src) or "\\" in src or os.path.isabs(src):
+        return None
+    repo, sub0 = _split_hf_src(src)
+    try:
+        from huggingface_hub import hf_hub_download
+    except Exception:
+        return None
+    for sub in ([sub0] if sub0 else [None, "text_encoder"]):
+        try:
+            p = hf_hub_download(repo, f"{sub}/config.json" if sub else "config.json")
+            with open(p, encoding="utf-8") as f:
+                return json.load(f), repo, sub
+        except Exception:
+            continue
+    return None
+
+
+def _encoder_label(src):
+    """Nom lisible d'un encodeur: le NOM du dossier -- jamais le chemin, qui finirait
+    dans les PNG partages avec le nom de la session Windows -- ou l'id du repo HF."""
+    src = (src or "").strip()
+    if not src:
+        return ""
+    if os.path.isabs(src) or os.path.exists(src) or "\\" in src:
+        parts = [p for p in src.replace("\\", "/").split("/") if p]
+        if len(parts) >= 2 and parts[-1] == "text_encoder":
+            return parts[-2]
+        return parts[-1] if parts else src
+    return src
+
+
+def _text_encoder_problem(src, base=None):
+    """Raison de refuser `src` comme encodeur du repo `base` (BASE_REPO par defaut), ou
+    None s'il convient."""
+    src = (src or "").strip()
+    if not src:
+        return None
+    if src.lower().endswith(".gguf"):
+        return ("a GGUF text encoder is a ComfyUI / llama.cpp file; this app loads the "
+                "transformers folder (config.json + .safetensors)")
+    if os.path.isfile(src) or _looks_single_file(src):
+        return ("a single file carries no config.json; point to the FOLDER that holds "
+                "config.json and the weights")
+    found = _text_encoder_source(src)
+    if found is None:
+        return ("no config.json found, neither at its root nor in text_encoder/"
+                if os.path.isdir(src) else
+                "neither a folder on this machine nor a readable Hugging Face repo")
+    ref_cfg = _base_text_encoder_config(base)
+    if ref_cfg is None:
+        return None                      # rien a comparer: le chargement tranchera
+    (h, n, t), (rh, rn, rt) = _enc_dims(found[0]), _enc_dims(ref_cfg)
+    b = (base or BASE_REPO)
+    if t and rt and t != rt:
+        return f"a '{t}' model, and {b} uses a '{rt}' text encoder"
+    if h and rh and h != rh:
+        return (f"hidden size {h}, and {b}'s encoder is {rh} wide: the transformer "
+                f"cannot read its embeddings")
+    if n and rn and n != rn:
+        return f"{n} layers, and {b}'s encoder has {rn}"
+    return None
+
+
+def _encoder_class(base=None):
+    """Classe transformers de l'encodeur, lue dans le model_index.json du repo `base`
+    (Qwen2_5_VLForConditionalGeneration ici): la meme que celle que diffusers aurait
+    chargee."""
+    base = (base or BASE_REPO or "").strip()
+    try:
+        p = os.path.join(base, "model_index.json")
+        if not os.path.isfile(p):
+            from huggingface_hub import hf_hub_download
+            try:
+                p = hf_hub_download(base, "model_index.json", local_files_only=True)
+            except Exception:
+                p = hf_hub_download(base, "model_index.json")
+        with open(p, encoding="utf-8") as f:
+            lib, cls = json.load(f)["text_encoder"]
+        import importlib
+        return getattr(importlib.import_module(lib), cls)
+    except Exception as e:
+        raise RuntimeError(f"cannot tell which class {base}'s text encoder uses "
+                           f"({type(e).__name__}: {e})") from e
+
+
+def _load_text_encoder(src, base=None):
+    """Charge l'encodeur `src` en DTYPE, avec la classe du repo `base`."""
+    found = _text_encoder_source(src)
+    if found is None:
+        raise RuntimeError(f"{src}: no config.json")
+    _cfg, where, sub = found
+    kw = {"torch_dtype": DTYPE}
+    if sub:
+        kw["subfolder"] = sub
+    return _encoder_class(base).from_pretrained(where, **kw)
+
+
+def _pick_text_encoder(base, which):
+    """Encodeur de remplacement pour le pipe `which` ('base' / 'edit') du repo `base`:
+    (modele, TEXT_ENCODER) s'il convient a CE repo et se charge, sinon (None, '') avec
+    une ligne de log -- le pipe garde alors l'encodeur de son repo. Ne leve jamais: une
+    option ne doit pas faire tomber une generation."""
+    src = TEXT_ENCODER
+    if not src:
+        return None, ""
+    label = _encoder_label(src)
+    try:
+        why = _text_encoder_problem(src, base)
+    except Exception as e:
+        why = f"its config could not be checked ({type(e).__name__}: {e})"
+    enc = None
+    if not why:
+        try:
+            enc = _load_monitor(f"text encoder {label}", lambda: _load_text_encoder(src, base))
+        except Exception as e:
+            why = f"it failed to load ({type(e).__name__}: {e})"
+    if why:
+        _log(f"text encoder {label} NOT used on the {which} pipe: {why}. {base}'s own "
+             f"encoder runs instead; the image metadata says so (text_encoder_not_applied).")
+        return None, ""
+    _log(f"text encoder: {label} replaces {base}'s own on the {which} pipe "
+         f"(tokenizer, processor, VAE and transformer unchanged)")
+    return enc, src
+
+
+def list_text_encoders():
+    """Dossiers d'encodeur proposes dans l'onglet Models: les sous-dossiers a config.json
+    de `text_encoders_dir`, ou de text_encoders / text_encoder / clip a cote du dossier
+    des checkpoints ou de son parent (conventions ComfyUI et Forge)."""
+    roots = [TEXT_ENCODERS_DIR] if TEXT_ENCODERS_DIR else []
+    here = os.path.abspath(CHECKPOINTS_DIR or ".")
+    for up in (os.path.dirname(here), os.path.dirname(os.path.dirname(here))):
+        roots += [os.path.join(up, n) for n in ("text_encoders", "text_encoder", "clip")]
+    out = []
+    for r in roots:
+        try:
+            names = sorted(os.listdir(r))
+        except OSError:
+            continue
+        for d in names:
+            p = os.path.join(r, d)
+            if p in out or not os.path.isdir(p):
+                continue
+            if (os.path.isfile(os.path.join(p, "config.json"))
+                    or os.path.isfile(os.path.join(p, "text_encoder", "config.json"))):
+                out.append(p)
+    return out
+
+
+def set_text_encoder(src):
+    """Choisit l'encodeur texte ('' = celui du repo). Un changement LIBERE les deux
+    pipelines, base et edition -- l'encodeur se charge avec eux, sans echange a chaud
+    sous les hooks d'offload -- et free_vram vide le cache d'embeddings, calcule par
+    l'ancien."""
+    global TEXT_ENCODER
+    src = (src or "").strip()
+    if src == TEXT_ENCODER:
+        return
+    TEXT_ENCODER = src
+    free_vram()
+    _log(f"text encoder -> {_encoder_label(src) or '(repo default)'} -> full reload of "
+         f"the base and edit pipes on next run")
 
 
 def _safetensors_header(path):
@@ -1423,10 +1709,13 @@ def free_vram():
     """Libere le pipeline de base + les pipelines derives et rend la VRAM
     (palier 3: unload sur inactivite ou endpoint /unload). Rechargement paresseux."""
     global _BASE_PIPE, _DERIVED, _LOADED_KEY, _APPLIED_LORAS
+    global _TEXT_ENCODER_ACTIVE, _TEXT_ENCODER_ACTIVE_EDIT
     _BASE_PIPE = None
     _DERIVED = {}
     _LOADED_KEY = None
     _APPLIED_LORAS = []      # plus de pipe -> plus d'adaptateur pose
+    _TEXT_ENCODER_ACTIVE = ""       # ... ni d'encodeur de remplacement charge, ni sur
+    _TEXT_ENCODER_ACTIVE_EDIT = ""  # le base ni sur le pipe d'edition (_DERIVED["omni"])
     _embed_cache_clear(" (VRAM freed)")
     gc.collect()
     if DEVICE == "cuda":
@@ -1834,6 +2123,7 @@ def _ensure_base():
       - LoRA differentes            -> _apply_loras (adaptateurs PEFT seuls)
       - transformer different, meme repo de base + offload -> _swap_transformer."""
     global _BASE_PIPE, _DERIVED, _LOADED_KEY, _BASE_SCHED_CONFIG, _APPLIED_LORAS
+    global _TEXT_ENCODER_ACTIVE
     key = (BASE_REPO, ZIMAGE_TRANSFORMER, OFFLOAD_MODE)
     _dbg(f"_ensure_base key={key} cached={_LOADED_KEY}")
     if _BASE_PIPE is not None and _LOADED_KEY == key:
@@ -1856,6 +2146,13 @@ def _ensure_base():
     kwargs = {}
     if ZIMAGE_TRANSFORMER:
         kwargs["transformer"] = _load_transformer()
+    # Encodeur de remplacement: verifie contre la config de BASE_REPO puis charge avec la
+    # classe du repo. Un encodeur qui ne convient pas (repo change depuis le choix,
+    # dossier illisible, chargement en echec) est ecarte AVEC une ligne de log, et les
+    # metadonnees le disent. img2img / inpaint le partagent via from_pipe.
+    _enc, _TEXT_ENCODER_ACTIVE = _pick_text_encoder(BASE_REPO, "base")
+    if _enc is not None:
+        kwargs["text_encoder"] = _enc
     _log(f"loading Qwen-Image base: {BASE_REPO} (offload={OFFLOAD_MODE}, dtype=bf16) ... "
          "first time downloads from HF (~20B, large), then cached")
     pipe = _load_monitor(f"Qwen-Image base {BASE_REPO}",
@@ -1972,9 +2269,10 @@ def _load_omni():
     """Charge le pipeline d'edition Qwen-Image-Edit (onglet Omni/Edit). Modele SEPARE du
     base (defaut 'Qwen/Qwen-Image-Edit-2509', multi-images). 2509 -> QwenImageEditPlus ;
     revision de base -> QwenImageEdit. Pipeline separe (ne partage pas avec le base)."""
-    global _DERIVED, _APPLIED_EDIT_LORAS
+    global _DERIVED, _APPLIED_EDIT_LORAS, _TEXT_ENCODER_ACTIVE_EDIT
     import diffusers
     _APPLIED_EDIT_LORAS = []        # pipe neuf: aucun adaptateur d'edition pose dessus
+    _TEXT_ENCODER_ACTIVE_EDIT = ""  # ... ni encodeur de remplacement, tant qu'il n'est pas monte
     repo = (OMNI_MODEL or os.environ.get("ZIMAGE_OMNI_MODEL")
             or CONFIG.get("zimage_omni_model") or DEFAULT_OMNI_REPO).strip()
     if not repo:
@@ -2001,7 +2299,14 @@ def _load_omni():
         tf = _load_transformer(repo, base_edit)
         mi = _json.load(open(hf_hub_download(base_edit, "model_index.json"), encoding="utf-8"))
         comps = {"transformer": tf}
+        # Encodeur de remplacement: compare a la config de base_edit (le repo qui fournit
+        # l'encodeur de CE pipe) et substitue a comps['text_encoder'] -- celui du repo,
+        # ~17 Go, n'est alors jamais lu. Tokenizer et processor restent ceux de base_edit.
+        te, te_src = _pick_text_encoder(base_edit, "edit")
         for name in ("scheduler", "vae", "text_encoder", "tokenizer", "processor"):
+            if name == "text_encoder" and te is not None:
+                comps[name] = te
+                continue
             spec = mi.get(name)
             if not (isinstance(spec, list) and len(spec) == 2):
                 continue
@@ -2018,14 +2323,19 @@ def _load_omni():
         plus = "2509" in repo or "2511" in repo or "plus" in repo.lower()
         EditCls = (EditPlus if plus else None) or diffusers.QwenImageEditPipeline
         _log(f"loading Qwen-Image-Edit: {repo} via {EditCls.__name__} (offload={OFFLOAD_MODE}) ...")
+        # Encodeur de remplacement: compare a la config de CE repo, passe en text_encoder=
+        # (diffusers monte le pipe avec lui au lieu de charger celui du repo).
+        te, te_src = _pick_text_encoder(repo, "edit")
+        te_kw = {"text_encoder": te} if te is not None else {}
         try:
-            pipe = EditCls.from_pretrained(repo, torch_dtype=DTYPE)
+            pipe = EditCls.from_pretrained(repo, torch_dtype=DTYPE, **te_kw)
         except Exception as e:
             alt = diffusers.QwenImageEditPipeline
             if EditCls is alt:
                 raise
             _log(f"{EditCls.__name__} failed ({e}); falling back to {alt.__name__}")
-            pipe = alt.from_pretrained(repo, torch_dtype=DTYPE)
+            pipe = alt.from_pretrained(repo, torch_dtype=DTYPE, **te_kw)
+    _TEXT_ENCODER_ACTIVE_EDIT = te_src      # pipe monte: dit ce qui tourne vraiment
     # Meme regle que le base: un transformer GGUF ne va sur le GPU QUE via
     # enable_model_cpu_offload (sinon il reste sur CPU: ~800 s/step observes).
     _off = _effective_offload(repo)
@@ -2690,6 +3000,15 @@ def _gen_meta(mode, prompt, negative="", seed=None, steps=None, guidance=None,
         m["styles"] = _styles
     m["sampler"] = f"{SAMPLER}/{SCHEDULE}"
     m["model"] = model or (ZIMAGE_TRANSFORMER or BASE_REPO)
+    # Encodeur de remplacement: celui qui a REELLEMENT tourne, par son nom de dossier.
+    # Une edition ('omni') sort du pipe d'edition, charge a part: il a son propre etat.
+    # Demande mais ecarte au chargement = l'image vient de l'encodeur du repo, et on
+    # nomme a part celui qui n'a pas servi.
+    _te = _TEXT_ENCODER_ACTIVE_EDIT if mode == "omni" else _TEXT_ENCODER_ACTIVE
+    if _te:
+        m["text_encoder"] = _encoder_label(_te)
+    elif TEXT_ENCODER:
+        m["text_encoder_not_applied"] = _encoder_label(TEXT_ENCODER)
     if LORAS:
         m["loras"] = [f"{os.path.basename(p)}@{w}" for p, w in LORAS]
     if extra:
