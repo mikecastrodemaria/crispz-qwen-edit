@@ -1,11 +1,11 @@
 {
   "manifest_version": 1,
-  "id": "crispz",
-  "name": "Crispz - Z-Image upscaler + detailer",
-  "version": "0.1.0",
-  "description": "ESRGAN upscale + Z-Image Turbo refinement pass (img2img BF16). External process, invoked via CLI.",
-  "repo": "https://github.com/mikecastrodemaria/crispz",
-  "license_note": "Models pulled separately (HuggingFace for Z-Image, local ESRGAN folder).",
+  "id": "crispz-qwen-edit",
+  "name": "crispz-qwen-edit - Qwen-Image upscaler + detailer",
+  "version": "1.17.0",
+  "description": "ESRGAN upscale + Qwen-Image refinement pass (img2img), from crispz-qwen-edit. External process, invoked via CLI.",
+  "repo": "https://github.com/mikecastrodemaria/crispz-qwen-edit",
+  "license_note": "Models pulled separately (HuggingFace for Qwen-Image, local ESRGAN folder).",
 
   "runtime": {
     "type": "cli",
