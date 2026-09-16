@@ -3,6 +3,27 @@
 All notable changes to crispz-qwen-edit. One versioned entry per feature.
 The app version lives in `cz_core.py` (`APP_VERSION`) and is shown in the browser tab title.
 
+## Unreleased — `{a|b|c}` variant groups in every prompt entry point
+
+Prompts accept the *dynamic prompts* syntax (`{a|b|c}`, `{a|}`, `{2$$a|b|c}`,
+`{1-3$$a|b|c}`, `{2$$ and $$a|b|c}`, nesting), from `prompt_variants.py`, the module
+shared by the whole crispz family (copied unchanged from Fooocus2026 custom-29).
+Groups resolve inside `cz_prompt._apply_wildcards`, one level per pass and before any
+`__wildcard__`, seed-bound or in order with *Read wildcards in order*. A prompt
+without group makes no random draw: existing seeds give the same image.
+
+Expansion now runs everywhere a prompt enters: UI Generate (txt2img, img2img, Omni),
+the Inpaint / Outpaint tab, queue and X/Y/Z (per cell in the CLI), the CLI, `--serve`
+and the `czp` protocol. Before, `__wildcards__` were only expanded by the UI Generate
+button. The negative is expanded too, a seed `-1` is resolved to a concrete value on
+every such path, and the protocol reads `<lora:...>` tags on the expanded text, so a
+LoRA written in an option that was not picked is never applied. `czp upscale` now
+returns `seed_used`.
+
+Tests: `tests/test_prompt_variants.py` (the 23 reference tests),
+`tests/test_variants_wiring.py` (no-regression against the previous
+`_apply_wildcards`, and each wired path).
+
 ## 1.17.0 — Edit LoRA presets: task LoRAs on the edit pipe, fetched on first use
 
 The Reference (Omni) tab and the protocol op `edit` run on a SEPARATE pipe
