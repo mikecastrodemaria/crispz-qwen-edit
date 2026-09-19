@@ -482,6 +482,64 @@ fidelity to the swapped pixels) — 0.5–0.7 suits a 128 px swap. GFPGAN ignore
 > applied to an existing image. The swap here transfers the *exact* face as a
 > post-process. Different trade-offs, not a better/worse pair.
 
+### Where the swap runs, and what it replaces
+
+The swap is the **last** step of a render. The order is: generation (txt2img, img2img
+or Reference (Omni)) → **Upscale after generate** → face / hand **detailer** → **face
+swap**. It runs on every image of a batch, and each swapped image is saved as its own
+file, tagged `faceswap`. Two consequences:
+
+- **Turn the face detailer off when the swap is on.** The detailer re-renders faces at
+  a larger size, then the swap replaces them anyway: the time is spent for nothing, and
+  an identity the detailer drifted is not the one you asked for.
+- **Every face found in the result is replaced** by the source face (the largest face
+  of the source image). On a group shot, everyone gets the same face.
+
+### One set of models for every crispz app
+
+The five files are the same in every app of the family (about 1.43 GB in total):
+`inswapper_128.onnx` (the swap), `codeformer.onnx` and `gfpgan_1.4.onnx` (restore),
+`dfl_xseg.onnx` (occlusion mask), `bisenet_resnet_34.onnx` (face-region mask). If
+another crispz app already has them, either copy its `faceswap/` folder into this one,
+or point `faceswap_model_path`, `faceswap_codeformer_path`, `faceswap_restore_path`,
+`faceswap_occluder_path` and `faceswap_parser_path` in `config.txt` to that folder, so a
+single copy serves every app. A missing auxiliary model is fetched once from the
+facefusion repository on Hugging Face; `inswapper_128.onnx` is never downloaded unless
+you set `faceswap_model_url`.
+
+## Try-on and casting: Reference (Omni) + face swap
+
+The edit model (Qwen-Image-Edit, set in `zimage_omni_model`) can dress a person with a
+garment from a product shot, and the face swap then puts the exact face back. The
+method below was measured on crispz-klein (FLUX.2-klein-9B), not on Qwen-Image-Edit:
+the principles hold, the numbers are klein's ([details and results](https://github.com/mikecastrodemaria/crispz-klein#try-on-and-casting-reference-omni--face-swap)).
+
+**The method.** Put the person in **Ref 1**: that image sets the pose, the framing,
+the background and the light, and the output keeps its aspect ratio. Put the garment
+in **Ref 2** (and a second view of it in **Ref 3** if you have one), the head to use in
+the next slot. In the prompt, name each image by its number **and** say what to take
+from it: "the woman in image 1 keeps her exact pose..., she now wears the dress from
+images 2 and 3: <short description of the dress>... her head is the head of the woman
+in image 4: <hair, eyes>". Numbers count **filled** slots only: fill them in order, an
+empty Ref 2 turns Ref 3 into "image 2". A short description of the garment (colour,
+pattern, collar, sleeves, hem) anchors the transfer. For a sheer garment, say what is
+worn under it ("worn over a matching slip"), or the render may show the body through
+it.
+
+**Consistency.** On klein, a consistency LoRA held the framing and the features of
+image 1 without blocking the change of clothing (head SSIM 0.91 without, 0.97 at 0.6,
+0.98 at 1.0). The same author publishes Qwen-Image-Edit versions in
+[`lrzjason/Consistance_Edit_Lora`](https://huggingface.co/lrzjason/Consistance_Edit_Lora)
+(`consistence_edit_v2.safetensors` for 2509, `qe2511_consis_alpha_patched.safetensors`
+for 2511; the author advises 0.5-1.0 with several images, 0-0.5 with one). They are not
+in the preset list and were not measured here; add one through `edit_loras` in
+`config.txt` (see *Edit LoRA presets*).
+
+**The limit is the face in a full-body shot**: at the size the edit renders, the face
+is small and gets redrawn. Keep the face **detailer off** and turn **Apply face swap to
+result** on, with the portrait of the person as the source face; **Upscale after
+generate** gives the final definition.
+
 ## Text -> Image
 
 ```bash
