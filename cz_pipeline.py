@@ -1,23 +1,24 @@
-"""crispz-qwen-edit - coeur Qwen-Image (diffusers, BF16): chargement des pipelines
-(txt2img / img2img / inpaint) + edition par instruction (onglet Omni/Edit), LoRA /
-checkpoints / transformer, generation et orchestration (generate / txt2img_run /
-process_one / outpaint / inpaint) + l'etat mutable runtime.
+"""crispz-qwen-edit - the Qwen-Image core (diffusers, BF16): loading the pipelines
+(txt2img / img2img / inpaint) + instruction-based editing (the Omni/Edit tab), LoRAs /
+checkpoints / transformer, generation and orchestration (generate / txt2img_run /
+process_one / outpaint / inpaint) + the mutable runtime state.
 
-Fork de crispz-studio (Z-Image). Mapping :
+Fork of crispz-studio (Z-Image). Mapping:
   - base txt2img             -> QwenImagePipeline
   - img2img (refine/upscale) -> QwenImageImg2ImgPipeline
   - inpaint / reframe        -> QwenImageInpaintPipeline
-  - onglet Omni/Edit         -> QwenImageEditPlusPipeline (modele SEPARE, multi-images,
-                                defaut 'Qwen/Qwen-Image-Edit-2509') via generate_omni.
-Tous les pipelines Qwen utilisent un VRAI CFG (`true_cfg_scale`) + negative_prompt ; le
-curseur "guidance" de l'UI pilote donc true_cfg_scale (cf. _cfg / _qwen_call), et le
-`guidance_scale` distille reste a 1.0. L'API publique du module reste identique a
-l'upstream (memes noms, ex. ZIMAGE_TRANSFORMER, generate_omni, SAMPLER_CHOICES) pour ne
-casser ni cz_ui ni cz_cli.
+  - the Omni/Edit tab        -> QwenImageEditPlusPipeline (a SEPARATE model, multi-image,
+                                default 'Qwen/Qwen-Image-Edit-2509') through generate_omni.
+Every Qwen pipeline uses a REAL CFG (`true_cfg_scale`) + negative_prompt; so the UI's
+"guidance" slider drives true_cfg_scale (see _cfg / _qwen_call), and the distilled
+`guidance_scale` stays at 1.0. The module's public API stays identical to upstream's (the
+same names, e.g. ZIMAGE_TRANSFORMER, generate_omni, SAMPLER_CHOICES) so that neither cz_ui
+nor cz_cli breaks.
 
-app lit l'etat courant via cz_pipeline.NAME (BASE_REPO, ZIMAGE_TRANSFORMER, ...) et pose
-cz_pipeline._PROGRESS / cz_pipeline._STOP depuis les handlers UI.
-Ne depend que de cz_core / cz_esrgan / cz_imageio (jamais de app ni de gradio).
+app reads the current state through cz_pipeline.NAME (BASE_REPO, ZIMAGE_TRANSFORMER, ...)
+and sets cz_pipeline._PROGRESS / cz_pipeline._STOP from the UI handlers.
+Depends only on cz_core / cz_esrgan / cz_imageio (never on app or gradio).
+
 """
 
 import os
@@ -38,18 +39,18 @@ from cz_core import (
     _prefs, _is_single_file, _log, _dbg,
 )
 
-# Modele Qwen de base (txt2img/img2img/inpaint). Surcharge via env ZIMAGE_MODEL (compat)
+# The base Qwen model (txt2img/img2img/inpaint). Overridable through env ZIMAGE_MODEL (compat)
 # ou QWEN_MODEL, ou prefs. Repo public.
 DEFAULT_BASE_REPO = (os.environ.get("QWEN_MODEL") or "Qwen/Qwen-Image")
-# Modele d'edition par instruction (onglet Omni/Edit), charge separement. 2509 = revision
+# The instruction-based edit model (the Omni/Edit tab), loaded separately. 2509 = revision
 # recente, multi-images. Surcharge via env ZIMAGE_OMNI_MODEL / QWEN_EDIT_MODEL ou config.
 DEFAULT_OMNI_REPO = (os.environ.get("QWEN_EDIT_MODEL") or "Qwen/Qwen-Image-Edit-2509")
 from cz_esrgan import load_esrgan, esrgan_upscale
 from cz_imageio import _now_stamp
 import cz_hw
 
-# Vitesse: autorise TF32 (matmul/cudnn) sur GPU. Gain gratuit sur Ampere+ pour les
-# operations fp32 residuelles; les poids restent BF16. Sans effet hors CUDA.
+# Speed: allow TF32 (matmul/cudnn) on the GPU. A free win on Ampere+ for the residual
+# fp32 operations; the weights stay BF16. No effect outside CUDA.
 if DEVICE == "cuda":
     try:
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -58,9 +59,9 @@ if DEVICE == "cuda":
         pass
 
 
-# Modele Z-Image courant. Un repo HF / dossier diffusers -> BASE_REPO. Un fichier
-# single-file (.safetensors Civitai) passe comme "modele" -> transformer override
-# (le VAE et l'encodeur Qwen3 restent tires du repo de base).
+# The current Z-Image model. An HF repo / diffusers folder -> BASE_REPO. A single-file
+# checkpoint (a Civitai .safetensors) passed as the "model" -> a transformer override (the
+# VAE and the Qwen3 encoder still come from the base repo).
 _zmodel = os.environ.get("ZIMAGE_MODEL") or _prefs.get("zimage_model") or DEFAULT_BASE_REPO
 ZIMAGE_TRANSFORMER = os.environ.get("ZIMAGE_TRANSFORMER") or _prefs.get("zimage_transformer") or None
 if _is_single_file(_zmodel):
@@ -69,18 +70,18 @@ if _is_single_file(_zmodel):
 else:
     BASE_REPO = _zmodel
 
-# Encodeur texte de remplacement (Models > Checkpoints > Text encoder). Vide = celui du
-# repo, comme avant. Sinon un DOSSIER au format transformers (config.json + poids) ou un
-# repo HF ('owner/repo', 'owner/repo/sous-dossier') -- ex. un Qwen2.5-VL-7B "abliterated".
-# Vaut pour les DEUX pipes, base et edition. Seul l'encodeur change: tokenizer,
-# processor, VAE et transformer restent ceux du repo.
+# Replacement text encoder (Models > Checkpoints > Text encoder). Empty = the repo's,
+# as before. Otherwise a FOLDER in transformers format (config.json + weights) or an HF repo
+# ('owner/repo', 'owner/repo/subfolder') -- e.g. an "abliterated" Qwen2.5-VL-7B.
+# It holds for BOTH pipes, base and edit. Only the encoder changes: tokenizer, processor,
+# VAE and transformer stay the repo's.
 CFG_TEXT_ENCODER_KEY = "text_encoder"
 
 
 def _resolve_text_encoder(env, prefs, config):
-    """Encodeur au demarrage: env > preferences > config. Une cle PRESENTE dans les
-    preferences gagne meme vide: c'est le choix "Default" fait dans l'UI, et une valeur
-    de config.txt ne doit pas le defaire au redemarrage (un "" passait pour absent)."""
+    """The encoder at startup: env > preferences > config. A key PRESENT in the
+    preferences wins even when empty: that is the "Default" choice made in the UI, and a
+    config.txt value must not undo it on the next start (a "" used to pass for absent)."""
     v = str(env.get("QWEN_TEXT_ENCODER") or "").strip()
     if v:
         return v
@@ -90,20 +91,20 @@ def _resolve_text_encoder(env, prefs, config):
 
 
 TEXT_ENCODER = _resolve_text_encoder(os.environ, _prefs, CONFIG)
-# Celui qui est REELLEMENT charge ('' = celui du repo), par pipe: le base (txt2img et ses
-# derives img2img / inpaint) et le pipe d'edition, charge a part et qui peut l'ecarter
-# seul. Distinct de TEXT_ENCODER: un encodeur qui ne convient pas est ecarte au
-# chargement, et les metadonnees disent ce qui a tourne, pas ce qui etait demande.
+# The one REALLY loaded ('' = the repo's), per pipe: the base one (txt2img and its
+# derived img2img / inpaint) and the edit pipe, which is loaded separately and can drop it
+# on its own. Distinct from TEXT_ENCODER: an encoder that does not suit is dropped at load
+# time, and the metadata says what ran, not what was asked for.
 _TEXT_ENCODER_ACTIVE = ""
 _TEXT_ENCODER_ACTIVE_EDIT = ""
 TEXT_ENCODERS_DIR = str(os.environ.get("TEXT_ENCODERS_DIR") or _prefs.get("text_encoders_dir")
                         or CONFIG.get("text_encoders_dir") or "").strip()
 
-# Dossiers de modeles Z-Image: checkpoints single-file a switcher + LoRA a appliquer.
+# Z-Image model folders: single-file checkpoints to switch between + LoRAs to apply.
 CHECKPOINTS_DIR = (os.environ.get("CHECKPOINTS_DIR") or _prefs.get("checkpoints_dir")
                    or CONFIG.get("checkpoints_dir") or os.path.join(HERE, "checkpoints"))
-# Dossier checkpoints supplementaire (optionnel) -> fusionne avec CHECKPOINTS_DIR dans
-# la meme liste de checkpoints. Vide par defaut; configurable via UI / prefs / config / env.
+# Additional checkpoints folder (optional) -> merged with CHECKPOINTS_DIR into the same
+# checkpoint list. Empty by default; configurable through UI / prefs / config / env.
 CHECKPOINTS_EXTRA_DIR = (os.environ.get("CHECKPOINTS_EXTRA_DIR") or _prefs.get("checkpoints_extra_dir")
                          or CONFIG.get("checkpoints_extra_dir") or "").strip()
 LORAS_DIR = (os.environ.get("LORAS_DIR") or _prefs.get("loras_dir")
@@ -111,7 +112,7 @@ LORAS_DIR = (os.environ.get("LORAS_DIR") or _prefs.get("loras_dir")
 
 
 def _split_dirs(spec):
-    """Liste de dossiers depuis une liste JSON ou une chaine 'a;b' (os.pathsep ou ';')."""
+    """Folder list from a JSON list or from an 'a;b' string (os.pathsep or ';')."""
     if not spec:
         return []
     if isinstance(spec, str):
@@ -126,16 +127,16 @@ def _split_dirs(spec):
     return out
 
 
-# Dossiers LoRA SUPPLEMENTAIRES (ex. la bibliotheque Civitai partagee avec d'autres
-# outils): env LORAS_EXTRA_DIRS ('a;b') > preferences > config 'loras_extra_dirs'.
-# Fusionnes avec LORAS_DIR dans une seule liste; en cas de meme nom, LORAS_DIR gagne.
+# EXTRA LoRA folders (e.g. the Civitai library shared with other tools): env
+# LORAS_EXTRA_DIRS ('a;b') > preferences > config 'loras_extra_dirs'. Merged with
+# LORAS_DIR into a single list; on a duplicate name, LORAS_DIR wins.
 LORAS_EXTRA_DIRS = _split_dirs(os.environ["LORAS_EXTRA_DIRS"] if "LORAS_EXTRA_DIRS" in os.environ
                                else (_prefs.get("loras_extra_dirs")
                                      or CONFIG.get("loras_extra_dirs")))
 
 
 def _lora_dirs():
-    """Dossiers LoRA a scanner: principal + extras, sans doublon, dans l'ordre de priorite."""
+    """LoRA folders to scan: the main one + the extras, deduplicated, in priority order."""
     dirs = [LORAS_DIR]
     for d in LORAS_EXTRA_DIRS:
         if d and d not in dirs:
@@ -144,9 +145,9 @@ def _lora_dirs():
 
 
 def resolve_lora_path(name):
-    """Chemin d'une LoRA depuis un nom de slot: chemin absolu tel quel, sinon nom relatif
-    (avec sous-dossiers) cherche dans LORAS_DIR puis les extras. Si absent partout, le
-    chemin dans LORAS_DIR (le caller signale 'not found')."""
+    """Path of a LoRA from a slot name: an absolute path as is, otherwise the relative
+    name (subfolders included) looked up in LORAS_DIR then in the extras. Absent
+    everywhere, the path inside LORAS_DIR (the caller reports 'not found')."""
     name = str(name or "")
     if os.path.isabs(name):
         return name
@@ -157,15 +158,15 @@ def resolve_lora_path(name):
     return os.path.join(LORAS_DIR, name)
 
 
-# LoRA actives: liste de (chemin, poids). Plusieurs LoRA combinables (multi-slots).
+# Active LoRAs: a list of (path, weight). Several LoRAs can be combined (multi-slot).
 LORAS = []
-LORA_WEIGHT = float(CONFIG.get("default_lora_weight", 1.0))  # poids par defaut des slots
+LORA_WEIGHT = float(CONFIG.get("default_lora_weight", 1.0))  # the slots' default weight
 
 
 def _lora_weight_range():
-    """Bornes des curseurs de poids LoRA (config 'lora_weight_min'/'lora_weight_max').
-    Defaut -2..2: les poids NEGATIFS sont valides et utiles (ils inversent l'effet de la
-    LoRA). Defensif: valeurs illisibles ou min >= max -> on retombe sur le defaut."""
+    """Bounds of the LoRA weight sliders (config 'lora_weight_min'/'lora_weight_max').
+    Default -2..2: NEGATIVE weights are valid and useful (they invert the LoRA's
+    effect). Defensive: unreadable values or min >= max -> fall back to the default."""
     try:
         lo = float(CONFIG.get("lora_weight_min", -2.0))
         hi = float(CONFIG.get("lora_weight_max", 2.0))
@@ -179,10 +180,10 @@ def _lora_weight_range():
 
 
 LORA_WEIGHT_MIN, LORA_WEIGHT_MAX = _lora_weight_range()
-# Le poids par defaut doit rester dans les bornes (sinon le curseur naitrait hors plage).
+# The default weight has to stay inside the bounds (or the slider would be born out of range).
 LORA_WEIGHT = min(LORA_WEIGHT_MAX, max(LORA_WEIGHT_MIN, LORA_WEIGHT))
-# LoRA appliquees AU DEMARRAGE (ex. Lightning 8-step). config 'default_loras' = liste de
-# noms (dans LORAS_DIR) ou de paires [nom, poids]. Resolues en (chemin, poids).
+# LoRAs applied AT STARTUP (e.g. Lightning 8-step). config 'default_loras' = a list of
+# names (inside LORAS_DIR) or of [name, weight] pairs. Resolved to (path, weight).
 for _spec in (CONFIG.get("default_loras") or []):
     _nm, _w = (_spec if isinstance(_spec, (list, tuple)) and len(_spec) == 2
                else (_spec, LORA_WEIGHT))
@@ -190,96 +191,99 @@ for _spec in (CONFIG.get("default_loras") or []):
         _p = resolve_lora_path(_nm)
         if os.path.isfile(_p):
             LORAS.append((_p, float(_w)))
-# Modele Omni/Edit (Qwen-Image-Edit, multi-images). Defaut = DEFAULT_OMNI_REPO pour que
-# l'onglet Edit marche sans config. Reglable via config.txt (zimage_omni_model) ou l'UI.
+# The Omni/Edit model (Qwen-Image-Edit, multi-image). The default = DEFAULT_OMNI_REPO
+# so that the Edit tab works with no config. Tunable through config.txt
+# (zimage_omni_model) or the UI.
 OMNI_MODEL = (os.environ.get("ZIMAGE_OMNI_MODEL") or _prefs.get("zimage_omni_model")
               or CONFIG.get("zimage_omni_model") or DEFAULT_OMNI_REPO).strip()
 
-# Caches process-wide. Un pipeline "base" (txt2img ZImagePipeline) detient les
-# composants; img2img / inpaint en derivent via from_pipe -> poids partages, pas de
-# VRAM en double. Clef de cache = (BASE_REPO, ZIMAGE_TRANSFORMER, OFFLOAD_MODE, LORAS).
+# Process-wide caches. A "base" pipeline (txt2img ZImagePipeline) owns the
+# components; img2img / inpaint derive from it through from_pipe -> shared weights, no
+# duplicate VRAM. Cache key = (BASE_REPO, ZIMAGE_TRANSFORMER, OFFLOAD_MODE, LORAS).
 _BASE_PIPE = None
 _DERIVED = {}
 _LOADED_KEY = None
-# LoRA reellement posees sur _BASE_PIPE (liste de (chemin, poids)). Sert a echanger les
-# LoRA a chaud sans recharger le modele: si ca diverge de LORAS, _apply_loras resynchronise.
+# LoRAs actually applied on _BASE_PIPE (a list of (path, weight)). Used to hot-swap the
+# LoRAs without reloading the model: if it diverges from LORAS, _apply_loras resyncs.
 _APPLIED_LORAS = []
-# LoRA d'EDITION (pipe omni / Qwen-Image-Edit): jeu SEPARE du base, car le transformer
-# d'edition est un autre modele (les presets cz_edit_loras visent 2509/2511). Meme
-# format (chemin, poids). EDIT_LORAS_ENABLED = la case "Edit LoRAs" de l'UI: OFF -> le
-# jeu est memorise mais pas pose (permet de comparer avec/sans en un clic).
+# EDIT LoRAs (the omni / Qwen-Image-Edit pipe): a set SEPARATE from the base one,
+# because the edit transformer is another model (the cz_edit_loras presets target
+# 2509/2511). Same (path, weight) format. EDIT_LORAS_ENABLED = the UI's "Edit LoRAs"
+# checkbox: OFF -> the set is remembered but not applied (so with/without can be compared in
+# one click).
 EDIT_LORAS = []
 EDIT_LORAS_ENABLED = bool(CONFIG.get("edit_loras_enabled", True))
 _APPLIED_EDIT_LORAS = []
-# Mode RAPIDE de l'edition (dropdown 'Edit speed'): None = off (steps/guidance des
-# Settings), sinon {"name", "steps", "guidance", "path"} - path = LoRA Lightning a
-# empiler sur le pipe d'edition (None pour 'Auto': un modele deja distille, Rapid-AIO
-# ou merge Lightning, dont le profil model_profiles fixe steps/guidance).
+# FAST edit mode (the 'Edit speed' dropdown): None = off (steps/guidance from
+# Settings), otherwise {"name", "steps", "guidance", "path"} - path = the Lightning LoRA
+# to stack on the edit pipe (None for 'Auto': an already distilled model, Rapid-AIO or a
+# Lightning merge, whose model_profiles profile sets steps/guidance).
 EDIT_SPEED = None
 
-# Palier 2 (cohabitation VRAM): offload CPU de la passe diffusion. none = tout en VRAM
-# (le plus rapide). model = decharge par sous-module (bon compromis). sequential = plus
-# agressif, plus lent. N'est PAS de la quantif: les poids restent BF16, ils transitent
-# RAM <-> GPU. 'auto' (defaut) = test de VRAM libre au chargement (cz_hw): un modele qui
-# deborde la VRAM ne plante pas, il bascule en RAM partagee (Windows Sysmem Fallback) et
-# rend 50-100x plus lentement SANS message d'erreur -> on ne promeut 'none' que si la
-# carte a prouve qu'elle a la place. Ordre de resolution (le premier defini gagne):
-# choix UI/CLI explicite > env CZ_OFFLOAD > config default_cpu_offload > auto.
+# Step 2 (VRAM coexistence): CPU offload of the diffusion pass. none = everything in
+# VRAM (the fastest). model = unloads per submodule (a good compromise). sequential = more
+# aggressive, slower. This is NOT quantization: the weights stay BF16, they travel
+# RAM <-> GPU. 'auto' (the default) = a free-VRAM test at load time (cz_hw): a model that
+# overflows the VRAM does not crash, it spills into shared RAM (Windows Sysmem Fallback) and
+# renders 50-100x slower WITH no error message -> 'none' is only promoted once the card has
+# proven it has the room. Resolution order (the first one set wins):
+# explicit UI/CLI choice > env CZ_OFFLOAD > config default_cpu_offload > auto.
 OFFLOAD_CHOICES = ("auto", "none", "model", "sequential")
 OFFLOAD_MODE = ((os.environ.get("CZ_OFFLOAD") or "").strip()
                 or str(CONFIG.get("default_cpu_offload", "") or "").strip()).lower() or "auto"
 if OFFLOAD_MODE not in OFFLOAD_CHOICES:
     _log(f"CZ_OFFLOAD/default_cpu_offload '{OFFLOAD_MODE}' unknown -> auto")
     OFFLOAD_MODE = "auto"
-# Mode concret resolu pour 'auto' (pose par _resolve_auto au 1er chargement) et flag du
-# filet de securite runtime (pose par le callback VRAM pendant le denoise).
+# The concrete mode resolved for 'auto' (set by _resolve_auto on the first load) and the
+# flag of the runtime safety net (set by the VRAM callback during the denoise).
 _AUTO_OFFLOAD = ""
 _VRAM_DOWNGRADE = False
 
-# Guidance Qwen-Image. Le curseur "guidance" de l'UI = `true_cfg_scale` (vrai CFG, qui
-# active le negative prompt). Plage conseillee ~3-5 (defaut 4.0). Le `guidance_scale`
-# distille du pipeline reste a 1.0 (cf. _cfg). Un 0 herite d'une config Z-Image retombe
-# sur 4.0. Override possible via env QWEN_CFG.
+# Qwen-Image guidance. The UI's "guidance" slider = `true_cfg_scale` (a real CFG,
+# which turns the negative prompt on). Advised range ~3-5 (default 4.0). The pipeline's
+# distilled `guidance_scale` stays at 1.0 (see _cfg). A 0 inherited from a Z-Image config
+# falls back to 4.0. Overridable through env QWEN_CFG.
 GUIDANCE = float(os.environ.get("QWEN_CFG") or CONFIG.get("default_guidance") or 0) or 4.0
 
-# Force ratio (facon Fooocus) pour upscale/img2img: si defini, l'image d'ENTREE est
-# recadree au centre a ce ratio avant traitement (crop to fit). Vide = ratio natif preserve
-# (defaut). Format: 'W:H' ou 'WxH' (ex. '13:19', '832x1216'). Pilotable par l'UI (case a
-# cocher + dropdown Aspect ratio) via set_force_ratio, ou par config.txt 'force_upscale_ratio'.
+# Forced ratio (Fooocus-style) for upscale/img2img: when set, the INPUT image is
+# center-cropped to that ratio before processing (crop to fit). Empty = the native ratio is
+# preserved (the default). Format: 'W:H' or 'WxH' (e.g. '13:19', '832x1216'). Driven by the
+# UI (checkbox + Aspect ratio dropdown) through set_force_ratio, or by config.txt
+# 'force_upscale_ratio'.
 FORCE_RATIO = (os.environ.get("CZ_FORCE_RATIO") or CONFIG.get("force_upscale_ratio") or "").strip()
-# Comment atteindre le ratio force: 'crop' = recadrage centre (perd les bords, defaut),
-# 'extend' = etend l'image au ratio par outpaint (ne perd rien, ajoute des bandes
-# generees). UI (radio) via set_force_ratio_mode, config 'force_ratio_mode'.
+# How to reach the forced ratio: 'crop' = center crop (loses the edges, the default),
+# 'extend' = extends the image to the ratio by outpainting (loses nothing, adds generated
+# bands). UI (radio) through set_force_ratio_mode, config 'force_ratio_mode'.
 FORCE_RATIO_MODE = (os.environ.get("CZ_FORCE_RATIO_MODE")
                     or CONFIG.get("force_ratio_mode") or "crop").strip().lower()
-# Passe de fusion des raccords du mode extend: apres l'outpaint des bandes, une passe
-# img2img LEGERE tourne sur l'image etendue et SEULES les bandes + une marge de
-# transition feather sont recollees depuis elle (centre original intact). 0 = desactive.
+# Seam-blending pass of the extend mode: after the bands are outpainted, a LIGHT img2img
+# pass runs on the extended image and ONLY the bands plus a feathered transition margin are
+# pasted back from it (the original centre stays untouched). 0 = off.
 try:
     EXTEND_DENOISE = float(CONFIG.get("force_ratio_extend_denoise", 0.22) or 0.0)
 except Exception:
     EXTEND_DENOISE = 0.22
 
-# Sampler / scheduler. Le pipeline Z-Image impose un schedule `sigmas` custom: seuls
-# les schedulers dont set_timesteps accepte `sigmas` fonctionnent. En pratique -> Euler
-# flow-matching (natif, defaut), UniPC (multistep) et LCM flow-matching (interessant sur
-# les modeles distilles/Turbo: peu de steps, guidance ~0-1).
-# Les DPM++ 2M / DPM2a / DPM++ SDE (dpmpp_sde) de diffusers ne prennent PAS de sigmas
-# custom -> incompatibles (DPMSolverSDEScheduler exige en plus torchsde). Non exposes.
+# Sampler / scheduler. The Z-Image pipeline imposes a custom `sigmas` schedule: only
+# the schedulers whose set_timesteps accepts `sigmas` work. In practice -> Euler
+# flow-matching (native, the default), UniPC (multistep) and LCM flow-matching (interesting
+# on distilled/Turbo models: few steps, guidance ~0-1).
+# diffusers' DPM++ 2M / DPM2a / DPM++ SDE (dpmpp_sde) do NOT take custom sigmas ->
+# incompatible (DPMSolverSDEScheduler also requires torchsde). Not exposed.
 SAMPLER_CHOICES = ("euler", "unipc", "lcm")
 SAMPLER = (os.environ.get("ZIMAGE_SAMPLER") or CONFIG.get("default_sampler") or "euler").strip().lower()
 if SAMPLER not in SAMPLER_CHOICES:
     SAMPLER = "euler"
 
-# Schedule de sigmas (= le "scheduler" facon ComfyUI). sgm_uniform = natif Z-Image
-# (linspace + dynamic shift). beta/karras/exponential = re-mapping des sigmas applique
-# PAR-DESSUS le schedule du pipeline (FlowMatchEuler/UniPC: use_*_sigmas). beta -> scipy.
+# Sigma schedule (= the "scheduler" in ComfyUI terms). sgm_uniform = Z-Image's native
+# one (linspace + dynamic shift). beta/karras/exponential = a sigma remapping applied ON TOP
+# of the pipeline's schedule (FlowMatchEuler/UniPC: use_*_sigmas). beta -> scipy.
 SCHEDULE_CHOICES = ("sgm_uniform", "beta", "karras", "exponential")
-# 'simple' (ComfyUI) designe EXACTEMENT le schedule natif expose ici sous 'sgm_uniform':
-# les sigmas par defaut que le pipeline passe au scheduler sont linspace(1, 1/n, n),
-# ce que ComfyUI appelle 'simple' sur un modele flow-matching. Accepte
-# en entree partout (config/env/CLI/XYZ) pour recopier une recette CivitAI au mot pres,
-# mais normalise vers le nom canonique: metadonnees et presets ne portent qu'un seul nom.
+# 'simple' (ComfyUI) names EXACTLY the native schedule exposed here as 'sgm_uniform': the
+# default sigmas the pipeline hands the scheduler are linspace(1, 1/n, n), which is what
+# ComfyUI calls 'simple' on a flow-matching model. Accepted as input everywhere
+# (config/env/CLI/XYZ) so a CivitAI recipe can be copied word for word, but normalised to
+# the canonical name: metadata and presets only ever carry one name.
 _SCHEDULE_ALIASES = {"simple": "sgm_uniform"}
 SCHEDULE_INPUTS = SCHEDULE_CHOICES + tuple(_SCHEDULE_ALIASES)   # listes ouvertes (CLI/XYZ)
 
@@ -293,29 +297,29 @@ def _norm_schedule(name, default="sgm_uniform"):
 
 SCHEDULE = _norm_schedule(os.environ.get("ZIMAGE_SCHEDULE") or CONFIG.get("default_schedule"))
 _SCHEDULE_FLAG = {"beta": "use_beta_sigmas", "karras": "use_karras_sigmas",
-                  "exponential": "use_exponential_sigmas"}  # sgm_uniform -> aucun flag (natif)
-# Config natif du scheduler du modele (capture au 1er chargement) -> base de construction
-# des autres samplers (conserve shift/flow params quel que soit le sampler courant).
+                  "exponential": "use_exponential_sigmas"}  # sgm_uniform -> no flag (native)
+# The model's own scheduler config (captured on the first load) -> the base every other
+# sampler is built from (keeps shift/flow params whatever the current sampler is).
 _BASE_SCHED_CONFIG = None
 
 # Hook de progression UI (gradio gr.Progress). None hors UI (CLI/serveur). Pose par
-# les handlers via cz_pipeline._PROGRESS = ...
+# the handlers through cz_pipeline._PROGRESS = ...
 _PROGRESS = None
-# Stop "facon Fooocus": flag global + interruption des pipelines diffusers. Pose par
-# les handlers via cz_pipeline._STOP = ... et par request_stop().
+# Fooocus-style Stop: a global flag plus the interruption of the diffusers pipelines. Set
+# by the handlers through cz_pipeline._STOP = ... and by request_stop().
 _STOP = False
 
-# Verrou GPU: serialise TOUTES les generations. Gradio ne serialise pas les events de
-# LISTENERS differents (Generate manuel vs Run queue vs detaileur): deux threads peuvent
-# alors appeler le MEME pipeline partage et stepper le MEME scheduler -> son index
-# depasse la fin ("IndexError: index 31 is out of bounds for dimension 0 with size 31",
-# scheduling_flow_match_euler_discrete.step). RLock: les imbrications d'un meme thread
-# (txt2img_run -> generate, process_one -> _refine_whole) restent libres.
+# GPU lock: serialises EVERY generation. Gradio does not serialise the events of
+# different LISTENERS (manual Generate vs Run queue vs the detailer): two threads can then
+# call the SAME shared pipeline and step the SAME scheduler -> its index runs past the end
+# ("IndexError: index 31 is out of bounds for dimension 0 with size 31",
+# scheduling_flow_match_euler_discrete.step). RLock: one thread's nested calls
+# (txt2img_run -> generate, process_one -> _refine_whole) stay free.
 _GPU_LOCK = threading.RLock()
 
 
 def _gpu_serial(fn):
-    """Decorateur: execute fn sous _GPU_LOCK (une seule generation GPU a la fois)."""
+    """Decorator: runs fn under _GPU_LOCK (a single GPU generation at a time)."""
     import functools
 
     @functools.wraps(fn)
@@ -324,13 +328,13 @@ def _gpu_serial(fn):
             return fn(*args, **kwargs)
     return _locked
 
-# Gestion du seed (facon Fooocus):
-#  _LAST_SEED         = seed CONCRET du dernier rendu (un -1 aleatoire est resolu en
-#                       valeur reelle) -> bouton "Reuse last seed" + metadonnees justes.
-#  _NO_SEED_INCREMENT = True -> tout un batch utilise le meme seed (pas de +i par image).
+# Seed handling (Fooocus-style):
+#  _LAST_SEED         = the CONCRETE seed of the last render (a random -1 is resolved to a
+#                       real value) -> the "Reuse last seed" button + honest metadata.
+#  _NO_SEED_INCREMENT = True -> a whole batch uses the same seed (no +i per image).
 _LAST_SEED = -1
 _NO_SEED_INCREMENT = False
-# True -> en txt2img+upscale, sauve AUSSI l'image txt2img d'origine (avant l'upscale).
+# True -> in txt2img+upscale, ALSO save the original txt2img image (before the upscale).
 _SAVE_PRE_UPSCALE = bool(CONFIG.get("save_pre_upscale", False))
 
 
@@ -351,63 +355,64 @@ def set_guidance(g):
 
 
 def _cfg(negative=None, guidance=None):
-    """kwargs CFG communs a tous les pipelines Qwen : `true_cfg_scale` = curseur guidance
-    de l'UI (vrai CFG, active le negative prompt), `guidance_scale` distille fixe a 1.0.
-    `guidance` = surcharge par appel (protocole edit: un modele distille veut 1.0 quand
-    le curseur global reste a 4.0)."""
+    """CFG kwargs shared by every Qwen pipeline: `true_cfg_scale` = the UI's guidance
+    slider (a real CFG, which turns the negative prompt on), with the distilled
+    `guidance_scale` fixed at 1.0.
+    `guidance` = a per-call override (the edit protocol: a distilled model wants 1.0 while
+    the global slider stays at 4.0)."""
     g = float(GUIDANCE) if guidance is None else float(guidance)
-    # guidance_scale n'est plus passe: Qwen-Image n'est pas guidance-distilled, diffusers
-    # l'ignore (1.0 est deja sa valeur par defaut) et le signalait a chaque appel.
-    # true_cfg <= 1 = CFG coupe (Lightning/Rapid): le negative n'aurait aucun effet, on ne
-    # le transmet pas plutot que de laisser diffusers avertir qu'il est ignore.
+    # guidance_scale is no longer passed: Qwen-Image is not guidance-distilled,
+    # diffusers ignores it (1.0 is its default already) and used to say so on every call.
+    # true_cfg <= 1 = CFG off (Lightning/Rapid): the negative would have no effect, so it is
+    # not passed rather than letting diffusers warn that it is ignored.
     return {"true_cfg_scale": g,
             "negative_prompt": (negative or None) if g > 1.0 else None}
 
 
-# --- Cache d'embeddings de prompt -------------------------------------------------
-# Encoder un prompt fait passer l'encodeur de texte par le GPU. En offload 'model'
-# ce transfert est paye a CHAQUE appel de pipeline -- y compris les passes du
-# detailer, qui refont le MEME prompt une fois par visage et par main.
-# Mesure sur crispz-klein (9B GGUF, offload model): prompt+setup 5,2-6,1 s par
-# passe sans cache contre 1,7-1,8 s avec, pour 0,3 s de diffusion. 2,1x par main.
-# Sans offload le gain tombe a ~8 % (l'encodeur est deja resident, rien a deplacer).
+# --- Prompt embedding cache -------------------------------------------------------
+# Encoding a prompt sends the text encoder through the GPU. Under 'model' offload that
+# transfer is paid on EVERY pipeline call -- including the detailer's passes, which redo
+# the SAME prompt once per face and per hand.
+# Measured on crispz-klein (9B GGUF, model offload): prompt+setup 5.2-6.1 s per pass
+# without the cache against 1.7-1.8 s with it, for 0.3 s of diffusion. 2.1x per hand.
+# Without offload the win drops to ~8 % (the encoder is already resident, nothing to move).
 #
-# encode_prompt() court-circuite l'encodeur des qu'on lui passe ses embeddings. On
-# memorise donc le TUPLE qu'il renvoie et on le repasse a __call__ via _EMBED_OUTS.
-# Les tenseurs sont gardes en RAM (quelques Mo): ils ne retiennent pas de VRAM et
-# survivent aux deplacements de l'offload.
-# QwenImage: encode_prompt -> (prompt_embeds, prompt_embeds_mask); le masque
-# accompagne les embeddings, __call__ veut les deux.
+# encode_prompt() short-circuits the encoder as soon as it is handed its embeddings. So the
+# TUPLE it returns is memorised and handed back to __call__ through _EMBED_OUTS.
+# The tensors are kept in RAM (a few MB): they hold no VRAM and survive the offload's moves.
+# QwenImage: encode_prompt -> (prompt_embeds, prompt_embeds_mask); the mask travels with
+# the embeddings, __call__ wants both.
 _EMBED_OUTS = ("prompt_embeds", "prompt_embeds_mask")
 _EMBED_CACHE = {}
 _EMBED_CACHE_MAX = max(0, int(CONFIG.get("prompt_embed_cache", 8) or 0))
 
 
 def _embed_cache_clear(why=""):
-    """Vide le cache. Appele des que l'encodeur peut avoir change (repo de base,
-    liberation de VRAM): un embedding calcule par un autre encodeur est faux."""
+    """Empties the cache. Called as soon as the encoder may have changed (base repo, VRAM
+    release): an embedding computed by another encoder is wrong."""
     if _EMBED_CACHE:
         _dbg(f"prompt embed cache cleared ({len(_EMBED_CACHE)} entries){why}")
     _EMBED_CACHE.clear()
 
 
 def _cached_prompt_embeds(pipe, prompt, kw):
-    """Embeddings de `prompt` pour ce pipeline, calcules une fois puis reutilises.
+    """Embeddings of `prompt` for this pipeline, computed once then reused.
 
-    Renvoie un dict de kwargs pour __call__, ou None si le cache est desactive, si
-    le pipeline n'expose pas l'API attendue, ou si l'encodage echoue: dans tous ces
-    cas l'appelant repasse le prompt en clair et rien ne change. Un cache ne doit
-    jamais casser un rendu."""
+    Returns a kwargs dict for __call__, or None when the cache is off, when the
+    pipeline does not expose the expected API, or when the encoding fails: in all
+    those cases the caller passes the prompt as text and nothing changes. A cache must
+    never break a render.
+"""
     if not _EMBED_CACHE_MAX or not _EMBED_OUTS:
         return None
     try:
         enc = getattr(pipe, "text_encoder", None)
         if enc is None or not hasattr(pipe, "encode_prompt"):
             return None
-        # Les LoRA font partie de la clef: certaines touchent l'encodeur de texte,
-        # et un embedding calcule sans elles serait faux.
-        # L'encodeur de remplacement aussi: id(enc) seul ne suffit pas, CPython
-        # recycle l'id d'un objet libere -- et un autre encodeur encode autrement.
+        # The LoRAs are part of the key: some of them touch the text encoder, and an
+        # embedding computed without them would be wrong.
+        # So is the replacement encoder: id(enc) alone is not enough, CPython recycles
+        # the id of a freed object -- and another encoder encodes differently.
         key = (BASE_REPO, _TEXT_ENCODER_ACTIVE, id(enc), prompt,
                kw.get("max_sequence_length"),
                tuple(sorted((p, float(w)) for p, w in _APPLIED_LORAS)))
@@ -434,13 +439,13 @@ def _cached_prompt_embeds(pipe, prompt, kw):
 
 
 def _encodes_with_image(pipe):
-    """Vrai si encode_prompt de ce pipeline prend l'image. Le pipe d'EDITION
-    (QwenImageEdit / EditPlus) prefixe le prompt des jetons de vision de l'image
-    ('Picture 1: <|vision_start|><|image_pad|><|vision_end|>') et Qwen2.5-VL lit l'image
-    avec l'instruction: un embedding calcule sans elle est un embedding texte seul.
-    img2img / inpaint recoivent aussi `image`, mais c'est l'image de depart: leur
-    encode_prompt n'a pas ce parametre. Signature illisible -> Vrai, donc pas de cache:
-    un encodage de trop coute du temps, un encodage faux coute l'image."""
+    """True when this pipeline's encode_prompt takes the image. The EDIT pipe
+    (QwenImageEdit / EditPlus) prefixes the prompt with the image's vision tokens
+    ('Picture 1: <|vision_start|><|image_pad|><|vision_end|>') and Qwen2.5-VL reads the image
+    along with the instruction: an embedding computed without it is a text-only embedding.
+    img2img / inpaint also receive `image`, but that is the starting image: their
+    encode_prompt has no such parameter. An unreadable signature -> True, so no cache: one
+    encoding too many costs time, a wrong encoding costs the image."""
     import inspect
     try:
         return "image" in inspect.signature(pipe.encode_prompt).parameters
@@ -449,13 +454,13 @@ def _encodes_with_image(pipe):
 
 
 def _qwen_call(pipe, **kw):
-    """Appelle un pipeline Qwen en tolerant les variations d'API diffusers : si la version
-    installee ne connait pas `true_cfg_scale` / `negative_prompt`, on retire ces kwargs et
-    on relance plutot que de crasher la generation."""
-    # Reutilise les embeddings si ce prompt a deja ete encode (cf. _EMBED_CACHE).
-    # Les passer fait sauter l'encodeur de texte: c'est tout le gain.
-    # Sauf quand l'encodage depend de l'image (pipe d'edition): __call__ ne re-encode
-    # jamais quand on lui passe prompt_embeds, l'edition tournerait sans son image.
+    """Calls a Qwen pipeline, tolerating diffusers API variations: when the installed
+    version does not know `true_cfg_scale` / `negative_prompt`, those kwargs are dropped and
+    the call is retried rather than crashing the generation."""
+    # Reuse the embeddings if this prompt has already been encoded (see _EMBED_CACHE).
+    # Passing them skips the text encoder: that is the whole win.
+    # Except when the encoding depends on the image (the edit pipe): __call__ never
+    # re-encodes when handed prompt_embeds, and the edit would run without its image.
     if (isinstance(kw.get("prompt"), str) and not any(k in kw for k in _EMBED_OUTS)
             and not (kw.get("image") is not None and _encodes_with_image(pipe))):
         _emb = _cached_prompt_embeds(pipe, kw["prompt"], kw)
@@ -466,8 +471,8 @@ def _qwen_call(pipe, **kw):
     try:
         return pipe(**kw)
     except TypeError as e:
-        # callback_on_step_end = garde VRAM optionnelle (cf. _vram_guard_kwargs):
-        # une vieille build diffusers qui ne le connait pas tourne sans garde.
+        # callback_on_step_end = the optional VRAM guard (see _vram_guard_kwargs):
+        # an old diffusers build that does not know it runs without the guard.
         if any(k in kw for k in ("true_cfg_scale", "negative_prompt", "callback_on_step_end")):
             for k in ("true_cfg_scale", "negative_prompt", "callback_on_step_end"):
                 kw.pop(k, None)
@@ -477,8 +482,8 @@ def _qwen_call(pipe, **kw):
 
 
 def _scheduler_accepts_sigmas(sched):
-    """Le pipeline Z-Image appelle set_timesteps(..., sigmas=<schedule custom>). Un
-    scheduler dont set_timesteps n'accepte pas `sigmas` plante a la generation."""
+    """The Z-Image pipeline calls set_timesteps(..., sigmas=<custom schedule>). A scheduler
+    whose set_timesteps does not accept `sigmas` crashes at generation time."""
     import inspect
     try:
         return "sigmas" in inspect.signature(sched.set_timesteps).parameters
@@ -487,8 +492,8 @@ def _scheduler_accepts_sigmas(sched):
 
 
 def _build_scheduler(sampler, schedule, config):
-    """Construit le scheduler choisi (sampler x schedule) depuis le config natif du modele.
-    schedule (sgm_uniform/beta/karras/exponential) = remapping des sigmas (use_*_sigmas)."""
+    """Builds the chosen scheduler (sampler x schedule) from the model's native config.
+    schedule (sgm_uniform/beta/karras/exponential) = a sigma remapping (use_*_sigmas)."""
     from diffusers import FlowMatchEulerDiscreteScheduler
     kw = {}
     flag = _SCHEDULE_FLAG.get((schedule or "").lower())
@@ -502,8 +507,8 @@ def _build_scheduler(sampler, schedule, config):
         except Exception:
             return UniPCMultistepScheduler.from_config(config, **kw)
     if name == "lcm":
-        # LCM flow-matching: accepte les sigmas custom du pipeline ET les flags de
-        # schedule. Repli sur Euler si la version de diffusers ne l'expose pas.
+        # LCM flow-matching: takes the pipeline's custom sigmas AND the schedule flags.
+        # Falls back to Euler when the installed diffusers does not expose it.
         try:
             from diffusers import FlowMatchLCMScheduler
             return FlowMatchLCMScheduler.from_config(config, **kw)
@@ -513,8 +518,9 @@ def _build_scheduler(sampler, schedule, config):
 
 
 def _apply_sampler(pipe):
-    """Pose le scheduler courant (SAMPLER x SCHEDULE) sur un pipe. Verifie la compatibilite
-    (sigmas custom) et retombe sur Euler/sgm_uniform si KO -> jamais de crash a la generation."""
+    """Applies the current scheduler (SAMPLER x SCHEDULE) to a pipe. Checks compatibility
+    (custom sigmas) and falls back to Euler/sgm_uniform when it fails -> never a crash at
+    generation time."""
     if _BASE_SCHED_CONFIG is None:
         return
     from diffusers import FlowMatchEulerDiscreteScheduler
@@ -533,15 +539,15 @@ def _apply_sampler(pipe):
 
 
 def _reapply_sampler_all():
-    """Re-applique le scheduler courant a tous les pipes en cache (base + derives)."""
+    """Re-applies the current scheduler to every cached pipe (base + derived)."""
     for p in [_BASE_PIPE] + list(_DERIVED.values()):
         if p is not None:
             _apply_sampler(p)
 
 
 def set_sampler(name):
-    """Change le sampler (euler/unipc) et le re-applique aux pipes en cache (pas de
-    rechargement). Pas d'effet sur le pipe Omni (scheduler propre)."""
+    """Changes the sampler (euler/unipc) and re-applies it to the cached pipes (no
+    reload). No effect on the Omni pipe (its own scheduler)."""
     global SAMPLER
     name = (name or "euler").strip().lower()
     if name not in SAMPLER_CHOICES:
@@ -554,8 +560,8 @@ def set_sampler(name):
 
 
 def set_schedule(name):
-    """Change le schedule de sigmas (sgm_uniform/beta/karras/exponential, alias 'simple'
-    = sgm_uniform) et le re-applique aux pipes en cache."""
+    """Changes the sigma schedule (sgm_uniform/beta/karras/exponential, alias 'simple'
+    = sgm_uniform) and re-applies it to the cached pipes."""
     global SCHEDULE
     name = _norm_schedule(name)
     if name != SCHEDULE:
@@ -573,11 +579,11 @@ def _progress(frac, desc=""):
             pass
 
 
-# ---- Feedback de chargement des modeles (terminal + UI) ----
-# from_pretrained est bloquant et silencieux (le 1er chargement telecharge depuis HF ->
-# plusieurs minutes). On execute le chargement dans un thread et on rafraichit toutes les
-# ~2s une ligne terminal + la barre Gradio (temps ecoule + VRAM allouee). Config bloc
-# "load_progress"; enabled=false -> chargement direct (aucun thread, zero cout).
+# ---- Model loading feedback (terminal + UI) ----
+# from_pretrained is blocking and silent (the first load downloads from HF -> several
+# minutes). So the load runs in a thread and every ~2s a terminal line plus the Gradio bar
+# are refreshed (elapsed time + allocated VRAM). Config block "load_progress";
+# enabled=false -> a direct load (no thread, zero cost).
 _LOAD_CFG = CONFIG.get("load_progress") if isinstance(CONFIG.get("load_progress"), dict) else {}
 LOAD_PROGRESS_ENABLED = bool(_LOAD_CFG.get("enabled", True))
 _LOAD_TARGET_GB = float(_LOAD_CFG.get("target_vram_gb", 14.0))
@@ -585,16 +591,16 @@ _LOAD_HEARTBEAT = float(_LOAD_CFG.get("heartbeat_s", 2.0))
 
 
 def _fmt_load(label, elapsed, vram_gb):
-    """Texte de progression de chargement (pur, testable). VRAM > 0 -> phase chargement
-    en memoire; sinon phase download/lecture disque."""
+    """Loading progress text (pure, testable). VRAM > 0 -> the loading-into-memory
+    phase; otherwise the download/disk-read phase."""
     if vram_gb > 0.05:
         return f"{label}... {elapsed:.0f}s | {vram_gb:.1f} GB in VRAM"
     return f"{label}... {elapsed:.0f}s (downloading / reading, first run only)"
 
 
 def _load_pct(elapsed, vram_gb, target_gb=None):
-    """% honnete: base sur la VRAM allouee / cible une fois le chargement en memoire
-    commence (plafonne 0.95); pendant le download (VRAM~0) petite barre temporelle."""
+    """An honest %: based on the allocated VRAM / target once the load into memory has
+    started (capped at 0.95); during the download (VRAM~0) a small time-based bar."""
     target_gb = target_gb or _LOAD_TARGET_GB
     if vram_gb <= 0.05:
         return min(0.12, elapsed / 600.0)
@@ -602,8 +608,8 @@ def _load_pct(elapsed, vram_gb, target_gb=None):
 
 
 def _load_monitor(label, fn):
-    """Execute fn() (chargement bloquant) dans un thread et rafraichit terminal + UI
-    (temps + VRAM) toutes les ~2s. Renvoie le resultat de fn (releve son exception)."""
+    """Runs fn() (a blocking load) in a thread and refreshes terminal + UI (time +
+    VRAM) every ~2s. Returns fn's result (re-raises its exception)."""
     if not LOAD_PROGRESS_ENABLED:
         return fn()
     box = {}
@@ -611,7 +617,7 @@ def _load_monitor(label, fn):
     def _work():
         try:
             box["v"] = fn()
-        except BaseException as e:   # noqa: BLE001 - on re-leve dans le thread principal
+        except BaseException as e:   # noqa: BLE001 - it is re-raised in the main thread
             box["e"] = e
 
     th = threading.Thread(target=_work, daemon=True)
@@ -637,8 +643,8 @@ def _load_monitor(label, fn):
 
 
 def request_stop():
-    """Demande l'arret: stoppe la boucle de debruitage en cours (pipe._interrupt) et
-    les boucles batch/tuiles (_STOP). Quasi-immediat (s'arrete au pas suivant)."""
+    """Asks for a stop: halts the running denoise loop (pipe._interrupt) and the
+    batch/tile loops (_STOP). Near-immediate (it stops at the next step)."""
     global _STOP
     _STOP = True
     n = 0
@@ -654,29 +660,30 @@ def request_stop():
 
 
 def set_zimage_model(repo_or_path):
-    """Change le modele Qwen. Un repo HF / dossier diffusers -> BASE_REPO.
-    Un fichier single-file (.safetensors Civitai, .gguf) -> transformer override."""
+    """Changes the Qwen model. An HF repo / diffusers folder -> BASE_REPO.
+    A single-file checkpoint (a Civitai .safetensors, a .gguf) -> a transformer override."""
     global BASE_REPO, ZIMAGE_TRANSFORMER
     if not repo_or_path:
         return
     if _is_single_file(repo_or_path):
-        # Changement de transformer seul: PAS de free_vram -> _ensure_base echangera
-        # uniquement le transformer (VAE + encodeur texte gardes en VRAM).
+        # A transformer-only change: NO free_vram -> _ensure_base will swap the
+        # transformer alone (VAE + text encoder kept in VRAM).
         if repo_or_path != ZIMAGE_TRANSFORMER:
             ZIMAGE_TRANSFORMER = repo_or_path
             _log("Qwen transformer (single-file) changed -> transformer swap on next run")
     elif repo_or_path != BASE_REPO:
-        # Le repo de base change: VAE/encodeur/tokenizer changent aussi -> reload complet.
+        # The base repo changes: the VAE/encoder/tokenizer change too -> a full reload.
         BASE_REPO = repo_or_path
         free_vram()
         _log("Qwen base repo changed -> will reload")
 
 
 def set_zimage_transformer(path):
-    """Definit (ou enleve avec '' / None) le transformer single-file.
+    """Sets (or removes with '' / None) the single-file transformer.
 
-    NE libere PAS le pipeline: a repo de base identique, _ensure_base ne rechargera que
-    le transformer (_swap_transformer) et gardera VAE + encodeur texte en VRAM."""
+    Does NOT release the pipeline: with the same base repo, _ensure_base will only reload
+    the transformer (_swap_transformer) and keep VAE + text encoder in VRAM.
+"""
     global ZIMAGE_TRANSFORMER
     path = path or None
     if path != ZIMAGE_TRANSFORMER:
@@ -685,25 +692,25 @@ def set_zimage_transformer(path):
              "-> transformer swap on next run (base components kept)")
 
 
-# --- Encodeur texte de remplacement ---------------------------------------------------
-# Qwen-Image lit le DERNIER etat cache de l'encodeur (hidden_states[-1]) dans txt_norm +
-# txt_in, larges de 3584 (joint_attention_dim): un encodeur ne convient que s'il a la
-# meme famille (qwen2_5_vl -- le pipe d'edition lui montre l'image), la meme largeur et
-# le meme nombre de couches que celui du repo qu'il remplace. Un Qwen2.5-VL-7B
-# "abliterated" ou fine-tune se branche tel quel. On le verifie a la config, AVANT de
-# lire 16 Go -- et pour CHAQUE pipe contre SON repo (base, ou repo d'edition).
+# --- Replacement text encoder ---------------------------------------------------------
+# Qwen-Image reads the LAST hidden state of the encoder (hidden_states[-1]) in txt_norm +
+# txt_in, both 3584 wide (joint_attention_dim): an encoder only fits if it has the same
+# family (qwen2_5_vl -- the edit pipe shows it the image), the same width and the same number
+# of layers as the one it replaces. An "abliterated" or fine-tuned Qwen2.5-VL-7B plugs in as
+# is. That is checked on the config, BEFORE reading 16 GB -- and for EACH pipe against ITS
+# repo (the base one, or the edit repo).
 _SINGLE_FILE_EXTS = (".safetensors", ".ckpt", ".pt", ".sft", ".gguf")
 
 
 def _looks_single_file(p):
-    """Vrai si le NOM est celui d'un checkpoint single-file, qu'il existe ou non
-    (_is_single_file exige en plus que le fichier soit la)."""
+    """True when the NAME is that of a single-file checkpoint, whether it exists or not
+    (_is_single_file also requires the file to be there)."""
     return bool(p) and str(p).lower().endswith(_SINGLE_FILE_EXTS)
 
 
 def _split_hf_src(src):
-    """'owner/repo/sous/dossier' -> ('owner/repo', 'sous/dossier'). Les poids d'un
-    encodeur publie sur HF sont souvent dans un sous-dossier du repo."""
+    """'owner/repo/sub/folder' -> ('owner/repo', 'sub/folder'). The weights of an encoder
+    published on HF often sit in a subfolder of the repo."""
     parts = [p for p in str(src).replace("\\", "/").split("/") if p]
     if len(parts) > 2:
         return "/".join(parts[:2]), "/".join(parts[2:])
@@ -711,9 +718,9 @@ def _split_hf_src(src):
 
 
 def _enc_dims(cfg):
-    """(largeur, couches, famille) d'une config transformers. Qwen2.5-VL range la partie
-    texte sous 'text_config' (en plus du premier niveau depuis transformers 4.53, et
-    seulement la dans les configs recentes); T5 dit d_model / num_layers."""
+    """(width, layers, family) of a transformers config. Qwen2.5-VL keeps the text part
+    under 'text_config' (on top of the top level since transformers 4.53, and only there in
+    recent configs); T5 says d_model / num_layers."""
     c = cfg.get("text_config") if isinstance(cfg.get("text_config"), dict) else cfg
     h = c.get("hidden_size") or c.get("d_model")
     n = c.get("num_hidden_layers") or c.get("num_layers")
@@ -721,8 +728,8 @@ def _enc_dims(cfg):
 
 
 def _base_text_encoder_config(base=None):
-    """config.json de l'encodeur du repo `base` (BASE_REPO par defaut), ou None si
-    illisible."""
+    """The config.json of repo `base`'s encoder (BASE_REPO by default), or None when
+    unreadable."""
     base = (base or BASE_REPO or "").strip()
     try:
         cfg = os.path.join(base, "text_encoder", "config.json")
@@ -740,9 +747,9 @@ def _base_text_encoder_config(base=None):
 
 
 def _text_encoder_source(src):
-    """Localise l'encodeur `src`: (config, dossier ou repo, sous-dossier) ou None.
-    Dossier local: config.json a la racine ou dans text_encoder/. Repo HF: idem, ou le
-    sous-dossier nomme dans l'id."""
+    """Locates the encoder `src`: (config, folder or repo, subfolder) or None.
+    A local folder: config.json at the root or inside text_encoder/. An HF repo: the same,
+    or the subfolder named in the id."""
     src = (src or "").strip()
     if not src:
         return None
@@ -765,7 +772,7 @@ def _text_encoder_source(src):
         return None
     for sub in ([sub0] if sub0 else [None, "text_encoder"]):
         rel = f"{sub}/config.json" if sub else "config.json"
-        for local in (True, False):          # le cache d'abord: marche hors ligne
+        for local in (True, False):          # the cache first: works offline
             try:
                 p = hf_hub_download(repo, rel, local_files_only=local)
                 with open(p, encoding="utf-8") as f:
@@ -776,8 +783,8 @@ def _text_encoder_source(src):
 
 
 def _encoder_label(src):
-    """Nom lisible d'un encodeur: le NOM du dossier -- jamais le chemin, qui finirait
-    dans les PNG partages avec le nom de la session Windows -- ou l'id du repo HF."""
+    """A readable name for an encoder: the FOLDER's name -- never the path, which would
+    end up in shared PNGs along with the Windows session name -- or the HF repo id."""
     src = (src or "").strip()
     if not src:
         return ""
@@ -790,8 +797,8 @@ def _encoder_label(src):
 
 
 def _text_encoder_problem(src, base=None):
-    """Raison de refuser `src` comme encodeur du repo `base` (BASE_REPO par defaut), ou
-    None s'il convient."""
+    """Why `src` should be refused as the encoder of repo `base` (BASE_REPO by default),
+    or None when it fits."""
     src = (src or "").strip()
     if not src:
         return None
@@ -808,7 +815,7 @@ def _text_encoder_problem(src, base=None):
                 "neither a folder on this machine nor a readable Hugging Face repo")
     ref_cfg = _base_text_encoder_config(base)
     if ref_cfg is None:
-        return None                      # rien a comparer: le chargement tranchera
+        return None                      # nothing to compare: the load will decide
     (h, n, t), (rh, rn, rt) = _enc_dims(found[0]), _enc_dims(ref_cfg)
     b = (base or BASE_REPO)
     if t and rt and t != rt:
@@ -822,9 +829,8 @@ def _text_encoder_problem(src, base=None):
 
 
 def _encoder_class(base=None):
-    """Classe transformers de l'encodeur, lue dans le model_index.json du repo `base`
-    (Qwen2_5_VLForConditionalGeneration ici): la meme que celle que diffusers aurait
-    chargee."""
+    """The encoder's transformers class, read from repo `base`'s model_index.json
+    (Qwen2_5_VLForConditionalGeneration here): the same one diffusers would have loaded."""
     base = (base or BASE_REPO or "").strip()
     try:
         p = os.path.join(base, "model_index.json")
@@ -844,7 +850,7 @@ def _encoder_class(base=None):
 
 
 def _load_text_encoder(src, base=None):
-    """Charge l'encodeur `src` en DTYPE, avec la classe du repo `base`."""
+    """Loads the encoder `src` in DTYPE, with repo `base`'s class."""
     found = _text_encoder_source(src)
     if found is None:
         raise RuntimeError(f"{src}: no config.json")
@@ -856,10 +862,10 @@ def _load_text_encoder(src, base=None):
 
 
 def _pick_text_encoder(base, which):
-    """Encodeur de remplacement pour le pipe `which` ('base' / 'edit') du repo `base`:
-    (modele, TEXT_ENCODER) s'il convient a CE repo et se charge, sinon (None, '') avec
-    une ligne de log -- le pipe garde alors l'encodeur de son repo. Ne leve jamais: une
-    option ne doit pas faire tomber une generation."""
+    """A replacement encoder for the `which` pipe ('base' / 'edit') of repo `base`:
+    (model, TEXT_ENCODER) when it suits THAT repo and loads, otherwise (None, '') with a log
+    line -- the pipe then keeps its repo's encoder. Never raises: an option must not bring a
+    generation down."""
     src = TEXT_ENCODER
     if not src:
         return None, ""
@@ -884,9 +890,9 @@ def _pick_text_encoder(base, which):
 
 
 def list_text_encoders():
-    """Dossiers d'encodeur proposes dans l'onglet Models: les sous-dossiers a config.json
-    de `text_encoders_dir`, ou de text_encoders / text_encoder / clip a cote du dossier
-    des checkpoints ou de son parent (conventions ComfyUI et Forge)."""
+    """Encoder folders offered in the Models tab: the subfolders with a config.json inside
+    `text_encoders_dir`, or inside text_encoders / text_encoder / clip next to the
+    checkpoints folder or its parent (ComfyUI and Forge conventions)."""
     roots = [TEXT_ENCODERS_DIR] if TEXT_ENCODERS_DIR else []
     here = os.path.abspath(CHECKPOINTS_DIR or ".")
     for up in (os.path.dirname(here), os.path.dirname(os.path.dirname(here))):
@@ -909,7 +915,7 @@ def list_text_encoders():
 
 
 def _hf_cache_dir():
-    """Dossier du cache Hugging Face (suit HF_HUB_CACHE / HF_HOME), ou None."""
+    """The Hugging Face cache folder (follows HF_HUB_CACHE / HF_HOME), or None."""
     try:
         from huggingface_hub import constants
         return constants.HF_HUB_CACHE
@@ -918,9 +924,9 @@ def _hf_cache_dir():
 
 
 def _scan_cached_encoders():
-    """[(id HF, config)] du cache Hugging Face: depots qui ne sont PAS des pipelines
-    diffusers (pas de model_index.json), dont une config -- a la racine ou dans un
-    sous-dossier -- a ses poids a cote (revision la plus recente)."""
+    """[(HF id, config)] from the Hugging Face cache: repos that are NOT diffusers
+    pipelines (no model_index.json), one of whose configs -- at the root or in a subfolder --
+    has its weights next to it (the most recent revision)."""
     root = _hf_cache_dir()
     if not root or not os.path.isdir(root):
         return []
@@ -939,7 +945,7 @@ def _scan_cached_encoders():
             continue
         snap = os.path.join(snaps, revs[0])
         if os.path.isfile(os.path.join(snap, "model_index.json")):
-            continue                                 # un pipeline diffusers, pas un encodeur
+            continue                                 # a diffusers pipeline, not an encoder
         try:
             subs = [""] + sorted(s for s in os.listdir(snap) if os.path.isdir(os.path.join(snap, s)))
         except OSError:
@@ -952,7 +958,7 @@ def _scan_cached_encoders():
                 if not isinstance(cfg, dict):
                     continue
                 if not any(fn.endswith(".safetensors") for fn in os.listdir(p)):
-                    continue                         # config seule, poids pas telecharges
+                    continue                         # the config alone, the weights are not downloaded
             except Exception:
                 continue
             out.append((f"{repo}/{s}" if s else repo, cfg))
@@ -960,11 +966,11 @@ def _scan_cached_encoders():
 
 
 def list_cached_text_encoders(base=None):
-    """Encodeurs COMPATIBLES deja telecharges dans le cache Hugging Face, en (nom, id HF).
-    Un encodeur telecharge depuis HF vit dans ce cache, pas dans un dossier text_encoders:
-    sans ce balayage, la liste de l'onglet Models ne le montrait pas (releve sur klein le
-    2026-09-10). Compatible = meme famille, largeur et nombre de couches que l'encodeur du
-    repo de base. La valeur est l'id HF: lisible dans les metadonnees."""
+    """COMPATIBLE encoders already downloaded in the Hugging Face cache, as (name, HF id).
+    An encoder downloaded from HF lives in that cache, not in a text_encoders folder:
+    without this sweep the Models tab list did not show it (caught on klein on 2026-09-10).
+    Compatible = the same family, width and number of layers as the base repo's encoder. The
+    value is the HF id: readable in the metadata."""
     ref_cfg = _base_text_encoder_config(base)
     if not ref_cfg:
         return []
@@ -973,9 +979,9 @@ def list_cached_text_encoders(base=None):
 
 
 def cached_text_encoder_mismatches(base=None):
-    """Encodeurs du cache HF de la MEME famille mais d'une autre taille que celui du repo
-    de base: masques de la liste (ils seraient refuses), nommes a cote pour que l'on sache
-    pourquoi. ([(id HF, largeur)], largeur attendue)."""
+    """Encoders in the HF cache of the SAME family but of another size than the base
+    repo's: hidden from the list (they would be refused), named next to it so one knows why.
+    ([(HF id, width)], expected width)."""
     ref_cfg = _base_text_encoder_config(base)
     if not ref_cfg:
         return [], None
@@ -989,10 +995,9 @@ def cached_text_encoder_mismatches(base=None):
 
 
 def set_text_encoder(src):
-    """Choisit l'encodeur texte ('' = celui du repo). Un changement LIBERE les deux
-    pipelines, base et edition -- l'encodeur se charge avec eux, sans echange a chaud
-    sous les hooks d'offload -- et free_vram vide le cache d'embeddings, calcule par
-    l'ancien."""
+    """Picks the text encoder ('' = the repo's). A change RELEASES both pipelines, base
+    and edit -- the encoder loads with them, no hot swap under the offload hooks -- and
+    free_vram empties the embedding cache, which the previous one computed."""
     global TEXT_ENCODER
     src = (src or "").strip()
     if src == TEXT_ENCODER:
@@ -1004,8 +1009,8 @@ def set_text_encoder(src):
 
 
 def _safetensors_header(path):
-    """En-tete JSON d'un .safetensors (noms/dtypes/shapes des tenseurs, JAMAIS les
-    poids) -- lecture de quelques centaines de Ko au plus, meme sur un fichier de 12 Go."""
+    """The JSON header of a .safetensors (tensor names/dtypes/shapes, NEVER the
+    weights) -- a few hundred KB read at most, even on a 12 GB file."""
     import struct
     with open(path, "rb") as f:
         n = struct.unpack("<Q", f.read(8))[0]
@@ -1013,13 +1018,14 @@ def _safetensors_header(path):
 
 
 def _safetensors_unsupported(path):
-    """Renvoie une raison (str) si le .safetensors n'est PAS chargeable, sinon None.
-    Lit juste l'en-tete (rapide). Deux cas restent non supportes:
-      - fichier LoRA range dans le dossier checkpoints (cles kohya/peft)
-      - SVDQuant / Nunchaku (tenseurs nommes '*.qweight'): poids pre-quantifies INT4
-        qui exigent le runtime nunchaku (kernels dedies), pas dequantifiables ici.
-    Les FP8 / INT8 'scaled' facon ComfyUI ne sont PLUS rejetes: ils passent par le
-    loader dequant (_safetensors_dequant + _load_dequant_state_dict)."""
+    """Returns a reason (str) when the .safetensors is NOT loadable, otherwise None.
+    Only reads the header (fast). Two cases stay unsupported:
+      - a LoRA file filed in the checkpoints folder (kohya/peft keys)
+      - SVDQuant / Nunchaku (tensors named '*.qweight'): pre-quantized INT4 weights that
+        require the nunchaku runtime (dedicated kernels), not dequantizable here.
+    ComfyUI-style 'scaled' FP8 / INT8 are NO LONGER rejected: they go through the dequant
+    loader (_safetensors_dequant + _load_dequant_state_dict).
+"""
     try:
         hdr = _safetensors_header(path)
         has_qweight = False
@@ -1031,8 +1037,9 @@ def _safetensors_unsupported(path):
                 continue
             if k.endswith(".qweight"):
                 has_qweight = True
-            # Encodeur texte Qwen2.5-VL (fichier ComfyUI 'qwen_2.5_vl_7b_fp8_scaled'):
-            # couches LLM + tour visuelle, jamais de blocs de diffusion.
+            # A Qwen2.5-VL text encoder (the ComfyUI file
+            # 'qwen_2.5_vl_7b_fp8_scaled'): LLM layers + a vision tower, never any
+            # diffusion block.
             if k.startswith(("model.layers.", "visual.", "lm_head.", "model.embed_tokens",
                              "language_model.", "model.language_model.")):
                 te_keys += 1
@@ -1041,19 +1048,20 @@ def _safetensors_unsupported(path):
             if (".lora_down." in k or ".lora_up." in k or ".lora_A." in k
                     or ".lora_B." in k or k.startswith(("lora_unet_", "lora_te"))):
                 lora_keys += 1
-        # Fichier LoRA range dans le dossier checkpoints (erreur classique): le charger
-        # comme transformer envoie diffusers chercher une config par defaut (SD1.5) ->
-        # 404 'stable-diffusion-v1-5 does not appear to have a file named config.json'.
+        # A LoRA file filed in the checkpoints folder (a classic mistake): loading it
+        # as a transformer sends diffusers looking for a default config (SD1.5) -> a 404
+        # 'stable-diffusion-v1-5 does not appear to have a file named config.json'.
         if lora_keys >= 4:
             return "LoRA file, not a checkpoint - move it to the LoRA folder and pick it in Models > LoRA"
-        # Encodeur texte range avec les checkpoints (telechargement Civitai 'text encoder'):
-        # ce n'est pas un modele d'image, le dequantifier gaspillerait ~15 Go de cache et
-        # le charger en transformer echouerait. Le pipe prend son encodeur du repo de base.
+        # A text encoder filed with the checkpoints (a Civitai 'text encoder'
+        # download): it is not an image model, dequantizing it would waste ~15 GB of cache
+        # and loading it as a transformer would fail. The pipe takes its encoder from the
+        # base repo.
         if te_keys >= 4 and dit_keys == 0:
             return ("text encoder (Qwen2.5-VL), not an image model - the pipeline takes its "
                     "text encoder from the base repo; nothing to do with this file")
-        # '*.qweight' = poids pre-quantifies (SVDQuant/Nunchaku, GPTQ-like). Signal net:
-        # un checkpoint BF16/FP16 normal n'a jamais de 'qweight'.
+        # '*.qweight' = pre-quantized weights (SVDQuant/Nunchaku, GPTQ-like). A clear signal:
+        # a normal BF16/FP16 checkpoint never has a 'qweight'.
         if has_qweight:
             return "SVDQuant/Nunchaku INT4"
     except Exception:
@@ -1062,14 +1070,15 @@ def _safetensors_unsupported(path):
 
 
 def _safetensors_dequant(path):
-    """Renvoie le schema de quantification ComfyUI a dequantifier au chargement
-    ('FP8', 'FP8 scaled' ou 'INT8 scaled'), sinon None (BF16/FP16 -> chemin normal).
-    Format 'scaled' ComfyUI observe sur les checkpoints Civitai:
-      X.weight (F8_E4M3 ou I8) + X.weight_scale (F32, scalaire ou par ligne [out,1])
-      + X.comfy_quant (petit blob U8 descripteur, a jeter).
-    NB: un bundle AIO dont SEUL l'encodeur texte est quantifie (transformer BF16)
-    declenche aussi -> le loader dequant filtre le transformer et le laisse intact.
-    U8 seul ne declenche pas: les blobs 'comfy_quant' sont U8 dans des fichiers sains."""
+    """Returns the ComfyUI quantization scheme to dequantize at load time
+    ('FP8', 'FP8 scaled' or 'INT8 scaled'), otherwise None (BF16/FP16 -> the normal path).
+    The ComfyUI 'scaled' format seen on Civitai checkpoints:
+      X.weight (F8_E4M3 or I8) + X.weight_scale (F32, scalar or per row [out,1])
+      + X.comfy_quant (a small U8 descriptor blob, to be dropped).
+    NB: an AIO bundle whose text encoder ALONE is quantized (BF16 transformer) also
+    triggers -> the dequant loader filters the transformer and leaves it untouched.
+    U8 alone does not trigger: 'comfy_quant' blobs are U8 in healthy files.
+"""
     try:
         hdr = _safetensors_header(path)
         has_fp8 = has_int = has_scale = False
@@ -1092,25 +1101,25 @@ def _safetensors_dequant(path):
     return None
 
 
-# Marqueurs de cles du transformer Qwen-Image (layout original OU prefixe ComfyUI):
-# utilises par le loader dequant pour refuser un checkpoint quantifie d'une AUTRE
-# architecture (il chargerait des poids incoherents).
+# Key markers of the Qwen-Image transformer (original layout OR ComfyUI prefix): used
+# by the dequant loader to refuse a quantized checkpoint of ANOTHER architecture (it would
+# load incoherent weights).
 _QWEN_KEY_MARKERS = ("transformer_blocks.", "img_in", "txt_in", "time_text_embed")
 
-# Prefixe ComfyUI/LDM des checkpoints diffusion single-file. diffusers 0.39 mappe
-# QwenImageTransformer2DModel avec une fonction IDENTITE (aucune conversion de cles):
-# le state dict doit donc arriver AU LAYOUT DIFFUSERS, prefixe retire. Sinon toutes les
-# cles sont "unexpected", aucun poids n'est charge, le modele reste sur 'meta' et
-# dispatch_model casse sur "Cannot copy out of meta tensor; no data!".
+# The ComfyUI/LDM prefix of single-file diffusion checkpoints. diffusers 0.39 maps
+# QwenImageTransformer2DModel with an IDENTITY function (no key conversion at all): the state
+# dict must therefore arrive IN THE DIFFUSERS LAYOUT, prefix stripped. Otherwise every key is
+# "unexpected", no weight is loaded, the model stays on 'meta' and dispatch_model breaks on
+# "Cannot copy out of meta tensor; no data!".
 _COMFY_PREFIX = "model.diffusion_model."
 
 
 # ----------------------------------------------------------------------------
-# Cache disque des transformers dequantifies (FP8/INT8 ComfyUI -> bf16), porte
-# de crispz-studio. Un dequant lit et convertit tout le fichier (minutes sur
-# HDD); le bf16 est ecrit UNE FOIS ici et les chargements suivants deviennent
-# un single-file normal (secondes). CLE = fichier ORIGINAL (chemin+taille+
-# mtime): supprimer ce cache est toujours sur, il se reconstruit a la demande.
+# Disk cache of dequantized transformers (ComfyUI FP8/INT8 -> bf16), carried over
+# from crispz-studio. A dequant reads and converts the whole file (minutes on a
+# HDD); the bf16 is written ONCE here and later loads become a normal
+# single-file one (seconds). The KEY is the ORIGINAL file (path+size+mtime):
+# deleting this cache is always safe, it rebuilds on demand.
 # ----------------------------------------------------------------------------
 import hashlib as _dqhash
 
@@ -1122,13 +1131,13 @@ except Exception:
 
 
 def _file_key(path):
-    """Identite stable et pas chere d'un fichier: (chemin absolu, taille, mtime)."""
+    """A file's stable, cheap identity: (absolute path, size, mtime)."""
     st = os.stat(path)
     return (os.path.abspath(path), st.st_size, int(st.st_mtime))
 
 
 def _dequant_cache_dir():
-    """Dossier du cache de dequant, cree a la demande. None = cache desactive."""
+    """The dequant cache folder, created on demand. None = cache disabled."""
     if _DQ_CACHE_CFG.lower() in ("off", "none", "0", "false"):
         return None
     d = (os.path.join(HERE, "cache", "dequant")
@@ -1141,21 +1150,22 @@ def _dequant_cache_dir():
         return None
 
 
-# Plage de chaque format 8 bits: la valeur stockee la plus grande qu'un poids QUANTIFIE
-# (poids / echelle) peut atteindre.
+# Range of each 8-bit format: the largest stored value a QUANTIZED weight
+# (weight / scale) can reach.
 _QUANT_RANGE = {torch.float8_e4m3fn: 448.0, torch.float8_e5m2: 57344.0, torch.int8: 127.0}
 
 
 def _stored_at_scale(t, s, qdtype, cfg=None):
-    """Vrai si les poids stockes sont DEJA a leur echelle reelle, un weight_scale etant
-    fourni en plus -- a ne pas appliquer. Porte de crispz-klein 1.34.1.
+    """True when the stored weights are ALREADY at their real scale, a weight_scale being
+    supplied on top -- not to be applied. Carried over from crispz-klein 1.34.1.
 
-    Un FP8 'scaled' normal stocke poids / echelle: il REMPLIT la plage du format (448 en
-    E4M3) et max|stocke| / (echelle x plage) vaut 1 / echelle (71 a 1 691 sur les 16
-    fichiers FP8/INT8 de la bibliotheque). kleinFinalcutFP16FP8_comfyQuant stocke ses
-    poids tels quels (0,375 sur 448) et fournit amax / 448 quand meme: rapport 1,03.
-    Appliquer l'echelle rendait chaque poids 1 200 a 1 700 fois trop petit, et l'image
-    sortait en bruit. Les echelles MX (uint8 = exposant E8M0) ne sont jamais concernees."""
+    A normal 'scaled' FP8 stores weight / scale: it FILLS the format's range (448 in E4M3)
+    and max|stored| / (scale x range) is 1 / scale (71 to 1,691 across the 16 FP8/INT8 files
+    of the library). kleinFinalcutFP16FP8_comfyQuant stores its weights as they are (0.375
+    out of 448) and supplies amax / 448 anyway: ratio 1.03. Applying the scale made every
+    weight 1,200 to 1,700 times too small, and the image came out as noise. MX scales
+    (uint8 = an E8M0 exponent) are never concerned.
+"""
     rng = _QUANT_RANGE.get(qdtype)
     fmt = str((cfg or {}).get("format", "")).lower()
     if rng is None or s.dtype == torch.uint8 or fmt.startswith("mx"):
@@ -1164,21 +1174,21 @@ def _stored_at_scale(t, s, qdtype, cfg=None):
     if smax <= 0.0:
         return False
     amax = float(t.detach().float().abs().max())
-    # 1. plage peu utilisee (un fichier normal la remplit)...
+    # 1. the range is barely used (a normal file fills it)...
     if amax >= rng / 4:
         return False
-    # 2. ... ET l'echelle decrit exactement les valeurs stockees: rapport ~1.
+        # 2. ... AND the scale describes exactly the stored values: ratio ~1.
     ratio = amax / (smax * rng)
     return 0.5 <= ratio < 2.0
 
 
-_PRESCALED = {}      # cle fichier -> bool (lu une fois par fichier et par session)
+_PRESCALED = {}      # file key -> bool (read once per file and per session)
 
 
 def _source_prescaled(src):
-    """Le fichier source stocke-t-il ses poids deja a l'echelle ? Lu sur le PLUS PETIT
-    tenseur quantifie qui porte une echelle: quelques Ko a lire. Toute erreur = False:
-    la cle de cache ne change alors pas."""
+    """Does the source file store its weights already at scale? Read on the SMALLEST
+    quantized tensor that carries a scale: a few KB to read. Any error = False: the cache key
+    then does not change."""
     try:
         fk = _file_key(src)
     except OSError:
@@ -1217,8 +1227,8 @@ def _source_prescaled(src):
 
 
 def _dequant_cache_path(src, legacy=False):
-    """Chemin du bf16 cache pour un checkpoint source. La cle inclut taille+mtime:
-    un fichier remplace (meme nom) ne reutilise jamais l'ancien cache."""
+    """Path of the cached bf16 for a source checkpoint. The key includes size+mtime: a
+    replaced file (same name) never reuses the old cache."""
     d = _dequant_cache_dir()
     if not d:
         return None
@@ -1226,8 +1236,8 @@ def _dequant_cache_path(src, legacy=False):
         p, size, mtime = _file_key(src)
     except OSError:
         return None
-    # Un fichier stocke deja a l'echelle change de cle: son ancien cache a ete ecrit par le
-    # chargeur qui appliquait l'echelle a tort. legacy=True rend l'ancienne cle.
+    # A file already stored at scale changes key: its old cache was written by the
+    # loader that applied the scale wrongly. legacy=True returns the old key.
     tag = "bf16-v2"
     if not legacy and _source_prescaled(src):
         tag = "bf16-v2-prescaled"
@@ -1238,8 +1248,8 @@ def _dequant_cache_path(src, legacy=False):
 
 
 def _dequant_cache_prune(keep=None):
-    """Plafonne le cache (dequant_cache_max_gb, 0 = illimite): supprime les fichiers
-    les moins recemment UTILISES (atime, sinon mtime) jusqu'a repasser sous le seuil."""
+    """Caps the cache (dequant_cache_max_gb, 0 = unlimited): deletes the least recently
+    USED files (atime, else mtime) until it is back under the threshold."""
     d = _dequant_cache_dir()
     if not d or DEQUANT_CACHE_MAX_GB <= 0:
         return
@@ -1270,9 +1280,9 @@ def _dequant_cache_prune(keep=None):
 
 
 def _dequant_cache_store(src, sd):
-    """Ecrit le state dict dequantifie dans le cache (best effort: toute erreur est
-    ignoree, le chargement courant a deja le dict en memoire). Ecriture atomique via
-    un .tmp renomme -> une interruption ne laisse jamais un cache tronque."""
+    """Writes the dequantized state dict into the cache (best effort: any error is
+    ignored, the current load already has the dict in memory). Atomic write through a
+    renamed .tmp -> an interruption never leaves a truncated cache."""
     dst = _dequant_cache_path(src)
     if not dst:
         return
@@ -1280,15 +1290,15 @@ def _dequant_cache_store(src, sd):
         from safetensors.torch import save_file
         t0 = time.time()
         tmp = dst + ".tmp"
-        # contiguous(): safetensors refuse les vues non contigues (issues des slices
-        # de dequant); clone implicite, on est deja en RAM.
+        # contiguous(): safetensors refuses non-contiguous views (they come from the
+        # dequant slices); an implicit clone, and we are in RAM already.
         save_file({k: v.contiguous() for k, v in sd.items()}, tmp)
         os.replace(tmp, dst)
         gb = os.path.getsize(dst) / 1024**3
         _log(f"dequant cache: saved {gb:.1f} GB in {time.time() - t0:.1f}s "
              f"-> next load of this checkpoint skips the dequant")
-        # L'ancien cache de CE fichier, ecrit sous l'ancienne cle (poids faux, cf.
-        # _dequant_cache_path): remplace, donc supprime.
+        # THIS file's old cache, written under the old key (wrong weights, see
+        # _dequant_cache_path): it has been replaced, so it is deleted.
         old = _dequant_cache_path(src, legacy=True)
         if old and os.path.abspath(old) != os.path.abspath(dst) and os.path.isfile(old):
             try:
@@ -1308,12 +1318,13 @@ def _dequant_cache_store(src, sd):
 
 
 def _hadamard_ortho(n):
-    """Matrice 'regular hadamard' du ConvRot comfy-quants -- ATTENTION, ce n'est PAS
-    la construction de Sylvester: la base est ce H4 precis, etendu par produits de
-    Kronecker jusqu'a n (puissance de 4), puis normalise 1/sqrt(n). Orthonormee ET
-    symetrique -> la reconstruction re-multiplie simplement par la meme matrice.
-    (Verifie contre src/comfy_quants/formats/convrot.py; avec un Sylvester la
-    correlation aux poids de base tombe a ~0 -> bruit total.)"""
+    """The comfy-quants ConvRot 'regular hadamard' matrix -- CAREFUL, this is NOT
+    Sylvester's construction: the base is that precise H4, extended by Kronecker products
+    up to n (a power of 4), then normalised by 1/sqrt(n). Orthonormal AND symmetric -> the
+    reconstruction simply multiplies by the same matrix again.
+    (Checked against src/comfy_quants/formats/convrot.py; with a Sylvester the correlation
+    to the base weights drops to ~0 -> pure noise.)
+"""
     h4 = torch.tensor([[1., 1., 1., -1.], [1., 1., -1., 1.],
                        [1., -1., 1., 1.], [-1., 1., 1., 1.]])
     H = h4
@@ -1325,9 +1336,9 @@ def _hadamard_ortho(n):
 
 
 def _safetensors_comfy_prefixed(path):
-    """True si le .safetensors est au layout ComfyUI ('model.diffusion_model.*').
-    Lit juste l'en-tete. Un tel fichier ne peut PAS partir tel quel dans
-    from_single_file (mapping identite cote diffusers, cf. _COMFY_PREFIX)."""
+    """True when the .safetensors is in the ComfyUI layout ('model.diffusion_model.*').
+    Only reads the header. Such a file can NOT go as is into from_single_file (identity
+    mapping on the diffusers side, see _COMFY_PREFIX)."""
     try:
         return any(k.startswith(_COMFY_PREFIX)
                    for k in _safetensors_header(path) if k != "__metadata__")
@@ -1336,51 +1347,53 @@ def _safetensors_comfy_prefixed(path):
 
 
 def _load_dequant_state_dict(path):
-    """Charge en RAM un single-file ComfyUI et le rend au LAYOUT DIFFUSERS, dequantifie
-    en DTYPE (bf16) tenseur par tenseur. Sert les deux cas: quantifie (FP8/INT8 'scaled')
-    et simplement PREFIXE (bf16/fp16 -- rien a dequantifier, juste le prefixe a retirer):
-      - bundle AIO (transformer + encodeur texte + VAE): seules les cles
-        'model.diffusion_model.*' sont gardees (VAE + encodeur = repo de base);
-      - X.weight (F8/I8) * X.weight_scale (scalaire ou par ligne) -> bf16;
-      - blob X.comfy_quant: si 'convrot' est declare (int8_tensorwise ComfyUI), la
-        rotation de Hadamard par groupes (defaut 256) est DEFAITE apres le descale --
-        sans ca les poids sont un bruit total;
-      - les cles de quantification (weight_scale/scale_weight, comfy_quant, marqueur
-        scaled_fp8) sont consommees/jetees.
-    Le dict resultant part dans from_single_file (conversion de cles diffusers comprise).
-    NB VRAM/RAM: dequantifie = empreinte d'un BF16 complet; le FP8 n'economise que le
-    disque/telechargement, pas la memoire."""
+    """Loads a ComfyUI single-file into RAM and returns it IN THE DIFFUSERS LAYOUT,
+    dequantized to DTYPE (bf16) tensor by tensor. Serves both cases: quantized (FP8/INT8
+    'scaled') and merely PREFIXED (bf16/fp16 -- nothing to dequantize, just the prefix to
+    strip):
+      - an AIO bundle (transformer + text encoder + VAE): only the
+        'model.diffusion_model.*' keys are kept (VAE + encoder = the base repo's);
+      - X.weight (F8/I8) * X.weight_scale (scalar or per row) -> bf16;
+      - the X.comfy_quant blob: when 'convrot' is declared (ComfyUI int8_tensorwise), the
+        grouped Hadamard rotation (256 by default) is UNDONE after the descale -- without
+        that the weights are pure noise;
+      - the quantization keys (weight_scale/scale_weight, comfy_quant, the scaled_fp8
+        marker) are consumed and dropped.
+    The resulting dict goes into from_single_file (diffusers key conversion included).
+    VRAM/RAM note: dequantized = the footprint of a full BF16; FP8 only saves disk and
+    download, not memory.
+"""
     from safetensors import safe_open
     t0 = time.time()
     hdr = _safetensors_header(path)
     entries = [(k, v) for k, v in hdr.items()
                if k != "__metadata__" and isinstance(v, dict)]
-    # Bundle AIO: ne garder que le transformer. (Sans prefixe ComfyUI = fichier
-    # transformer-only au layout original -> pas de filtre.) Methode crispz-krea2:
-    # le prefixe est retire des la LECTURE, tout l'aval (scales, qcfg, garde d'archi,
-    # state dict rendu) travaille donc sur des cles au layout diffusers, sans variante.
+    # AIO bundle: keep only the transformer. (No ComfyUI prefix = a transformer-only
+    # file in the original layout -> no filtering.) crispz-krea2's method: the prefix is
+    # stripped at READ time, so everything downstream (scales, qcfg, architecture guard,
+    # returned state dict) works on diffusers-layout keys, with no variant.
     prefix = ""
     if any(k.startswith(_COMFY_PREFIX) for k, _ in entries):
         prefix = _COMFY_PREFIX
         entries = [(k, v) for k, v in entries if k.startswith(prefix)]
-    # Garde d'architecture: un checkpoint quantifie d'un AUTRE modele (cles sans
-    # aucun marqueur Qwen-Image) chargerait des poids incoherents -> refus clair.
+    # Architecture guard: a quantized checkpoint of ANOTHER model (keys without a
+    # single Qwen-Image marker) would load incoherent weights -> a clear refusal.
     if not any(any(m in k[len(prefix):] for m in _QWEN_KEY_MARKERS) for k, _ in entries):
         raise RuntimeError(
             f"{os.path.basename(path)}: quantized checkpoint does not look like a "
             "Qwen-Image transformer (different architecture); this build only loads "
             "Qwen-Image models.")
-    # Lecture SEQUENTIELLE dans l'ordre PHYSIQUE du fichier (data_offsets): un HDD
-    # s'effondre en acces aleatoire, et l'ordre des cles ne suit pas celui des donnees.
+    # SEQUENTIAL read in the file's PHYSICAL order (data_offsets): a HDD collapses on
+    # random access, and the key order does not follow the data's.
     entries.sort(key=lambda kv: kv[1].get("data_offsets", [0])[0])
     raw = {}
     qcfg = {}
-    # comfy-quants declare le schema soit en blobs PAR TENSEUR (X.comfy_quant),
-    # soit CENTRALEMENT dans __metadata__._quantization_metadata (variante
-    # StableYogi: {"layers": {"blocks...": {"format": "int8_tensorwise",
-    # "convrot": true, "convrot_groupsize": 256}}}). Ignorer cette variante
-    # laisse la rotation en place -> poids en bruit total (observe sur les
-    # INT8 Krea 2; meme format possible ici). Les blobs par tenseur gagnent.
+    # comfy-quants declares the scheme either in PER-TENSOR blobs (X.comfy_quant), or
+    # CENTRALLY in __metadata__._quantization_metadata (the StableYogi variant:
+    # {"layers": {"blocks...": {"format": "int8_tensorwise", "convrot": true,
+    # "convrot_groupsize": 256}}}). Ignoring that variant leaves the rotation in place ->
+    # weights as pure noise (observed on the Krea 2 INT8s; the same format is possible
+    # here). The per-tensor blobs win.
     try:
         qm = json.loads((hdr.get("__metadata__") or {}).get(
             "_quantization_metadata") or "{}")
@@ -1402,10 +1415,10 @@ def _load_dequant_state_dict(path):
                     _dbg(f"comfy_quant blob unreadable {k}: {e}")
                 continue
             raw[kk] = f.get_tensor(k)
-    # Le calcul de dequantification (cast fp32 + scales + un-rotation) est limite par la
-    # BANDE PASSANTE MEMOIRE en CPU (mesure crispz-krea2: ~9 min sur un INT8 12.9B): on le
-    # fait sur le GPU quand il y en a un, tenseur par tenseur (quelques centaines de Mo de
-    # VRAM au plus), retour bf16 en RAM. config convert_device: auto (defaut) | cpu.
+    # The dequantization work (fp32 cast + scales + un-rotation) is MEMORY BANDWIDTH
+    # bound on the CPU (measured on crispz-krea2: ~9 min on a 12.9B INT8): so it runs on
+    # the GPU when there is one, tensor by tensor (a few hundred MB of VRAM at most), with
+    # the bf16 coming back to RAM. config convert_device: auto (the default) | cpu.
     dev = "cpu"
     try:
         if (torch.cuda.is_available()
@@ -1413,14 +1426,14 @@ def _load_dequant_state_dict(path):
             dev = "cuda"
     except Exception:
         pass
-    _had = {}                                # cache Hadamard par taille de groupe
+    _had = {}                                # a Hadamard cache per group size
     sd = {}
     n_dq = n_rot = n_pre = 0
     for k in list(raw.keys()):
         if (k.endswith((".weight_scale", ".scale_weight", ".scale_input", ".input_scale"))
                 or k.endswith("scaled_fp8")):
             continue                         # consommees via lookup / jetees (scale_input
-                                             # = echelle d'ACTIVATION, pas de poids)
+                                             # = an ACTIVATION scale, not a weight one)
         t = raw.pop(k)
         if t.dtype in (torch.float8_e4m3fn, torch.float8_e5m2,
                        torch.int8, torch.uint8):
@@ -1435,13 +1448,13 @@ def _load_dequant_state_dict(path):
             t = t.to(dev).to(torch.float32)
             cfg0 = qcfg.get(k[:-len(".weight")]) if k.endswith(".weight") else None
             if s is not None and _stored_at_scale(t, s, qdt, cfg0):
-                s = None                     # deja a l'echelle: cf. _stored_at_scale
+                s = None                     # already at scale: see _stored_at_scale
                 n_pre += 1
             if s is not None:                # scalaire ou [out,1] -> broadcast
                 t = t * s.to(dev).to(torch.float32)
-            # ConvRot (int8_tensorwise comfy-quants): les poids stockes ont ete tournes
-            # W_rot = (W.view(out, in/g, g) @ H.T).reshape(...) AVANT quantification ->
-            # reconstruction = re-multiplier par H (orthonormee, symetrique) par groupe.
+            # ConvRot (comfy-quants int8_tensorwise): the stored weights were rotated
+            # W_rot = (W.view(out, in/g, g) @ H.T).reshape(...) BEFORE quantization ->
+            # reconstruction = multiply by H again (orthonormal, symmetric) per group.
             cfg = qcfg.get(k[:-len(".weight")]) if k.endswith(".weight") else None
             if cfg and cfg.get("convrot"):
                 g = int(cfg.get("convrot_groupsize", 256) or 256)
@@ -1470,10 +1483,10 @@ def _load_dequant_state_dict(path):
     return sd
 
 
-# Architecture attendue dans les .gguf. Un GGUF de diffusion declare son archi dans
+# Architecture expected in .gguf files. A diffusion GGUF declares its architecture in
 # 'general.architecture': 'flux' (city96 FLUX.1 dev/schnell/krea), 'qwen_image',
-# 'krea2' (Krea 2 = architecture PROPRE qui exige ComfyUI + son encodeur/VAE),
-# 'llama'/'gemma3'... pour les LLM. On ne charge que 'qwen_image' ici.
+# 'krea2' (Krea 2 = its OWN architecture, which requires ComfyUI + its own encoder/VAE),
+# 'llama'/'gemma3'... for LLMs. Only 'qwen_image' is loaded here.
 GGUF_ARCH = str(CONFIG.get("gguf_arch") or "qwen_image").strip().lower()
 
 _GGUF_FIXED = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i",
@@ -1481,7 +1494,8 @@ _GGUF_FIXED = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i",
 
 
 def _gguf_skip(f, t):
-    """Avance le flux au-dela d'une valeur GGUF sans la lire (strings et arrays inclus)."""
+    """Skips past a GGUF value in the stream without reading it (strings and arrays
+    included)."""
     import struct
     if t == 8:                                   # string
         f.seek(struct.unpack("<Q", f.read(8))[0], 1)
@@ -1499,9 +1513,10 @@ def _gguf_skip(f, t):
 
 
 def _gguf_arch(path, max_kv=64):
-    """'general.architecture' d'un .gguf -- lit seulement l'en-tete (quelques Ko), jamais
-    les poids. Renvoie 'qwen_image' / 'flux' / 'krea2' / 'llama'... ou None si illisible
-    (dans ce cas on ne filtre pas: mieux vaut tenter que d'ecarter un modele valide)."""
+    """The 'general.architecture' of a .gguf -- reads the header only (a few KB), never
+    the weights. Returns 'qwen_image' / 'flux' / 'krea2' / 'llama'... or None when
+    unreadable (in that case nothing is filtered: better to try than to discard a valid
+    model)."""
     import struct
     try:
         with open(path, "rb") as f:
@@ -1524,31 +1539,33 @@ def _gguf_arch(path, max_kv=64):
     return None
 
 
-# Prefixes de tenseurs du layout Qwen ORIGINAL (celui que le loader GGUF de diffusers
-# sait mapper — GGUF QuantStack/city96). Certains GGUF Civitai sont convertis avec un
-# schema compact renomme (blocks.N.attn.wq, txtmlp, tproj... — outil type
-# stable-diffusion.cpp): l'archi declaree est bien 'qwen_image' mais AUCUNE cle ne
-# matche -> tous les poids restent sur le device 'meta' et le .to(device) explose en
-# "Cannot copy out of meta tensor". On detecte ce cas a l'en-tete pour refuser proprement.
+# Tensor prefixes of the ORIGINAL Qwen layout (the one diffusers' GGUF loader knows how
+# to map -- QuantStack/city96 GGUFs). Some Civitai GGUFs are converted with a compact
+# renamed scheme (blocks.N.attn.wq, txtmlp, tproj... -- a stable-diffusion.cpp-style tool):
+# the declared architecture really is 'qwen_image' but NO key matches -> every weight stays
+# on the 'meta' device and the .to(device) blows up with "Cannot copy out of meta tensor".
+# That case is detected from the header so it can be refused cleanly.
 _GGUF_OK_PREFIXES = ("transformer_blocks.", "img_in", "txt_in", "time_text_embed",
                      "norm_out", "proj_out")
 
-# Signature qui identifie POSITIVEMENT un transformer Qwen-Image, par opposition aux
-# autres DiT diffusers. Les prefixes ci-dessus sont trop laches pour ca: 'transformer_
-# blocks.', 'time_text_embed', 'norm_out' et 'proj_out' existent AUSSI chez FLUX (qui
-# nomme ses entrees x_embedder/context_embedder). Ces trois cles-la, non:
+# The signature that POSITIVELY identifies a Qwen-Image transformer, as opposed to the
+# other diffusers DiTs. The prefixes above are too loose for that: 'transformer_blocks.',
+# 'time_text_embed', 'norm_out' and 'proj_out' exist in FLUX TOO (which names its inputs
+# x_embedder/context_embedder). These three keys do not:
 _QWEN_GGUF_SIGNATURE = ("img_in.weight", "txt_in.weight", "txt_norm.weight")
 
 
 def _gguf_layout(path):
-    """Etat du layout de tenseurs d'un .gguf, lu a l'en-tete (gguf mmap):
-      'qwen'    -> signature Qwen-Image presente: c'est une PREUVE, bien plus fiable que
-                   le 'general.architecture' declare (des outils de conversion tamponnent
-                   n'importe quoi -- vu 'wan' sur des Qwen-Image parfaitement valides);
-      'foreign' -> des noms lisibles, mais aucun marqueur diffusers connu (conversion
-                   type stable-diffusion.cpp: blocks.N.attn.wq, txtmlp, tproj...);
-      'unknown' -> en-tete illisible ou layout diffusers sans la signature Qwen: on ne
-                   tranche pas ici, l'archi declaree reste le juge."""
+    """Layout state of a .gguf's tensors, read from the header (gguf mmap):
+      'qwen'    -> the Qwen-Image signature is there: that is PROOF, far more reliable than
+                   the declared 'general.architecture' (conversion tools stamp anything --
+                   'wan' has been seen on perfectly valid Qwen-Image files);
+      'foreign' -> readable names, but no known diffusers marker (a
+                   stable-diffusion.cpp-style conversion: blocks.N.attn.wq, txtmlp,
+                   tproj...);
+      'unknown' -> an unreadable header, or a diffusers layout without the Qwen signature:
+                   nothing is decided here, the declared architecture stays the judge.
+"""
     try:
         from gguf import GGUFReader
         names = [t.name for t in GGUFReader(path).tensors]
@@ -1565,8 +1582,8 @@ def _gguf_layout(path):
 
 
 def _gguf_layout_unsupported(path):
-    """Renvoie une raison (str) si le .gguf n'utilise PAS le layout de tenseurs Qwen
-    attendu par diffusers, sinon None. Lecture d'en-tete seule."""
+    """Returns a reason (str) when the .gguf does NOT use the Qwen tensor layout diffusers
+    expects, otherwise None. Header read only."""
     if _gguf_layout(path) != "foreign":
         return None
     return ("GGUF with a non-standard tensor layout (e.g. stable-diffusion.cpp "
@@ -1575,8 +1592,8 @@ def _gguf_layout_unsupported(path):
 
 
 def _checkpoint_dirs():
-    """Dossiers a scanner pour les checkpoints single-file: principal + extra (si defini),
-    sans doublon de chemin."""
+    """Folders to scan for single-file checkpoints: the main one + the extra one (when
+    set), with no duplicate path."""
     dirs = [CHECKPOINTS_DIR]
     if CHECKPOINTS_EXTRA_DIR and CHECKPOINTS_EXTRA_DIR not in dirs:
         dirs.append(CHECKPOINTS_EXTRA_DIR)
@@ -1584,12 +1601,12 @@ def _checkpoint_dirs():
 
 
 def list_checkpoints():
-    """Modeles Qwen-Image single-file (.safetensors / .gguf) des dossiers checkpoints
-    (principal + extra, fusionnes dans une seule liste). Les FP8/INT8 'scaled' ComfyUI
-    sont acceptes (loader dequant, cf. _safetensors_dequant); seuls restent ecartes,
-    avec leur raison: LoRA egarees, SVDQuant/Nunchaku INT4, GGUF d'une autre archi ou
-    au layout sd.cpp. En cas de meme nom de fichier, le dossier principal a la
-    priorite."""
+    """Single-file Qwen-Image models (.safetensors / .gguf) from the checkpoints folders
+    (main + extra, merged into a single list). ComfyUI 'scaled' FP8/INT8 are accepted (the
+    dequant loader, see _safetensors_dequant); only these stay discarded, with their reason:
+    stray LoRAs, SVDQuant/Nunchaku INT4, GGUFs of another architecture or in the sd.cpp
+    layout. On a duplicate file name, the main folder wins.
+"""
     out = []
     seen = set()
     for d in _checkpoint_dirs():
@@ -1608,9 +1625,9 @@ def list_checkpoints():
             if f.lower().endswith(".gguf"):
                 fp = os.path.join(d, f)
                 lay, a = _gguf_layout(fp), _gguf_arch(fp)
-                # Le LAYOUT prime sur l'archi declaree: les noms de tenseurs sont une
-                # preuve, le KV 'general.architecture' une simple etiquette -- et des
-                # outils de conversion la tamponnent faux (Qwen-Image publies en 'wan').
+                # The LAYOUT beats the declared architecture: tensor names are proof,
+                # the 'general.architecture' KV a mere label -- and conversion tools stamp
+                # it wrong (Qwen-Image files published as 'wan').
                 if lay == "foreign":
                     _log(f"checkpoint skipped ({_gguf_layout_unsupported(fp)}): {f}")
                     continue
@@ -1631,9 +1648,9 @@ def list_checkpoints():
 
 
 def resolve_checkpoint(name):
-    """Chemin absolu d'un checkpoint single-file depuis son nom de fichier, cherche dans
-    les dossiers checkpoints (principal puis extra). Renvoie name tel quel s'il est deja
-    absolu; fallback sur le dossier principal si introuvable."""
+    """Absolute path of a single-file checkpoint from its file name, looked up in the
+    checkpoints folders (main then extra). Returns name as is when it is already absolute;
+    falls back to the main folder when not found."""
     if not name or os.path.isabs(name):
         return name
     for d in _checkpoint_dirs():
@@ -1644,12 +1661,13 @@ def resolve_checkpoint(name):
 
 
 def list_loras():
-    """LoRA (.safetensors / .ckpt / .pt) du dossier loras, RECURSIF (sous-dossiers inclus).
-    Renvoie des chemins RELATIFS a LORAS_DIR avec des '/' (ex. 'sous-dossier/ma_lora.safetensors')
-    -> set_loras / resolve les resolvent via os.path.join(LORAS_DIR, name)."""
+    """LoRAs (.safetensors / .ckpt / .pt) from the loras folder, RECURSIVELY (subfolders
+    included). Returns paths RELATIVE to LORAS_DIR with '/' (e.g.
+    'subfolder/my_lora.safetensors') -> set_loras / resolve resolve them through
+    os.path.join(LORAS_DIR, name)."""
     exts = (".safetensors", ".ckpt", ".pt")
     out, seen = [], set()
-    for d in _lora_dirs():          # principal puis extras: meme nom -> le principal gagne
+    for d in _lora_dirs():          # main then extras: same name -> the main one wins
         if not os.path.isdir(d):
             continue
         for root, _dirs, files in os.walk(d):
@@ -1669,7 +1687,7 @@ def set_checkpoints_dir(path):
 
 
 def set_checkpoints_extra_dir(path):
-    """Definit (ou efface avec '' / None) le dossier checkpoints supplementaire."""
+    """Sets (or clears with '' / None) the additional checkpoints folder."""
     global CHECKPOINTS_EXTRA_DIR
     CHECKPOINTS_EXTRA_DIR = (path or "").strip()
 
@@ -1681,14 +1699,14 @@ def set_loras_dir(path):
 
 
 def set_loras_extra_dirs(spec):
-    """Definit (ou efface avec '' / [] / None) les dossiers LoRA supplementaires.
-    spec = liste ou chaine 'a;b'."""
+    """Sets (or clears with '' / [] / None) the extra LoRA folders.
+    spec = a list or an 'a;b' string."""
     global LORAS_EXTRA_DIRS
     LORAS_EXTRA_DIRS = _split_dirs(spec)
 
 
 def _read_safetensors_metadata(path):
-    """Lit le header JSON (__metadata__) d'un .safetensors SANS charger les poids."""
+    """Reads the JSON header (__metadata__) of a .safetensors WITHOUT loading the weights."""
     import struct
     with open(path, "rb") as f:
         n = struct.unpack("<Q", f.read(8))[0]
@@ -1697,8 +1715,8 @@ def _read_safetensors_metadata(path):
 
 
 def lora_keywords(path):
-    """Extrait les mots-cles / trigger words d'une LoRA depuis ses metadonnees:
-    champs trigger explicites + top tags d'entrainement (ss_tag_frequency)."""
+    """Extracts a LoRA's keywords / trigger words from its metadata: explicit trigger
+    fields + the top training tags (ss_tag_frequency)."""
     if not path or not os.path.isfile(path):
         return ""
     try:
@@ -1734,11 +1752,12 @@ def lora_keywords(path):
 
 
 def set_loras(slots):
-    """Definit les LoRA actives. slots = liste de (nom_ou_None, poids). Resout les
-    noms en chemins, ignore les None.
+    """Sets the active LoRAs. slots = a list of (name_or_None, weight). Resolves the
+    names to paths, ignores the Nones.
 
-    NE recharge PAS le modele: les LoRA sont echangees A CHAUD sur le transformer deja
-    en VRAM (_apply_loras, appele par _ensure_base au run suivant)."""
+    Does NOT reload the model: the LoRAs are hot-swapped on the transformer already in
+    VRAM (_apply_loras, called by _ensure_base on the next run).
+"""
     global LORAS
     new = []
     for name, weight in slots:
@@ -1751,10 +1770,10 @@ def set_loras(slots):
 
 
 def set_edit_loras(slots):
-    """Definit les LoRA d'EDITION (pipe omni). slots = liste de (nom_ou_None, poids);
-    un nom est un preset cz_edit_loras (telecharge a la demande), un chemin absolu, ou un
-    fichier relatif a LORAS_DIR. Ignore les None. Applique a chaud au prochain
-    generate_omni (_apply_edit_loras). Leve si un preset ne peut pas etre telecharge."""
+    """Sets the EDIT LoRAs (the omni pipe). slots = a list of (name_or_None, weight); a
+    name is a cz_edit_loras preset (downloaded on demand), an absolute path, or a file
+    relative to LORAS_DIR. Ignores the Nones. Applied hot on the next generate_omni
+    (_apply_edit_loras). Raises when a preset cannot be downloaded."""
     global EDIT_LORAS
     import cz_edit_loras
     new = []
@@ -1780,11 +1799,11 @@ def edit_speed_choices():
 
 
 def set_edit_speed(name):
-    """Mode rapide de l'edition. 'Off'/None -> steps/guidance des Settings, pas de LoRA
-    de vitesse. 'Auto' -> profil model_profiles du modele d'edition (Rapid-AIO / merge
-    Lightning: deja distille, 4-8 steps, CFG off), sans LoRA. 'Lightning N steps' ->
-    LoRA Lightning (2509 ou 2511 selon le modele d'edition; cherchee dans les dossiers
-    LoRA, sinon telechargee) + N steps + guidance 1.0. Renvoie le dict applique."""
+    """Fast edit mode. 'Off'/None -> steps/guidance from Settings, no speed LoRA.
+    'Auto' -> the edit model's model_profiles profile (Rapid-AIO / a Lightning merge:
+    already distilled, 4-8 steps, CFG off), with no LoRA. 'Lightning N steps' -> the
+    Lightning LoRA (2509 or 2511 depending on the edit model; looked up in the LoRA
+    folders, downloaded otherwise) + N steps + guidance 1.0. Returns the applied dict."""
     global EDIT_SPEED
     import cz_edit_loras
     name = (name or "Off").strip()
@@ -1807,8 +1826,8 @@ def set_edit_speed(name):
 
 
 def set_edit_loras_enabled(on):
-    """Case 'Edit LoRAs': ON = le jeu EDIT_LORAS est pose sur le pipe omni, OFF = retire
-    (le jeu reste memorise). Sans rechargement."""
+    """The 'Edit LoRAs' checkbox: ON = the EDIT_LORAS set is applied on the omni pipe,
+    OFF = removed (the set stays remembered). No reload."""
     global EDIT_LORAS_ENABLED
     on = bool(on)
     if on != EDIT_LORAS_ENABLED:
@@ -1817,7 +1836,7 @@ def set_edit_loras_enabled(on):
 
 
 def set_omni_model(repo):
-    """Definit le modele Omni/Edit (repo HF ou dossier). Invalide le pipe omni."""
+    """Sets the Omni/Edit model (an HF repo or a folder). Invalidates the omni pipe."""
     global OMNI_MODEL, _APPLIED_EDIT_LORAS
     repo = (repo or "").strip()
     if repo != OMNI_MODEL:
@@ -1828,10 +1847,10 @@ def set_omni_model(repo):
 
 
 def list_edit_models():
-    """Modeles d'EDITION locaux (chemins complets) dans les dossiers checkpoints: fichiers
-    single-file (.gguf / .safetensors) dont le nom contient 'edit', 'aio' ou 'rapid'
-    (Qwen-Image-Edit 2509/2511, Rapid-AIO), hors LoRA egarees et formats non charges.
-    Alimente le dropdown 'Omni model' (le texte libre reste possible)."""
+    """Local EDIT models (full paths) in the checkpoints folders: single-file files
+    (.gguf / .safetensors) whose name contains 'edit', 'aio' or 'rapid' (Qwen-Image-Edit
+    2509/2511, Rapid-AIO), stray LoRAs and unloadable formats excluded.
+    Feeds the 'Omni model' dropdown (free text is still possible)."""
     out, seen = [], set()
     for d in _checkpoint_dirs():
         if not os.path.isdir(d):
@@ -1842,7 +1861,8 @@ def list_edit_models():
                 continue
             if not any(k in low for k in ("edit", "aio", "rapid")):
                 continue
-            # encodeur texte (Qwen2.5-VL) / VAE ranges a cote: pas des transformers
+            # a text encoder (Qwen2.5-VL) / a VAE filed next to them: not
+            # transformers
             if any(k in low for k in ("qwen25vl", "qwen2.5", "qwen2_5", "text_encoder",
                                       "textencoder", "vae", "clip")):
                 continue
@@ -1855,15 +1875,15 @@ def list_edit_models():
 
 
 def check_omni_available():
-    """Onglet Edit = Qwen-Image-Edit (modele d'edition par instruction). Verifie que le
-    repo d'edition configure existe sur Hugging Face (API publique)."""
+    """The Edit tab = Qwen-Image-Edit (an instruction-based edit model). Checks that the
+    configured edit repo exists on Hugging Face (public API)."""
     import urllib.request
     repo = (OMNI_MODEL or DEFAULT_OMNI_REPO).strip()
     looks_local = (repo.lower().endswith((".gguf", ".safetensors")) or os.path.isdir(repo)
                    or os.path.isabs(repo))
     if looks_local:
-        # Fichier/dossier LOCAL: rien a verifier sur le Hub. Seul le reste du pipe
-        # (encodeur texte, VAE) vient du repo de base au premier usage.
+        # A LOCAL file/folder: nothing to check on the Hub. Only the rest of the pipe
+        # (text encoder, VAE) comes from the base repo on first use.
         if os.path.exists(repo):
             base_edit = (os.environ.get("QWEN_EDIT_BASE") or CONFIG.get("zimage_omni_base")
                          or DEFAULT_OMNI_REPO).strip()
@@ -1888,32 +1908,32 @@ def check_omni_available():
 
 
 def set_offload_mode(mode):
-    """Change le mode d'offload CPU. Invalide le pipe (hooks poses au chargement).
-    Valeur inconnue -> 'auto' (jamais 'none': le repli doit etre le mode SUR)."""
+    """Changes the CPU offload mode. Invalidates the pipe (the hooks are set at load
+    time). An unknown value -> 'auto' (never 'none': the fallback must be the SAFE mode)."""
     global OFFLOAD_MODE, _AUTO_OFFLOAD
     mode = str(mode or "").strip().lower()
     mode = mode if mode in OFFLOAD_CHOICES else "auto"
     if mode != OFFLOAD_MODE:
         OFFLOAD_MODE = mode
-        _AUTO_OFFLOAD = ""   # 'auto' refait le test VRAM au prochain chargement
+        _AUTO_OFFLOAD = ""   # 'auto' runs the VRAM test again on the next load
         free_vram()
         _log(f"offload -> {OFFLOAD_MODE}: pipeline invalidated -> will reload")
 
 
-# ---- Offload 'auto': test VRAM au chargement + filet de securite runtime (cz_hw) ----
+# ---- Offload 'auto': a VRAM test at load time + a runtime safety net (cz_hw) ----
 
 def _hw_profile_path():
-    """Profil des verdicts du test VRAM (JSON), a cote des autres caches."""
+    """Profile of the VRAM test's verdicts (JSON), next to the other caches."""
     return os.path.join(HERE, "cache", "hw_profile.json")
 
 
 def _model_footprint_gb():
-    """Empreinte VRAM (Go) du pipeline complet en offload 'none' (poids en VRAM,
-    hors activations). Qwen-Image: transformer bf16 ~40 Go + encodeur ~17 Go
-    -> ~57 Go, 'auto' resout donc 'model' sur toute carte grand public (un
-    transformer GGUF ~11-13 Go est force en 'model' de toute facon, et l'encodeur
-    est evince apres l'encodage du prompt). Surcharge via config
-    'model_footprint_gb' (ex. grosse carte pro + transformer single-file leger)."""
+    """VRAM footprint (GB) of the whole pipeline under 'none' offload (weights in VRAM,
+    activations excluded). Qwen-Image: a bf16 transformer ~40 GB + the encoder ~17 GB
+    -> ~57 GB, so 'auto' resolves 'model' on every consumer card (a ~11-13 GB GGUF
+    transformer is forced to 'model' anyway, and the encoder is evicted once the prompt is
+    encoded). Overridable through config 'model_footprint_gb' (e.g. a big pro card + a light
+    single-file transformer)."""
     try:
         v = float(CONFIG.get("model_footprint_gb", 0) or 0)
         if v > 0:
@@ -1924,9 +1944,9 @@ def _model_footprint_gb():
 
 
 def _resolve_auto(retest=False):
-    """Mode concret pour 'auto' (memoise pour le process). Le verdict est cache
-    dans cache/hw_profile.json par (GPU, build torch/cuda, modele, dtype): le
-    test ne coute qu'un mem_get_info par combinaison, puis une lecture JSON."""
+    """The concrete mode for 'auto' (memoised for the process). The verdict is cached in
+    cache/hw_profile.json per (GPU, torch/cuda build, model, dtype): the test only costs one
+    mem_get_info per combination, then a JSON read."""
     global _AUTO_OFFLOAD
     if _AUTO_OFFLOAD and not retest:
         return _AUTO_OFFLOAD
@@ -1940,7 +1960,7 @@ def _resolve_auto(retest=False):
 
 
 def offload_status():
-    """Ligne d'etat pour l'UI: mode demande + resolution 'auto' le cas echeant."""
+    """Status line for the UI: the requested mode + the 'auto' resolution when relevant."""
     if OFFLOAD_MODE != "auto":
         return f"offload: {OFFLOAD_MODE} (explicit)"
     if not _AUTO_OFFLOAD:
@@ -1949,8 +1969,8 @@ def offload_status():
 
 
 def retest_offload():
-    """Bouton 'Re-test VRAM' de l'UI: refait le test en ignorant le profil (autre
-    app fermee/ouverte, driver change...). Invalide le pipe si le verdict change."""
+    """The UI's 'Re-test VRAM' button: runs the test again, ignoring the profile (another
+    app closed/opened, a driver change...). Invalidates the pipe when the verdict changes."""
     if OFFLOAD_MODE != "auto":
         return f"Offload is '{OFFLOAD_MODE}' (explicit) - select 'auto' to use the VRAM test."
     old = _AUTO_OFFLOAD
@@ -1962,12 +1982,13 @@ def retest_offload():
 
 
 def _vram_guard_kwargs():
-    """Filet de securite runtime: callback_on_step_end qui verifie APRES le 1er
-    step de denoise en mode effectif 'none' que la VRAM n'est pas saturee (le
-    test au chargement estime; un process tiers a pu arriver depuis, ou la
-    resolution demandee depasse la marge). Sature -> flag + interruption du
-    denoise; l'appelant bascule en 'model' et rejoue le job UNE fois.
-    {} quand la garde est inutile (offload deja actif, pas de CUDA)."""
+    """Runtime safety net: a callback_on_step_end that checks AFTER the first denoise step
+    in effective mode 'none' that the VRAM is not saturated (the load-time test estimates; a
+    third-party process may have arrived since, or the requested resolution exceeds the
+    margin). Saturated -> the flag + an interruption of the denoise; the caller switches to
+    'model' and replays the job ONCE.
+    {} when the guard is pointless (offload already on, no CUDA).
+"""
     if DEVICE != "cuda" or _effective_offload() != "none":
         return {}
 
@@ -1981,9 +2002,9 @@ def _vram_guard_kwargs():
 
 
 def _consume_vram_downgrade():
-    """Si la garde a declenche: applique la retrogradation vers 'model',
-    l'enregistre dans le profil (le prochain boot demarre directement en 'model')
-    et libere le pipe. True -> l'appelant rejoue le job une fois."""
+    """When the guard has fired: applies the downgrade to 'model', records it in the
+    profile (the next boot starts in 'model' directly) and releases the pipe. True -> the
+    caller replays the job once."""
     global _VRAM_DOWNGRADE, _AUTO_OFFLOAD
     if not _VRAM_DOWNGRADE:
         return False
@@ -2002,16 +2023,16 @@ def _consume_vram_downgrade():
 
 
 def free_vram():
-    """Libere le pipeline de base + les pipelines derives et rend la VRAM
-    (palier 3: unload sur inactivite ou endpoint /unload). Rechargement paresseux."""
+    """Releases the base pipeline + the derived pipelines and gives the VRAM back
+    (step 3: unload on idle or the /unload endpoint). Lazy reload."""
     global _BASE_PIPE, _DERIVED, _LOADED_KEY, _APPLIED_LORAS
     global _TEXT_ENCODER_ACTIVE, _TEXT_ENCODER_ACTIVE_EDIT
     _BASE_PIPE = None
     _DERIVED = {}
     _LOADED_KEY = None
     _APPLIED_LORAS = []      # plus de pipe -> plus d'adaptateur pose
-    _TEXT_ENCODER_ACTIVE = ""       # ... ni d'encodeur de remplacement charge, ni sur
-    _TEXT_ENCODER_ACTIVE_EDIT = ""  # le base ni sur le pipe d'edition (_DERIVED["omni"])
+    _TEXT_ENCODER_ACTIVE = ""       # ... nor of a replacement encoder loaded, neither on
+    _TEXT_ENCODER_ACTIVE_EDIT = ""  # the base nor on the edit pipe (_DERIVED["omni"])
     _embed_cache_clear(" (VRAM freed)")
     gc.collect()
     if DEVICE == "cuda":
@@ -2019,25 +2040,26 @@ def free_vram():
 
 
 def is_oom(e):
-    """Vrai si `e` est un manque de VRAM, sous ses deux formes: celle de l'allocateur de
-    torch ("CUDA out of memory. Tried to allocate ...") et celle d'un appel CUDA direct
-    ("CUDA error: out of memory"). La seconde arrive quand le cache de torch a tout
-    reserve: un noyau charge a la demande ne trouve plus rien et ne peut rien reclamer a
-    ce cache (porte de crispz-klein 1.36.4)."""
+    """True when `e` is a lack of VRAM, in either of its two forms: torch's allocator one
+    ("CUDA out of memory. Tried to allocate ...") and a direct CUDA call's one ("CUDA error:
+    out of memory"). The second happens once torch's cache has reserved everything: a kernel
+    loaded on demand finds nothing left and cannot claim anything back from that cache
+    (carried over from crispz-klein 1.36.4)."""
     s = str(e).lower()
     return "out of memory" in s or "alloc_failed" in s
 
 
 def release_vram(offload=False, why=""):
-    """Rend au pilote la VRAM que le cache de torch garde en reserve, sans rien decharger.
+    """Gives the driver back the VRAM that torch's cache holds in reserve, unloading
+    nothing.
 
-    torch ne vide son cache que quand SON allocateur echoue; les autres consommateurs
-    echouent sans pouvoir le recuperer. offload=True remet aussi sur le CPU les modeles
-    qu'un appel interrompu a laisses sur le GPU en offload 'model', pour CHAQUE pipeline
-    charge avec ses hooks (le base, et le pipeline Omni quand il est charge a part). Sur
-    crispz-klein, un transformer a moitie deplace par un OOM restait sur le GPU: 10,8 Go
-    coinces, et chaque rendu suivant echouait jusqu'au redemarrage. `why` journalise
-    l'etat de la VRAM apres coup."""
+    torch only empties its cache when ITS allocator fails; the other consumers fail without
+    being able to reclaim it. offload=True also puts back on the CPU the models an
+    interrupted call left on the GPU under 'model' offload, for EVERY pipeline loaded with
+    its hooks (the base one, and the Omni pipeline when it is loaded separately). On
+    crispz-klein, a transformer half-moved by an OOM stayed on the GPU: 10.8 GB stuck, and
+    every later render failed until a restart. `why` logs the VRAM state afterwards.
+"""
     if offload:
         seen = set()
         for p in [_BASE_PIPE, *_DERIVED.values()]:
@@ -2045,7 +2067,7 @@ def release_vram(offload=False, why=""):
                 continue
             seen.add(id(p))
             try:
-                p.maybe_free_model_hooks()   # diffusers: tout sur le CPU, hooks reposes
+                p.maybe_free_model_hooks()   # diffusers: everything on the CPU, hooks put back
             except Exception as e:
                 _dbg(f"release_vram: offload failed ({e})")
     gc.collect()
@@ -2064,11 +2086,12 @@ def release_vram(offload=False, why=""):
 
 
 def _load_lora(pipe, *args, **kwargs):
-    """pipe.load_lora_weights avec des tenseurs REELS (low_cpu_mem_usage=False).
+    """pipe.load_lora_weights with REAL tensors (low_cpu_mem_usage=False).
 
-    Une build diffusers/peft qui ne connait pas ce parametre le refuse par TypeError:
-    on rappelle alors sans lui plutot que de faire echouer la pose (le defaut y cree les
-    couches sur 'meta' -- cf. _sync_adapters)."""
+    A diffusers/peft build that does not know that parameter refuses it with a TypeError:
+    the call is then retried without it rather than failing the application (the default
+    creates the layers on 'meta' there -- see _sync_adapters).
+"""
     try:
         return pipe.load_lora_weights(*args, low_cpu_mem_usage=False, **kwargs)
     except TypeError as e:
@@ -2079,19 +2102,19 @@ def _load_lora(pipe, *args, **kwargs):
 
 
 def _offload_hooks(pipe):
-    """Nombre de hooks d'offload 'model' poses par diffusers sur ce pipe (0 = aucun)."""
+    """Number of 'model' offload hooks diffusers has set on this pipe (0 = none)."""
     return len(getattr(pipe, "_all_hooks", None) or [])
 
 
 def restore_offload(pipe, why=""):
-    """Remet le pipe dans son etat d'offload EFFECTIF s'il a ete laisse sur le CPU.
+    """Puts the pipe back in its EFFECTIVE offload state when it has been left on the CPU.
 
-    diffusers RETIRE les hooks d'offload avant de poser une LoRA et les remet apres.
-    Quand le chargement echoue entre les deux, personne ne les remet: le pipe reste sur
-    le CPU, son `_execution_device` passe a cpu, et TOUS les rendus suivants echouent
-    sur "Cannot generate a cpu tensor from a generator of type cuda" -- jusqu'au
-    redemarrage de l'app. Releve le 2026-09-23 avec deux LoRA DoRA (crispz-klein 1.36.6).
-    Renvoie True si l'etat a ete retabli."""
+    diffusers REMOVES the offload hooks before applying a LoRA and puts them back after.
+    When the load fails in between, nobody puts them back: the pipe stays on the CPU, its
+    `_execution_device` becomes cpu, and EVERY later render fails on "Cannot generate a cpu
+    tensor from a generator of type cuda" -- until the app is restarted. Caught on 2026-09-23
+    with two DoRA LoRAs (crispz-klein 1.36.6). Returns True when the state has been restored.
+"""
     if DEVICE != "cuda" or pipe is None:
         return False
     try:
@@ -2117,9 +2140,9 @@ def restore_offload(pipe, why=""):
 
 
 def retry_on_oom(what, fn, *args, **kwargs):
-    """Appelle fn(*args, **kwargs); sur un manque de VRAM, rend la VRAM (cache de torch,
-    modeles restes sur le GPU) et retente UNE fois. Un second echec rend encore la VRAM
-    avant de remonter l'erreur: le processus reste utilisable pour le rendu suivant."""
+    """Calls fn(*args, **kwargs); on a lack of VRAM, gives the VRAM back (torch's cache,
+    models left on the GPU) and retries ONCE. A second failure gives the VRAM back again
+    before re-raising: the process stays usable for the next render."""
     err = None
     for attempt in (1, 2):
         try:
@@ -2127,8 +2150,8 @@ def retry_on_oom(what, fn, *args, **kwargs):
         except Exception as e:
             if not is_oom(e):
                 raise
-            # Le traceback retient les frames, donc leurs tenseurs sur le GPU: on le
-            # lache AVANT de vider le cache, sinon empty_cache ne recupere rien.
+            # The traceback holds the frames, so their tensors on the GPU: it is
+            # dropped BEFORE emptying the cache, or empty_cache reclaims nothing.
             err = e.with_traceback(None)
             err.__context__ = err.__cause__ = None
         if attempt == 1:
@@ -2138,38 +2161,41 @@ def retry_on_oom(what, fn, *args, **kwargs):
     raise err
 
 
-# Au-dela de ce cote (px) on active l'attention slicing (whole-image 2K+ -> evite le
-# spill VRAM 32 Go). En-dessous (tuiles 1024, txt2img 1024/1536) -> slicing OFF =
-# attention SDPA native = RAPIDE (comme ComfyUI). Reglable via config attention_slice_above.
+# Beyond this side (px) attention slicing is turned on (whole-image 2K+ -> avoids the
+# 32 GB VRAM spill). Below it (1024 tiles, 1024/1536 txt2img) -> slicing OFF = native SDPA
+# attention = FAST (like ComfyUI). Tunable through config attention_slice_above.
 _SLICE_ABOVE = int(CONFIG.get("attention_slice_above", 1664))
 
-# Garde-fou: au-dela de ce cote (px), un refine "whole image" (refine_tile=0) est auto-
-# tuile (tuile 1024). Defaut = le seuil de slicing: au-dela, un whole-image serait slice
-# (lent: ~120s en 2K) ET risque le spill VRAM (4K -> crash). Tuiler est plus rapide ET sur.
+# Guard rail: beyond this side (px), a "whole image" refine (refine_tile=0) is
+# auto-tiled (1024 tile). The default = the slicing threshold: beyond it a whole-image pass
+# would be sliced (slow: ~120s at 2K) AND risks the VRAM spill (4K -> a crash). Tiling is
+# faster AND safe.
 _AUTO_TILE_ABOVE = int(CONFIG.get("auto_refine_tile_above", _SLICE_ABOVE))
 
-# Taille de la tuile employee par cet auto-tuilage. "auto" (defaut) = calculee par
-# _pick_refine_tile ; un entier fige la taille (ancien comportement : 1024).
-# Mesure (RTX 5090, sortie 4096x4096, denoise 0.40, overlap 64) : le cout par pixel est
-# PLAT de 768 a 1024 (1.78 / 1.83 / 1.79 us/px) et ne grimpe qu'au-dela (2.41 a 1536,
-# 3.00 a 2048). Le temps suit donc la SURFACE TUILEE (n x tuile^2), pas la taille de la
-# tuile. Or a 1024 la grille deborde : pas de 960 sur 4096 -> la derniere tuile est
-# rabattue et recouvre la precedente sur 832px au lieu de 64, soit 1.56x la surface de
-# l'image. A 896 le pas tombe juste (1.20x) -> 36.7s au lieu de 46.9s sur la meme image,
-# a nombre de tuiles (25) et de coutures (8) IDENTIQUE.
-# Bornes [768, 1024] : en dessous on multiplie tuiles et coutures et chaque tuile voit
-# moins de contexte (le rendu derive - un arriere-plan flou se reconstruit differemment,
-# verifie visuellement) ; au-dessus l'attention devient superlineaire.
+# Size of the tile this auto-tiling uses. "auto" (the default) = computed by
+# _pick_refine_tile; an integer freezes the size (the old behaviour: 1024).
+# Measured (RTX 5090, 4096x4096 output, denoise 0.40, overlap 64): the cost per pixel is
+# FLAT from 768 to 1024 (1.78 / 1.83 / 1.79 us/px) and only climbs beyond that (2.41 at
+# 1536, 3.00 at 2048). So the time follows the TILED AREA (n x tile^2), not the tile size.
+# But at 1024 the grid overflows: 960 does not divide 4096 -> the last tile is pulled back
+# and overlaps the previous one by 832px instead of 64, that is 1.56x the image's area. At
+# 896 the step lands right (1.20x) -> 36.7s instead of 46.9s on the same image, with an
+# IDENTICAL number of tiles (25) and seams (8).
+# Bounds [768, 1024]: below them tiles and seams multiply and each tile sees less context
+# (the render drifts - a blurred background rebuilds differently, checked visually); above
+# them the attention becomes superlinear.
 _AUTO_TILE_MIN = int(CONFIG.get("auto_refine_tile_min", 768))
 _AUTO_TILE_MAX = int(CONFIG.get("auto_refine_tile_max", 1024))
 _AUTO_TILE_SIZE = str(CONFIG.get("auto_refine_tile", "auto")).strip().lower()
 
 
 def _pick_refine_tile(w, h, overlap):
-    """Tuile qui minimise la surface tuilee pour couvrir w x h (= le cout reel de la passe).
+    """The tile that minimises the tiled area needed to cover w x h (= the pass's real
+    cost).
 
-    A surface egale on garde la PLUS GRANDE tuile : moins de coutures et plus de contexte
-    par tuile. Un entier dans auto_refine_tile court-circuite le calcul (taille figee)."""
+    At equal area the LARGEST tile wins: fewer seams and more context per tile. An integer
+    in auto_refine_tile short-circuits the computation (a frozen size).
+"""
     if _AUTO_TILE_SIZE not in ("auto", "", "0"):
         try:
             return round_to_multiple(int(_AUTO_TILE_SIZE))
@@ -2183,37 +2209,38 @@ def _pick_refine_tile(w, h, overlap):
     for t in range(lo, hi + 1, 32):
         step = max(16, t - ov)
         n = len(range(0, max(1, int(w)), step)) * len(range(0, max(1, int(h)), step))
-        cands.append((n * t * t, -t, t))       # surface mini, puis plus grande tuile
+        cands.append((n * t * t, -t, t))       # the smallest area, then the largest tile
     return min(cands)[2]
 
-# Plafond de denoise pour le refine TUILE. En tuiles, chaque tuile est rediffusee avec le
-# prompt global -> a fort denoise la diffusion reconstruit le sujet (ex: la tasse) DANS
-# chaque tuile = duplications. On plafonne donc le denoise par tuile (le contenu existant
-# guide alors la diffusion, facon Ultimate SD Upscale). Le refine "whole image" garde le
-# denoise demande (pas de duplication possible: une seule passe sur toute la compo).
-# Reglable via config refine_tile_denoise_cap (0 = pas de plafond).
+# Denoise ceiling for the TILED refine. In tiles, each tile is re-diffused with the
+# global prompt -> at a high denoise the diffusion rebuilds the subject (the cup, say) IN
+# every tile = duplications. So the per-tile denoise is capped (the existing content then
+# guides the diffusion, Ultimate SD Upscale style). The "whole image" refine keeps the
+# requested denoise (no duplication is possible: a single pass over the whole composition).
+# Tunable through config refine_tile_denoise_cap (0 = no cap).
 _TILE_DENOISE_CAP = float(CONFIG.get("refine_tile_denoise_cap", 0.40))
 
-# Prompt utilise pour le refine TUILE. Le prompt global decrit TOUTE la composition (pas
-# la tuile) -> le passer a chaque tuile pousse la diffusion a recreer le sujet (la tasse)
-# dans des tuiles qui ne sont que du fond. Par defaut on passe donc un prompt VIDE: chaque
-# tuile se contente d'affiner le detail local. Valeurs config refine_tile_prompt:
-#   "" (defaut) = prompt vide par tuile
-#   "global"/"scene" = reutilise le prompt de la scene (ancien comportement)
-#   tout autre texte = prompt generique applique a chaque tuile (ex: "high detail, sharp")
+# Prompt used for the TILED refine. The global prompt describes the WHOLE composition
+# (not the tile) -> handing it to every tile pushes the diffusion to recreate the subject
+# (the cup) in tiles that are nothing but background. So an EMPTY prompt is passed by
+# default: each tile just refines the local detail. config refine_tile_prompt values:
+#   "" (the default) = an empty prompt per tile
+#   "global"/"scene" = reuses the scene's prompt (the old behaviour)
+#   any other text = a generic prompt applied to every tile (e.g. "high detail, sharp")
 _TILE_PROMPT = str(CONFIG.get("refine_tile_prompt", ""))
 
 
 def _tile_prompt(scene_prompt):
-    """Prompt a utiliser par tuile selon la config (vide par defaut, anti-duplication)."""
+    """The prompt to use per tile according to the config (empty by default,
+    anti-duplication)."""
     if _TILE_PROMPT.strip().lower() in ("global", "scene"):
         return scene_prompt or ""
     return _TILE_PROMPT
 
 
 def _set_slicing(pipe, longest_side):
-    """Active/desactive l'attention slicing selon le plus grand cote a traiter. Appele
-    avant CHAQUE passe de diffusion (txt2img/refine/tuile/inpaint/outpaint/omni)."""
+    """Turns attention slicing on/off according to the largest side to process. Called
+    before EVERY diffusion pass (txt2img/refine/tile/inpaint/outpaint/omni)."""
     try:
         if int(longest_side) > _SLICE_ABOVE:
             pipe.enable_attention_slicing()
@@ -2224,9 +2251,9 @@ def _set_slicing(pipe, longest_side):
 
 
 def _vram_str():
-    """Pic VRAM PyTorch reserve / total (pour reperer la saturation -> spill RAM partagee
-    Windows = lenteur extreme, et TDR/'CUDA unknown error'). Ne voit PAS la VRAM des
-    autres process (ComfyUI, etc.) -> utiliser nvidia-smi pour le total reel."""
+    """PyTorch's peak reserved VRAM / the total (to spot saturation -> a spill into
+    Windows' shared RAM = extreme slowness, and TDR/'CUDA unknown error'). Does NOT see the
+    other processes' VRAM (ComfyUI, etc.) -> use nvidia-smi for the real total."""
     if DEVICE != "cuda":
         return ""
     try:
@@ -2238,17 +2265,17 @@ def _vram_str():
 
 
 # ----------------------------------------------------------------------------
-# Qwen-Image (diffusers, BF16) : un pipeline "base" txt2img qui detient les composants,
-# img2img / inpaint derives via from_pipe (poids partages, pas de VRAM en double).
+# Qwen-Image (diffusers, BF16): a "base" txt2img pipeline that owns the components, with
+# img2img / inpaint derived through from_pipe (shared weights, no duplicate VRAM).
 # ----------------------------------------------------------------------------
 def _is_gguf_path(p):
     return bool(p) and str(p).lower().endswith(".gguf")
 
 
 def _effective_offload(tpath=None):
-    """Offload REELLEMENT applique. Un transformer GGUF quantifie ne se deplace pas sur le
-    GPU via .to(cuda) ni en sequential -> seul enable_model_cpu_offload le pose sur le GPU
-    pendant le forward. On force donc 'model' pour un base GGUF, quel que soit le reglage."""
+    """The offload REALLY applied. A quantized GGUF transformer does not move onto the GPU
+    through .to(cuda) nor in sequential -> only enable_model_cpu_offload places it on the GPU
+    during the forward. So 'model' is forced for a GGUF base, whatever the setting says."""
     off = OFFLOAD_MODE
     if off == "auto":
         off = _resolve_auto()   # test VRAM (memoise + profil cache) -> mode concret
@@ -2259,37 +2286,40 @@ def _effective_offload(tpath=None):
 
 
 def _load_transformer(path=None, base=None):
-    """Charge UNIQUEMENT le transformer courant (sans le reste du pipeline):
-      - GGUF quantifie -> from_single_file + GGUFQuantizationConfig (archi = repo de base)
-      - single-file .safetensors -> from_single_file
-      - repo HF / dossier diffusers -> sous-dossier 'transformer'
-      - pas d'override -> transformer du repo de base
-    Utilise au chargement complet ET pour l'echange a chaud (_swap_transformer).
-    path/base: par defaut le transformer du BASE (ZIMAGE_TRANSFORMER / BASE_REPO);
-    le pipe d'EDITION passe son propre fichier (GGUF, FP8 Rapid-AIO...) + son repo
-    d'edition (zimage_omni_base) pour l'architecture."""
+    """Loads ONLY the current transformer (without the rest of the pipeline):
+      - a quantized GGUF -> from_single_file + GGUFQuantizationConfig (architecture = the
+        base repo's)
+      - a single-file .safetensors -> from_single_file
+      - an HF repo / diffusers folder -> the 'transformer' subfolder
+      - no override -> the base repo's transformer
+    Used both on a full load AND for the hot swap (_swap_transformer).
+    path/base: by default the BASE's transformer (ZIMAGE_TRANSFORMER / BASE_REPO); the EDIT
+    pipe passes its own file (GGUF, FP8 Rapid-AIO...) + its edit repo (zimage_omni_base) for
+    the architecture.
+"""
     from diffusers import QwenImageTransformer2DModel
     path = ZIMAGE_TRANSFORMER if path is None else path
     base = BASE_REPO if base is None else base
     if path:
         if _is_single_file(path):
-            # Garde: un fichier non chargeable (LoRA egaree, FP8, quantifie) doit
-            # echouer avec un message actionnable, pas partir chercher une config
-            # par defaut sur le Hub. (Sans effet sur les .gguf: header illisible -> None.)
+            # Guard: a file that cannot be loaded (a stray LoRA, an FP8, a quantized
+            # one) must fail with an actionable message, not go looking for a default
+            # config on the Hub. (No effect on .gguf files: an unreadable header -> None.)
             bad = _safetensors_unsupported(path)
             if bad:
                 raise RuntimeError(f"{os.path.basename(path)}: {bad}.")
             if _is_gguf_path(path):
-                # transformer Qwen GGUF (quantifie) -> tient en VRAM (~11 Go en Q4) et
-                # reste rapide. Le VAE + encodeur texte viennent du repo de base (cache).
+                # A Qwen GGUF transformer (quantized) -> fits in VRAM (~11 GB in Q4)
+                # and stays fast. The VAE + text encoder come from the base repo (cached).
                 lay = _gguf_layout_unsupported(path)
                 if lay:
                     raise RuntimeError(
                         f"{os.path.basename(path)}: {lay}.")
                 from diffusers import GGUFQuantizationConfig
                 _log(f"loading Qwen transformer (GGUF, quantized): {path} ...")
-                # config/subfolder = archi du transformer depuis le repo de base (cache),
-                # sinon from_single_file ne sait pas la structure et tente un repo par defaut.
+                # config/subfolder = the transformer's architecture from the base repo
+                # (cached), otherwise from_single_file does not know the structure and
+                # tries a default repo.
                 return _load_monitor(
                     f"transformer {os.path.basename(path)} (GGUF)",
                     lambda: QwenImageTransformer2DModel.from_single_file(
@@ -2299,17 +2329,17 @@ def _load_transformer(path=None, base=None):
                         torch_dtype=DTYPE))
             dq = _safetensors_dequant(path)
             if dq:
-                # FP8/INT8 'scaled' ComfyUI (builds Civitai legers) -> dequant en RAM
-                # puis chargement du dict (conversion de cles diffusers incluse).
-                # Deja dequantifie une fois ? -> relire le bf16 du cache
-                # disque: un single-file normal (secondes) au lieu de reconvertir
-                # tout le fichier (minutes sur HDD).
+                # ComfyUI 'scaled' FP8/INT8 (light Civitai builds) -> dequantized in
+                # RAM then the dict is loaded (diffusers key conversion included).
+                # Already dequantized once? -> re-read the bf16 from the disk cache: a
+                # normal single-file load (seconds) instead of converting the whole file
+                # again (minutes on a HDD).
                 cached = _dequant_cache_path(path)
                 if cached and os.path.isfile(cached):
                     _log(f"loading Qwen transformer ({dq} -> bf16, from dequant "
                          f"cache): {os.path.basename(cached)}")
                     try:
-                        os.utime(cached, None)       # marque l'usage pour le LRU
+                        os.utime(cached, None)       # marks the use for the LRU
                     except OSError:
                         pass
                     return _load_monitor(
@@ -2326,17 +2356,18 @@ def _load_transformer(path=None, base=None):
                     lambda: QwenImageTransformer2DModel.from_single_file(
                         sd, config=base, subfolder="transformer",
                         torch_dtype=DTYPE))
-            # checkpoint Qwen single-file (.safetensors bf16/fp16) -> override transformer.
-            # config/subfolder = archi du transformer depuis le repo de base (deja en cache),
-            # comme pour le GGUF: sans ca, from_single_file ne sait pas la structure et va
-            # chercher un repo par defaut -> echec en mode offline (HF_HUB_OFFLINE=1).
+            # A single-file Qwen checkpoint (.safetensors bf16/fp16) -> a transformer
+            # override. config/subfolder = the transformer's architecture from the base repo
+            # (already cached), as for the GGUF: without it, from_single_file does not know
+            # the structure and goes looking for a default repo -> a failure in offline mode
+            # (HF_HUB_OFFLINE=1).
             if _safetensors_comfy_prefixed(path):
-                # Layout ComfyUI SANS quantification: diffusers ne convertit pas les cles
-                # Qwen (mapping identite), un passage direct du chemin laisserait le modele
-                # sur 'meta'. On lit et on deprefixe nous-memes -- meme cout RAM, puisque
-                # from_single_file charge de toute facon tout le checkpoint. Pas de cache
-                # disque ici: il n'y a rien de dequantifie a memoriser, ce serait une
-                # copie bf16 -> bf16.
+                # ComfyUI layout WITHOUT quantization: diffusers does not convert the
+                # Qwen keys (identity mapping), and handing the path over directly would
+                # leave the model on 'meta'. So we read and strip the prefix ourselves --
+                # the same RAM cost, since from_single_file loads the whole checkpoint
+                # anyway. No disk cache here: there is nothing dequantized to memorise, it
+                # would be a bf16 -> bf16 copy.
                 _log(f"loading Qwen transformer (single-file, ComfyUI layout -> "
                      f"diffusers): {path} ...")
                 sd = _load_dequant_state_dict(path)
@@ -2351,7 +2382,7 @@ def _load_transformer(path=None, base=None):
                 lambda: QwenImageTransformer2DModel.from_single_file(
                     path, config=base, subfolder="transformer",
                     torch_dtype=DTYPE))
-        # repo HF / dossier diffusers -> charge le sous-dossier 'transformer'.
+        # An HF repo / diffusers folder -> load the 'transformer' subfolder.
         _log(f"loading Qwen transformer (repo subfolder): {path} ...")
         return _load_monitor(
             f"transformer {path}",
@@ -2369,13 +2400,14 @@ def _lora_names(loras):
 
 
 def _clear_loras(pipe):
-    """Retire TOUT adaptateur LoRA du pipe pour repartir d'un etat vierge.
+    """Removes EVERY LoRA adapter from the pipe to start from a clean state.
 
-    unload_lora_weights() seul laisse, selon les versions diffusers/peft, un peft_config
-    residuel sur le transformer -> le load suivant avertit ('Already found a peft_config')
-    et, comme on reutilise les memes noms d'adaptateurs (cz_lora_i), l'ancien adaptateur
-    peut rester en place (mauvaise LoRA appliquee). On supprime donc explicitement les
-    adaptateurs restants par nom apres l'unload."""
+    unload_lora_weights() alone leaves, depending on the diffusers/peft versions, a residual
+    peft_config on the transformer -> the next load warns ('Already found a peft_config')
+    and, since the same adapter names are reused (cz_lora_i), the old adapter can stay in
+    place (the wrong LoRA applied). So the remaining adapters are deleted explicitly by name
+    after the unload.
+"""
     try:
         pipe.unload_lora_weights()
     except Exception as e:
@@ -2391,20 +2423,21 @@ def _clear_loras(pipe):
 
 
 def _sync_adapters(pipe, wanted, applied, force=False, tag="LoRA"):
-    """Synchronise les adaptateurs PEFT d'un pipe avec le jeu `wanted`, SANS recharger
-    le modele. `applied` = jeu reellement pose sur ce pipe (liste de (chemin, poids)).
+    """Synchronises a pipe's PEFT adapters with the `wanted` set, WITHOUT reloading the
+    model. `applied` = the set really applied on this pipe (a list of (path, weight)).
 
-    Le transformer reste en VRAM; seuls les adaptateurs PEFT bougent:
-      - memes fichiers, poids differents -> set_adapters (immediat)
-      - jeu de LoRA different            -> unload_lora_weights + reload des LoRA (~1s)
-    Les pipes derives (from_pipe) partagent ce transformer -> ils suivent automatiquement.
-    Renvoie (ok, applied): ok=False si echec (le caller decide: reload complet pour le
-    base, erreur franche pour l'edition), applied = nouveau jeu pose ([] si echec)."""
-    # low_cpu_mem_usage=False a CHAQUE chargement (cf. _load_lora): le defaut de
-    # diffusers cree les couches de l'adaptateur sur 'meta' puis y copie les poids. Une
-    # DoRA dont diffusers filtre les cles 'dora_scale' laisse alors des parametres sans
-    # donnees, et le premier deplacement leve "Cannot copy out of meta tensor". Avec des
-    # tenseurs reels, une cle manquante garde sa valeur d'init.
+    The transformer stays in VRAM; only the PEFT adapters move:
+      - same files, different weights -> set_adapters (immediate)
+      - a different LoRA set          -> unload_lora_weights + reloading the LoRAs (~1s)
+    The derived pipes (from_pipe) share that transformer -> they follow automatically.
+    Returns (ok, applied): ok=False on a failure (the caller decides: a full reload for the
+    base, a hard error for editing), applied = the new set applied ([] on a failure).
+"""
+    # low_cpu_mem_usage=False on EVERY load (see _load_lora): diffusers' default
+    # creates the adapter's layers on 'meta' then copies the weights into them. A DoRA whose
+    # 'dora_scale' keys diffusers filters out then leaves parameters without data, and the
+    # first move raises "Cannot copy out of meta tensor". With real tensors, a missing key
+    # keeps its initial value.
     wanted = list(wanted)
     if not force and applied == wanted:
         return True, applied
@@ -2413,7 +2446,7 @@ def _sync_adapters(pipe, wanted, applied, force=False, tag="LoRA"):
     new_paths = [p for p, _ in wanted]
     try:
         if not force and old_paths and old_paths == new_paths:
-            # Seuls les poids changent -> re-ponderation instantanee.
+            # Only the weights change -> an instant re-weighting.
             pipe.set_adapters(_lora_names(wanted), [float(w) for _, w in wanted])
             _log(f"{tag} weights updated in place (no reload): "
                  + ", ".join(f"{os.path.basename(p)}@{w}" for p, w in wanted))
@@ -2425,11 +2458,12 @@ def _sync_adapters(pipe, wanted, applied, force=False, tag="LoRA"):
             if os.path.isfile(p):
                 an = f"cz_lora_{i}"
                 _log(f"applying {tag}: {os.path.basename(p)} (weight {w})")
-                # Passer le dossier + weight_name (et non le chemin complet) : sinon
-                # diffusers en mode offline (HF_HUB_OFFLINE) refuse "must specify a
-                # weight_name". Marche aussi online et avec un fichier local direct.
-                # A partir du 2e adaptateur, peft avertit "Already found a peft_config"
-                # : empiler plusieurs LoRA est justement le but, on tait ce message.
+                # Pass the folder + weight_name (not the full path): otherwise
+                # diffusers in offline mode (HF_HUB_OFFLINE) refuses with "must specify a
+                # weight_name". Works online too, and with a direct local file.
+                # From the 2nd adapter on, peft warns "Already found a peft_config":
+                # stacking several LoRAs is precisely the point, so that message is
+                # silenced.
                 import warnings
                 with warnings.catch_warnings():
                     warnings.filterwarnings("ignore", message=".*Already found a `peft_config`.*")
@@ -2446,17 +2480,18 @@ def _sync_adapters(pipe, wanted, applied, force=False, tag="LoRA"):
         return True, wanted
     except Exception as e:
         _log(f"{tag} hot-swap failed ({e})")
-        # diffusers a retire les hooks d'offload avant de charger et n'a pas eu le temps
-        # de les remettre: sans ca, le pipe reste sur le CPU et TOUS les rendus suivants
-        # echouent, y compris ceux qui n'ont rien a voir avec cette LoRA.
+        # diffusers removed the offload hooks before loading and did not get to put
+        # them back: without this, the pipe stays on the CPU and EVERY later render fails,
+        # including the ones that have nothing to do with this LoRA.
         if had_hooks and not _offload_hooks(pipe):
             restore_offload(pipe, f"a failed {tag} load")
         return False, []
 
 
 def _apply_loras(pipe, force=False):
-    """LoRA du BASE (txt2img/img2img): synchronise le pipe avec LORAS via _sync_adapters.
-    Renvoie True si applique, False si echec (le caller retombe sur un reload complet)."""
+    """BASE LoRAs (txt2img/img2img): synchronises the pipe with LORAS through
+    _sync_adapters. Returns True when applied, False on a failure (the caller falls back to
+    a full reload)."""
     global _APPLIED_LORAS
     ok, _APPLIED_LORAS = _sync_adapters(pipe, LORAS, _APPLIED_LORAS, force=force)
     if not ok:
@@ -2465,13 +2500,13 @@ def _apply_loras(pipe, force=False):
 
 
 def _apply_edit_loras(pipe):
-    """LoRA d'EDITION: synchronise le pipe omni avec EDIT_LORAS (ou [] si la case
-    'Edit LoRAs' est decochee). Un echec est une erreur franche: l'utilisateur a
-    demande ce preset, une edition SANS lui serait un faux resultat."""
+    """EDIT LoRAs: synchronises the omni pipe with EDIT_LORAS (or [] when the 'Edit LoRAs'
+    box is unticked). A failure is a hard error: the user asked for that preset, and an edit
+    WITHOUT it would be a false result."""
     global _APPLIED_EDIT_LORAS
     wanted = list(EDIT_LORAS) if EDIT_LORAS_ENABLED else []
-    # LoRA Lightning du mode rapide: empilee APRES les presets (independante de la
-    # case 'Edit LoRAs', qui ne concerne que les presets de tache).
+    # The fast mode's Lightning LoRA: stacked AFTER the presets (independent of the
+    # 'Edit LoRAs' box, which only concerns the task presets).
     if EDIT_SPEED and EDIT_SPEED.get("path"):
         wanted.append((EDIT_SPEED["path"], 1.0))
     ok, _APPLIED_EDIT_LORAS = _sync_adapters(pipe, wanted, _APPLIED_EDIT_LORAS,
@@ -2482,16 +2517,17 @@ def _apply_edit_loras(pipe):
 
 
 def _swap_transformer(pipe):
-    """Remplace SEULEMENT le transformer du pipeline deja en cache: le VAE, l'encodeur de
-    texte, le tokenizer et le scheduler restent en VRAM (c'est eux le gros du temps de
-    chargement). Valable uniquement a repo de base + offload EFFECTIF identiques.
+    """Replaces ONLY the transformer of the already cached pipeline: the VAE, the text
+    encoder, the tokenizer and the scheduler stay in VRAM (they are most of the load time).
+    Valid only with an identical base repo + EFFECTIVE offload.
 
-    Renvoie True si l'echange a reussi, False -> le caller fait un reload complet."""
+    Returns True when the swap succeeded, False -> the caller does a full reload.
+"""
     global _APPLIED_LORAS, _DERIVED
     t0 = time.time()
     old_t = _LOADED_KEY[1] if _LOADED_KEY else None
-    # Passer de/vers un GGUF change l'offload EFFECTIF (un GGUF impose 'model') -> les
-    # hooks accelerate et le placement different: on ne bricole pas, on recharge.
+    # Switching to/from a GGUF changes the EFFECTIVE offload (a GGUF forces 'model')
+    # -> the accelerate hooks and the placement differ: no tinkering, we reload.
     if _effective_offload(old_t) != _effective_offload(ZIMAGE_TRANSFORMER):
         _log("transformer swap skipped (GGUF changes the effective offload) -> full reload")
         return False
@@ -2501,8 +2537,9 @@ def _swap_transformer(pipe):
         new_t = _load_transformer()
         old = getattr(pipe, "transformer", None)
         off = _effective_offload()
-        # Offload: les hooks accelerate sont poses sur les composants. Il faut les retirer
-        # avant l'echange, sinon le nouveau transformer n'en a pas et l'ancien garde les siens.
+        # Offload: the accelerate hooks are set on the components. They have to be
+        # removed before the swap, or the new transformer has none and the old one keeps
+        # its own.
         if DEVICE == "cuda" and off in ("model", "sequential"):
             try:
                 pipe.remove_all_hooks()
@@ -2512,12 +2549,12 @@ def _swap_transformer(pipe):
             pipe.register_modules(transformer=new_t)   # API diffusers (met a jour le config)
         except Exception:
             pipe.transformer = new_t
-        # Liberer l'ANCIEN transformer AVANT de poser le nouveau sur le GPU: sinon
-        # ancien + nouveau + VAE/encodeur depassent la VRAM -> spill en RAM partagee
-        # qui ne se resorbe pas (mesure sur une grille XYZ multi-checkpoints cote
-        # studio: 1.7 s/step -> 300-600 s/step, puis crash). Les pipes derives
-        # (from_pipe) pointent aussi sur l'ancien -> a purger d'abord, sinon
-        # `del old` ne libere rien (from_pipe est gratuit, il sera reconstruit).
+        # Free the OLD transformer BEFORE putting the new one on the GPU: otherwise
+        # old + new + VAE/encoder exceed the VRAM -> a spill into shared RAM that never
+        # recovers (measured on a multi-checkpoint XYZ grid on the studio side: 1.7 s/step
+        # -> 300-600 s/step, then a crash). The derived pipes (from_pipe) point at the old
+        # one too -> purge them first, or `del old` frees nothing (from_pipe is free, it
+        # will be rebuilt).
         _DERIVED = {}
         del old
         gc.collect()
@@ -2529,8 +2566,8 @@ def _swap_transformer(pipe):
             elif off == "sequential":
                 pipe.enable_sequential_cpu_offload()
             else:
-                new_t.to(DEVICE)       # jamais un GGUF ici (offload force a 'model')
-        # Les adaptateurs LoRA etaient poses sur l'ancien transformer -> a reposer.
+                new_t.to(DEVICE)       # never a GGUF here (offload forced to 'model')
+        # The LoRA adapters were applied on the old transformer -> to be reapplied.
         _APPLIED_LORAS = []
         if LORAS:
             _apply_loras(pipe, force=True)
@@ -2544,21 +2581,21 @@ def _swap_transformer(pipe):
 
 
 def _ensure_base():
-    """Charge (si besoin) le pipeline de base txt2img. Gere le transformer
-    single-file/GGUF et l'offload. Cache par (repo, transformer, offload).
+    """Loads (when needed) the base txt2img pipeline. Handles the single-file/GGUF
+    transformer and the offload. Cached by (repo, transformer, offload).
 
-    Deux echanges a chaud evitent un rechargement complet (transformer + VAE + encodeur
-    texte, des dizaines de secondes):
-      - LoRA differentes            -> _apply_loras (adaptateurs PEFT seuls)
-      - transformer different, meme repo de base + offload -> _swap_transformer."""
+    Two hot swaps avoid a full reload (transformer + VAE + text encoder, tens of seconds):
+      - different LoRAs            -> _apply_loras (the PEFT adapters alone)
+      - a different transformer, same base repo + offload -> _swap_transformer.
+"""
     global _BASE_PIPE, _DERIVED, _LOADED_KEY, _BASE_SCHED_CONFIG, _APPLIED_LORAS
     global _TEXT_ENCODER_ACTIVE
     key = (BASE_REPO, ZIMAGE_TRANSFORMER, OFFLOAD_MODE)
     _dbg(f"_ensure_base key={key} cached={_LOADED_KEY}")
     if _BASE_PIPE is not None and _LOADED_KEY == key:
-        # Filet: un pipe laisse sur le CPU par un echec anterieur (LoRA, offload) ferait
-        # echouer CE rendu sur "Cannot generate a cpu tensor from a generator of type
-        # cuda", et tous les suivants.
+        # Safety net: a pipe left on the CPU by an earlier failure (LoRA, offload)
+        # would make THIS render fail on "Cannot generate a cpu tensor from a generator of
+        # type cuda", and every later one too.
         restore_offload(_BASE_PIPE, "an earlier failure")
         if _apply_loras(_BASE_PIPE):
             _dbg("base pipeline: reusing cached (no reload)")
@@ -2566,8 +2603,8 @@ def _ensure_base():
         _dbg("base pipeline: LoRA hot-swap failed -> free + reload")
         free_vram()
     elif _BASE_PIPE is not None:
-        # Seul le transformer change (meme repo de base + meme offload) ? -> on ne recharge
-        # QUE le transformer et on garde VAE + encodeur texte en VRAM.
+        # Only the transformer changes (same base repo + same offload)? -> reload the
+        # transformer ONLY and keep VAE + text encoder in VRAM.
         if (_LOADED_KEY and _LOADED_KEY[0] == BASE_REPO and _LOADED_KEY[2] == OFFLOAD_MODE
                 and _swap_transformer(_BASE_PIPE)):
             _LOADED_KEY = key
@@ -2579,10 +2616,10 @@ def _ensure_base():
     kwargs = {}
     if ZIMAGE_TRANSFORMER:
         kwargs["transformer"] = _load_transformer()
-    # Encodeur de remplacement: verifie contre la config de BASE_REPO puis charge avec la
-    # classe du repo. Un encodeur qui ne convient pas (repo change depuis le choix,
-    # dossier illisible, chargement en echec) est ecarte AVEC une ligne de log, et les
-    # metadonnees le disent. img2img / inpaint le partagent via from_pipe.
+    # A replacement encoder: checked against BASE_REPO's config then loaded with the
+    # repo's class. An encoder that does not suit (the repo changed since the choice, an
+    # unreadable folder, a failed load) is dropped WITH a log line, and the metadata says so.
+    # img2img / inpaint share it through from_pipe.
     _enc, _TEXT_ENCODER_ACTIVE = _pick_text_encoder(BASE_REPO, "base")
     if _enc is not None:
         kwargs["text_encoder"] = _enc
@@ -2592,25 +2629,26 @@ def _ensure_base():
     pipe = _load_monitor(f"Qwen-Image base {BASE_REPO}",
                          lambda: QwenImagePipeline.from_pretrained(BASE_REPO, torch_dtype=DTYPE,
                                                                    **kwargs))
-    # Capture le config natif (flow-matching) du scheduler -> base pour construire les
-    # autres samplers (euler/dpm2a/dpmpp2m) sans perdre shift/flow params.
+    # Capture the scheduler's native (flow-matching) config -> the base for building
+    # the other samplers (euler/dpm2a/dpmpp2m) without losing shift/flow params.
     try:
         _BASE_SCHED_CONFIG = dict(pipe.scheduler.config)
     except Exception:
         _BASE_SCHED_CONFIG = None
-    # LoRA Qwen-Image (sur le transformer du base -> partage par les pipes derives).
-    # force=True: pipe neuf, aucun adaptateur pose -> on (re)pose tout.
+    # Qwen-Image LoRAs (on the base's transformer -> shared by the derived pipes).
+    # force=True: a new pipe, no adapter applied -> we (re)apply everything.
     _APPLIED_LORAS = []
     if LORAS:
         _apply_loras(pipe, force=True)
-    # Attention slicing: POSE PAR APPEL via _set_slicing (selon la resolution traitee),
-    # PAS au chargement. En tuile/1024 -> slicing OFF = attention SDPA native, rapide
-    # (comme ComfyUI). Whole-image 2K+ -> slicing ON pour eviter le spill VRAM 32 Go.
-    # enable_*_cpu_offload gere lui-meme le device -> ne PAS faire .to(cuda) alors.
-    # IMPORTANT: un transformer GGUF quantifie ne se deplace PAS sur le GPU via .to(cuda)
-    # (offload=none) ni en sequential -> il reste sur CPU = ULTRA lent (VRAM vide, ~500s/step).
-    # Seul enable_model_cpu_offload (accelerate) le pose correctement sur le GPU pendant le
-    # forward. On force donc 'model' pour un base GGUF, quel que soit le reglage UI/config.
+    # Attention slicing: SET PER CALL through _set_slicing (according to the
+    # resolution processed), NOT at load time. In tiles/at 1024 -> slicing OFF = native SDPA
+    # attention, fast (like ComfyUI). Whole-image 2K+ -> slicing ON to avoid the 32 GB VRAM
+    # spill.
+    # enable_*_cpu_offload handles the device itself -> do NOT call .to(cuda) then.
+    # IMPORTANT: a quantized GGUF transformer does NOT move onto the GPU through .to(cuda)
+    # (offload=none) nor in sequential -> it stays on the CPU = ULTRA slow (empty VRAM,
+    # ~500s/step). Only enable_model_cpu_offload (accelerate) places it properly on the GPU
+    # during the forward. So 'model' is forced for a GGUF base, whatever the UI/config says.
     _off = _effective_offload()
     _base_off = _resolve_auto() if OFFLOAD_MODE == "auto" else OFFLOAD_MODE
     if _off != _base_off:
@@ -2622,12 +2660,12 @@ def _ensure_base():
         pipe.enable_sequential_cpu_offload()
     else:
         pipe = pipe.to(DEVICE)
-    # VAE tiling/slicing: indispensable pour l'img2img/upscale. Qwen-Image est gros (~20B
-    # transformer + encodeur texte) -> sans tiling le VAE peut faire deborder la VRAM (spill
-    # RAM partagee = tres lent). Tuiler le VAE plafonne ce pic (comme le "tiled decode" de
-    # ComfyUI). Le VAE est partage par les pipes derives.
+    # VAE tiling/slicing: essential for img2img/upscale. Qwen-Image is big (~20B
+    # transformer + text encoder) -> without tiling the VAE can overflow the VRAM (a spill
+    # into shared RAM = very slow). Tiling the VAE caps that peak (like ComfyUI's "tiled
+    # decode"). The VAE is shared by the derived pipes.
     try:
-        pipe.vae.config.force_upcast = False   # VAE en bf16 (fp32 lent sur Blackwell) -- TOUJOURS
+        pipe.vae.config.force_upcast = False   # the VAE in bf16 (fp32 is slow on Blackwell) -- ALWAYS
     except Exception:
         pass
     try:
@@ -2635,7 +2673,7 @@ def _ensure_base():
         pipe.vae.enable_tiling()
     except Exception as e:
         _dbg(f"VAE tiling not available: {e}")
-    _apply_sampler(pipe)   # pose le sampler choisi (euler par defaut) sur le pipe de base
+    _apply_sampler(pipe)   # applies the chosen sampler (euler by default) to the base pipe
     _BASE_PIPE = pipe
     _DERIVED = {"txt2img": pipe}
     _LOADED_KEY = key
@@ -2644,12 +2682,12 @@ def _ensure_base():
 
 
 def get_pipe(kind="img2img"):
-    """Renvoie le pipeline demande. txt2img/img2img/inpaint derivent du base via
-    from_pipe (poids partages). Omni a besoin de composants en plus (SigLIP) ->
-    charge separement depuis un modele Omni dedie (CONFIG['zimage_omni_model'])."""
+    """Returns the requested pipeline. txt2img/img2img/inpaint derive from the base through
+    from_pipe (shared weights). Omni needs extra components (SigLIP) -> loaded separately
+    from a dedicated Omni model (CONFIG['zimage_omni_model'])."""
     if kind == "omni":
-        # Qwen-Image-Edit est un modele SEPARE: ne PAS charger le base (txt2img,
-        # ~8 min + RAM/VRAM en double) juste pour editer une image.
+        # Qwen-Image-Edit is a SEPARATE model: do NOT load the base one (txt2img,
+        # ~8 min + duplicate RAM/VRAM) just to edit an image.
         if "omni" in _DERIVED:
             _dbg("get_pipe('omni'): reuse derived")
             return _DERIVED["omni"]
@@ -2663,14 +2701,16 @@ def get_pipe(kind="img2img"):
     if cls is None:
         return base
     _log(f"deriving {kind} pipeline (shared weights, no extra VRAM)")
-    # Un transformer GGUF est QUANTIFIE: on ne peut pas le recaster en dtype (.to(DTYPE)
-    # leve "Casting a quantized model is unsupported"). On saute donc le recast bf16 dans
-    # ce cas (le compute_dtype est deja bf16). Sinon (bf16 plein): recast defensif Blackwell
-    # (certains from_pipe upcastent en float32 -> tres lent sans tensor cores fp32).
+    # A GGUF transformer is QUANTIZED: it cannot be recast to a dtype (.to(DTYPE)
+    # raises "Casting a quantized model is unsupported"). So the bf16 recast is skipped in
+    # that case (the compute_dtype is bf16 already). Otherwise (full bf16): a defensive
+    # Blackwell recast (some from_pipe calls upcast to float32 -> very slow without fp32
+    # tensor cores).
     quantized = bool(ZIMAGE_TRANSFORMER) and ZIMAGE_TRANSFORMER.lower().endswith(".gguf")
     try:
-        # GGUF quantifie: torch_dtype=None EXPLICITE -> sinon from_pipe met float32 par
-        # defaut et caste le modele quantifie -> ValueError "Casting a quantized model".
+        # A quantized GGUF: torch_dtype=None EXPLICITLY -> otherwise from_pipe puts
+        # float32 by default and casts the quantized model -> ValueError "Casting a
+        # quantized model".
         p = cls.from_pipe(base, torch_dtype=None) if quantized else cls.from_pipe(base, torch_dtype=DTYPE)
     except TypeError:
         p = cls.from_pipe(base)
@@ -2682,11 +2722,13 @@ def get_pipe(kind="img2img"):
             torch.cuda.empty_cache()
     except Exception as e:
         _log(f"img2img bf16 recast failed ({e})")
-    _apply_sampler(p)   # meme sampler que le base (au cas ou from_pipe recree le scheduler)
-    # Diagnostic vitesse: si le pipe derive n'est PAS sur cuda -> img2img/refine tourne
-    # sur CPU = ultra lent. On le force sur DEVICE en mode plein VRAM (offload gere seul).
-    # NB: offload EFFECTIF (un base GGUF force 'model' meme si l'UI dit 'none'): en
-    # offload, un transformer "sur CPU" est normal -> un .to(cuda) casserait les hooks.
+    _apply_sampler(p)   # the same sampler as the base (in case from_pipe recreates the scheduler)
+    # Speed diagnosis: if the derived pipe is NOT on cuda -> img2img/refine runs on the
+    # CPU = ultra slow. So it is forced onto DEVICE in full-VRAM mode (offload handles
+    # itself).
+    # NB: the EFFECTIVE offload (a GGUF base forces 'model' even when the UI says 'none'):
+    # under offload, a transformer "on the CPU" is normal -> a .to(cuda) would break the
+    # hooks.
     try:
         tdev = next(p.transformer.parameters()).device
         if DEVICE == "cuda" and _effective_offload() == "none" and tdev.type != "cuda":
@@ -2701,13 +2743,14 @@ def get_pipe(kind="img2img"):
 
 
 def _load_omni():
-    """Charge le pipeline d'edition Qwen-Image-Edit (onglet Omni/Edit). Modele SEPARE du
-    base (defaut 'Qwen/Qwen-Image-Edit-2509', multi-images). 2509 -> QwenImageEditPlus ;
-    revision de base -> QwenImageEdit. Pipeline separe (ne partage pas avec le base)."""
+    """Loads the Qwen-Image-Edit editing pipeline (the Omni/Edit tab). A model SEPARATE
+    from the base (default 'Qwen/Qwen-Image-Edit-2509', multi-image). 2509 ->
+    QwenImageEditPlus; the base revision -> QwenImageEdit. A separate pipeline (it shares
+    nothing with the base)."""
     global _DERIVED, _APPLIED_EDIT_LORAS, _TEXT_ENCODER_ACTIVE_EDIT
     import diffusers
-    _APPLIED_EDIT_LORAS = []        # pipe neuf: aucun adaptateur d'edition pose dessus
-    _TEXT_ENCODER_ACTIVE_EDIT = ""  # ... ni encodeur de remplacement, tant qu'il n'est pas monte
+    _APPLIED_EDIT_LORAS = []        # a new pipe: no edit adapter applied on it
+    _TEXT_ENCODER_ACTIVE_EDIT = ""  # ... nor a replacement encoder, as long as it is not mounted
     repo = (OMNI_MODEL or os.environ.get("ZIMAGE_OMNI_MODEL")
             or CONFIG.get("zimage_omni_model") or DEFAULT_OMNI_REPO).strip()
     if not repo:
@@ -2715,10 +2758,11 @@ def _load_omni():
     EditPlus = getattr(diffusers, "QwenImageEditPlusPipeline", None)
     t0 = time.time()
     if _is_single_file(repo):
-        # Single-file: transformer d'edition local (GGUF quantifie ~13 Go, ou .safetensors
-        # FP8/bf16 type Rapid-AIO = 2511 + Lightning fusionnes) + le RESTE (encodeur texte
-        # ~17 Go, VAE, processor) tire du repo d'edition de base (zimage_omni_base, defaut
-        # Qwen-Image-Edit-2509). Fait tenir l'edition en VRAM 32 Go, sans le transformer 40 Go.
+        # Single-file: a local edit transformer (a quantized GGUF ~13 GB, or a
+        # .safetensors FP8/bf16 such as Rapid-AIO = 2511 + Lightning merged) + the REST (the
+        # text encoder ~17 GB, the VAE, the processor) taken from the base edit repo
+        # (zimage_omni_base, default Qwen-Image-Edit-2509). Makes editing fit in 32 GB of
+        # VRAM, without the 40 GB transformer.
         import importlib, json as _json
         from huggingface_hub import hf_hub_download
         base_edit = (os.environ.get("QWEN_EDIT_BASE") or CONFIG.get("zimage_omni_base")
@@ -2726,17 +2770,18 @@ def _load_omni():
         EditCls = EditPlus or diffusers.QwenImageEditPipeline
         _log(f"loading Qwen-Image-Edit transformer (single-file): {repo} + base {base_edit} "
              f"via {EditCls.__name__} (offload={OFFLOAD_MODE}) ...")
-        # Transformer depuis le fichier (archi tiree du repo de base, pas de download du
-        # transformer bf16): meme loader que le base (GGUF, FP8/INT8 scaled dequantifie +
-        # cache disque, layout ComfyUI). NB: from_pretrained(base, transformer=tf)
-        # telechargerait QUAND MEME le transformer 40 Go du repo -> on construit donc le
-        # pipeline composant par composant. Les classes viennent du model_index.json.
+        # The transformer from the file (its architecture taken from the base repo, no
+        # download of the bf16 transformer): the same loader as the base one (GGUF, 'scaled'
+        # FP8/INT8 dequantized + the disk cache, the ComfyUI layout). NB:
+        # from_pretrained(base, transformer=tf) would download the repo's 40 GB transformer
+        # ANYWAY -> so the pipeline is built component by component. The classes come from
+        # model_index.json.
         tf = _load_transformer(repo, base_edit)
         mi = _json.load(open(hf_hub_download(base_edit, "model_index.json"), encoding="utf-8"))
         comps = {"transformer": tf}
-        # Encodeur de remplacement: compare a la config de base_edit (le repo qui fournit
-        # l'encodeur de CE pipe) et substitue a comps['text_encoder'] -- celui du repo,
-        # ~17 Go, n'est alors jamais lu. Tokenizer et processor restent ceux de base_edit.
+        # A replacement encoder: compared against base_edit's config (the repo that
+        # supplies THIS pipe's encoder) and substituted into comps['text_encoder'] -- the
+        # repo's own, ~17 GB, is then never read. Tokenizer and processor stay base_edit's.
         te, te_src = _pick_text_encoder(base_edit, "edit")
         for name in ("scheduler", "vae", "text_encoder", "tokenizer", "processor"):
             if name == "text_encoder" and te is not None:
@@ -2748,8 +2793,8 @@ def _load_omni():
             lib, cls_name = spec
             Cls = getattr(importlib.import_module(lib), cls_name)
             kw = {"torch_dtype": DTYPE} if name in ("vae", "text_encoder") else {}
-            # Charge UNIQUEMENT ce sous-dossier (encodeur ~17 Go, VAE...) ; le transformer
-            # 40 Go du repo n'est jamais telecharge.
+            # Load ONLY this subfolder (the encoder ~17 GB, the VAE...); the repo's
+            # 40 GB transformer is never downloaded.
             comps[name] = Cls.from_pretrained(base_edit, subfolder=name, **kw)
         pipe = EditCls(**comps)
     else:
@@ -2758,8 +2803,9 @@ def _load_omni():
         plus = "2509" in repo or "2511" in repo or "plus" in repo.lower()
         EditCls = (EditPlus if plus else None) or diffusers.QwenImageEditPipeline
         _log(f"loading Qwen-Image-Edit: {repo} via {EditCls.__name__} (offload={OFFLOAD_MODE}) ...")
-        # Encodeur de remplacement: compare a la config de CE repo, passe en text_encoder=
-        # (diffusers monte le pipe avec lui au lieu de charger celui du repo).
+        # A replacement encoder: compared against THIS repo's config, passed as
+        # text_encoder= (diffusers then builds the pipe with it instead of loading the
+        # repo's).
         te, te_src = _pick_text_encoder(repo, "edit")
         te_kw = {"text_encoder": te} if te is not None else {}
         try:
@@ -2770,9 +2816,9 @@ def _load_omni():
                 raise
             _log(f"{EditCls.__name__} failed ({e}); falling back to {alt.__name__}")
             pipe = alt.from_pretrained(repo, torch_dtype=DTYPE, **te_kw)
-    _TEXT_ENCODER_ACTIVE_EDIT = te_src      # pipe monte: dit ce qui tourne vraiment
-    # Meme regle que le base: un transformer GGUF ne va sur le GPU QUE via
-    # enable_model_cpu_offload (sinon il reste sur CPU: ~800 s/step observes).
+    _TEXT_ENCODER_ACTIVE_EDIT = te_src      # the pipe is mounted: says what really runs
+    # The same rule as the base: a GGUF transformer only goes onto the GPU through
+    # enable_model_cpu_offload (otherwise it stays on the CPU: ~800 s/step observed).
     _off = _effective_offload(repo)
     if _off != OFFLOAD_MODE:
         _log(f"GGUF edit: offload '{OFFLOAD_MODE}' forced to '{_off}' (a GGUF does not run "
@@ -2796,19 +2842,20 @@ def _load_omni():
 @_gpu_serial
 def generate_omni(refs, prompt, negative, width, height, steps, seed,
                   guidance=None, honor_size=False, steps_explicit=False):
-    """Edition par instruction Qwen-Image-Edit: edite une (ou plusieurs, via 2509) image(s)
-    d'entree selon le prompt d'instruction. Conserve la signature de l'upstream (cz_ui).
-    width/height sont ignores par defaut (l'edition preserve les dimensions de l'entree);
-    honor_size=True les transmet au pipe (protocole edit avec taille explicite, ex. le
-    preset Upscaler qui veut une sortie 2x). guidance = surcharge du CFG global.
-    Les LoRA d'edition (EDIT_LORAS, case 'Edit LoRAs') sont posees a chaud ici."""
+    """Qwen-Image-Edit instruction-based editing: edits one (or several, through 2509)
+    input image(s) according to the instruction prompt. Keeps upstream's signature (cz_ui).
+    width/height are ignored by default (editing preserves the input's dimensions);
+    honor_size=True passes them to the pipe (the edit protocol with an explicit size, e.g.
+    the Upscaler preset which wants a 2x output). guidance = an override of the global CFG.
+    The edit LoRAs (EDIT_LORAS, the 'Edit LoRAs' box) are applied hot here.
+"""
     refs = [r.convert("RGB") for r in (refs or []) if r is not None]
     if not refs:
         raise ValueError("Edit needs at least one input image.")
     pipe = get_pipe("omni")
     _apply_edit_loras(pipe)
-    # Mode rapide: ses steps/guidance priment sur les Settings; un appelant qui les
-    # a fixes explicitement (protocole spec.steps / spec.guidance) garde la main.
+    # Fast mode: its steps/guidance win over Settings; a caller that set them
+    # explicitly (protocol spec.steps / spec.guidance) keeps the upper hand.
     if EDIT_SPEED:
         if not steps_explicit:
             steps = EDIT_SPEED["steps"]
@@ -2816,12 +2863,12 @@ def generate_omni(refs, prompt, negative, width, height, steps, seed,
             guidance = EDIT_SPEED["guidance"]
     g = float(GUIDANCE) if guidance is None else float(guidance)
     lora_info = ", edit LoRA " + "+".join(os.path.basename(p) for p, _ in _APPLIED_EDIT_LORAS) \
-        if _APPLIED_EDIT_LORAS else ""            # presets + LoRA Lightning reellement poses
+        if _APPLIED_EDIT_LORAS else ""            # the presets + the Lightning LoRA really applied
     _log(f"edit: {len(refs)} image(s), {int(steps)} steps, cfg {g:.1f}{lora_info} ...")
     _progress(0.1, f"Editing ({len(refs)} image(s))...")
     _set_slicing(pipe, max(max(r.size) for r in refs))
     t0 = time.time()
-    # 2509/Plus accepte une liste d'images; la revision de base prend une seule image.
+    # 2509/Plus takes a list of images; the base revision takes a single one.
     image_arg = refs if len(refs) > 1 else refs[0]
     size_kw = {}
     if honor_size and width and height:
@@ -2850,9 +2897,9 @@ def load_pipe():
 
 @_gpu_serial
 def generate(prompt, width, height, steps, seed, negative_prompt=""):
-    """txt2img Qwen-Image: genere une image depuis un prompt. CFG reel via true_cfg_scale
-    (= curseur guidance, ~4.0), ~30-50 steps conseilles. Le negative prompt agit grace au
-    vrai CFG (cf. _cfg)."""
+    """Qwen-Image txt2img: generates an image from a prompt. Real CFG through
+    true_cfg_scale (= the guidance slider, ~4.0), ~30-50 steps advised. The negative prompt
+    works thanks to the real CFG (see _cfg)."""
     pipe = get_pipe("txt2img")
     w = round_to_multiple(int(width))
     h = round_to_multiple(int(height))
@@ -2863,8 +2910,8 @@ def generate(prompt, width, height, steps, seed, negative_prompt=""):
         _dbg(f"VRAM before: alloc={torch.cuda.memory_allocated()/1024**3:.2f} Go")
     _progress(0.1, f"Generating {w}x{h} ({int(steps)} steps)...")
     t0 = time.time()
-    # Deux tentatives maxi: si la garde VRAM declenche au 1er step (mode 'none'
-    # trop optimiste), _consume_vram_downgrade bascule en 'model' et on rejoue.
+    # Two attempts at most: when the VRAM guard fires at the first step ('none' mode
+    # too optimistic), _consume_vram_downgrade switches to 'model' and we replay.
     for _attempt in (0, 1):
         _set_slicing(pipe, max(w, h))
         img = _qwen_call(
@@ -2878,7 +2925,7 @@ def generate(prompt, width, height, steps, seed, negative_prompt=""):
         ).images[0]
         if not _consume_vram_downgrade():
             break
-        pipe = get_pipe("txt2img")   # recharge avec l'offload retrograde
+        pipe = get_pipe("txt2img")   # reload with the downgraded offload
     _log(f"txt2img done in {time.time() - t0:.1f}s")
     if DEVICE == "cuda":
         _dbg(f"VRAM peak: alloc={torch.cuda.max_memory_allocated()/1024**3:.2f} Go | "
@@ -2894,22 +2941,23 @@ def round_to_multiple(x, m=16):
 
 
 def set_force_ratio(spec):
-    """Definit le ratio force pour upscale/img2img: 'W:H' / 'WxH' (ex '13:19', '832x1216')
-    ou '' pour desactiver (ratio natif preserve). Pilote par le radio UI."""
+    """Sets the forced ratio for upscale/img2img: 'W:H' / 'WxH' (e.g. '13:19',
+    '832x1216') or '' to turn it off (the native ratio is preserved). Driven by the UI
+    radio."""
     global FORCE_RATIO
     FORCE_RATIO = (spec or "").strip()
     _log(f"force ratio -> {FORCE_RATIO or '(off, ratio natif preserve)'}")
 
 
 def set_force_ratio_mode(mode):
-    """'crop' (recadrage centre) ou 'extend' (outpaint des bandes manquantes)."""
+    """'crop' (a center crop) or 'extend' (outpainting the missing bands)."""
     global FORCE_RATIO_MODE
     FORCE_RATIO_MODE = "extend" if str(mode or "").strip().lower() == "extend" else "crop"
     _log(f"force ratio mode -> {FORCE_RATIO_MODE}")
 
 
 def _parse_ratio(spec):
-    """(w, h) depuis 'W:H', 'WxH', ou un label '832 x 1216 | 13:19'; sinon None."""
+    """(w, h) from 'W:H', 'WxH', or a '832 x 1216 | 13:19' label; otherwise None."""
     import re
     if not spec:
         return None
@@ -2928,7 +2976,7 @@ def _crop_to_ratio(image, ratio_w, ratio_h):
     cur = w / h
     if abs(cur - target) < 1e-3:
         return image
-    if cur > target:                       # trop large -> couper les cotes
+    if cur > target:                       # too wide -> cut the sides
         nw = max(1, int(round(h * target)))
         x0 = (w - nw) // 2
         return image.crop((x0, 0, x0 + nw, h))
@@ -2938,15 +2986,16 @@ def _crop_to_ratio(image, ratio_w, ratio_h):
 
 
 def _extend_to_ratio(image, ratio_w, ratio_h, prompt, steps, seed):
-    """Amene l'image au ratio cible en l'ETENDANT (outpaint) au lieu de recadrer:
-    bandes symetriques ajoutees sur l'axe manquant et remplies par le modele via
-    outpaint_directions -- le centre garde sa pleine resolution (seules les bandes
-    sont generees, diffusion bornee a ~1 MP puis recomposition).
+    """Brings the image to the target ratio by EXTENDING it (outpaint) instead of
+    cropping: symmetric bands are added on the missing axis and filled by the model through
+    outpaint_directions -- the centre keeps its full resolution (only the bands are
+    generated, with the diffusion bounded to ~1 MP then recomposed).
 
-    Anti 'effet bande': une passe img2img legere (EXTEND_DENOISE) tourne sur l'image
-    etendue, mais SEULES les bandes + une marge de transition feather sont recollees
-    depuis cette passe -- le centre original reste PIXEL POUR PIXEL intact (la passe
-    harmonise l'exposition/texture aux jointures sans jamais retoucher l'image)."""
+    Anti 'banding': a light img2img pass (EXTEND_DENOISE) runs on the extended image, but
+    ONLY the bands + a feathered transition margin are pasted back from that pass -- the
+    original centre stays PIXEL FOR PIXEL intact (the pass harmonises exposure/texture at
+    the seams without ever retouching the image).
+"""
     from PIL import ImageDraw, ImageFilter
     image = image.convert("RGB")
     w, h = image.size
@@ -2954,7 +3003,7 @@ def _extend_to_ratio(image, ratio_w, ratio_h, prompt, steps, seed):
     cur = w / h
     if abs(cur - target) < 1e-3:
         return image
-    if cur < target:                       # trop etroit -> elargir gauche + droite
+    if cur < target:                       # too narrow -> widen left + right
         pad = target * h - w
         out = outpaint_directions(image, None, ["left", "right"], prompt, steps, seed,
                                   expand=pad / (2.0 * w))
@@ -2967,12 +3016,12 @@ def _extend_to_ratio(image, ratio_w, ratio_h, prompt, steps, seed):
              "original centre kept)")
         refined = _refine_whole(get_pipe("img2img"), out, EXTEND_DENOISE,
                                 steps, prompt, seed)
-        # Masque de recollage: blanc = prendre la passe harmonisee (bandes + marge de
-        # transition A CHEVAL sur la jointure), noir = garder l'original. La marge
-        # penetre dans l'image d'origine puis est feather -> raccord fondu, centre intact.
+        # Paste-back mask: white = take the harmonised pass (the bands + a transition
+        # margin STRADDLING the seam), black = keep the original. The margin reaches into
+        # the original image then is feathered -> a blended join, an intact centre.
         ox, oy = (out.width - w) // 2, (out.height - h) // 2
-        m = max(24, int(0.05 * min(out.size)))       # transition ~5% du petit cote
-        mx, my = (m if ox > 0 else 0), (m if oy > 0 else 0)   # marge cote jointure SEULEMENT
+        m = max(24, int(0.05 * min(out.size)))       # a transition ~5% of the short side
+        mx, my = (m if ox > 0 else 0), (m if oy > 0 else 0)   # a margin on the seam side ONLY
         mask = Image.new("L", out.size, 255)
         ImageDraw.Draw(mask).rectangle(
             [ox + mx, oy + my, ox + w - mx, oy + h - my], fill=0)
@@ -2982,16 +3031,16 @@ def _extend_to_ratio(image, ratio_w, ratio_h, prompt, steps, seed):
 
 
 def _reframe_canvas(image, ratio_w, ratio_h, overlap=8):
-    """Place l'image dans un canevas plus grand au ratio cible (expansion sur 1 axe),
-    + un masque (blanc = a remplir, noir = a garder, avec un petit overlap)."""
+    """Places the image in a larger canvas at the target ratio (expansion on 1 axis),
+    + a mask (white = to fill, black = to keep, with a small overlap)."""
     from PIL import ImageDraw
     image = image.convert("RGB")
     w, h = image.size
     r = ratio_w / ratio_h
-    # Alignement sur 32 (patch 2 x VAE 16): evite les erreurs de conv (no engine).
+    # Aligned on 32 (patch 2 x VAE 16): avoids conv errors (no engine).
     if w / h < r:  # trop etroit -> elargir
         nw, nh = round_to_multiple(int(round(h * r)), 32), round_to_multiple(h, 32)
-    else:          # trop large -> agrandir en hauteur
+    else:          # too wide -> grow in height
         nw, nh = round_to_multiple(w, 32), round_to_multiple(int(round(w / r)), 32)
     nw, nh = max(nw, round_to_multiple(w, 32)), max(nh, round_to_multiple(h, 32))
     ox, oy = (nw - w) // 2, (nh - h) // 2
@@ -3005,11 +3054,12 @@ def _reframe_canvas(image, ratio_w, ratio_h, overlap=8):
 
 @_gpu_serial
 def inpaint_run(background, mask, prompt, steps, denoise, seed):
-    """Inpaint: regenere la zone blanche du masque selon le prompt
-    (ZImageInpaintPipeline). background + mask = PIL (L: blanc = a changer)."""
+    """Inpaint: regenerates the white area of the mask according to the prompt
+    (ZImageInpaintPipeline). background + mask = PIL (L: white = to change)."""
     orig = background.convert("RGB")
     full_mask = mask
-    # Diffusion bornee a ~1 MP (zone optimale du modele), puis recomposition pleine res.
+    # Diffusion bounded to ~1 MP (the model's sweet spot), then recomposed at full
+    # resolution.
     bg, work_mask, orig_size = _cap_work_res(orig, mask)
     w, h = bg.size
     pipe = get_pipe("inpaint")
@@ -3021,7 +3071,7 @@ def inpaint_run(background, mask, prompt, steps, denoise, seed):
     out = _qwen_call(pipe, prompt=prompt or "", image=bg, mask_image=work_mask,
                      strength=float(denoise), num_inference_steps=int(steps),
                      generator=_make_generator(seed), **_cfg(None)).images[0]
-    # Recompose: hors-masque garde la pleine resolution; jointure fondue (feather).
+    # Recompose: outside the mask keeps the full resolution; the join is feathered.
     out = _composite_back(out, orig, full_mask, orig_size,
                           feather=max(2, int(min(orig_size) * 0.01)))
     _log(f"inpaint done in {time.time() - t0:.1f}s")
@@ -3031,9 +3081,9 @@ def inpaint_run(background, mask, prompt, steps, denoise, seed):
     return out
 
 
-# Resolution cible "zone optimale" du modele Z-Image (~1 MP, comme les ratios txt2img).
-# Le reframe vise ce budget pour ne PAS exploser le nombre de pixels (sortie 2-3 MP qui
-# sort de la zone d'entrainement -> lent et qualite degradee).
+# The Z-Image model's "sweet spot" target resolution (~1 MP, like the txt2img ratios).
+# The reframe aims at that budget so as NOT to blow up the pixel count (a 2-3 MP output that
+# leaves the training zone -> slow and degraded quality).
 MODEL_TARGET_PX = 1024 * 1024
 
 
@@ -3046,10 +3096,10 @@ def _ratio_canvas(ratio_w, ratio_h, target_px=MODEL_TARGET_PX):
 
 
 def _cap_work_res(image, mask, max_px=MODEL_TARGET_PX):
-    """Borne la resolution de travail pour la diffusion: si image > max_px, renvoie une
-    version reduite (multiples de 32) de (image, mask) + la taille d'origine pour
-    recomposer ensuite. Evite de faire tourner le modele tres au-dessus de sa zone
-    optimale (~1 MP) -> plus rapide et meilleure qualite."""
+    """Bounds the working resolution for the diffusion: when image > max_px, returns a
+    reduced version (multiples of 32) of (image, mask) + the original size to recompose
+    afterwards. Avoids running the model far above its sweet spot (~1 MP) -> faster and
+    better quality."""
     w, h = image.size
     if w * h > max_px:
         s = (max_px / (w * h)) ** 0.5
@@ -3062,10 +3112,10 @@ def _cap_work_res(image, mask, max_px=MODEL_TARGET_PX):
 
 
 def _composite_back(result, original, mask, orig_size, feather=0):
-    """Recompose a la resolution d'origine: la zone masquee (blanc) vient de `result`
-    (re-agrandi a orig_size), le reste vient de `original` -> le hors-masque garde la
-    pleine resolution de l'image de depart. `feather` (px) floute le masque pour fondre
-    la jointure (transition progressive original <-> genere, plus de ligne dure)."""
+    """Recomposes at the original resolution: the masked area (white) comes from `result`
+    (scaled back up to orig_size), the rest from `original` -> everything outside the mask
+    keeps the starting image's full resolution. `feather` (px) blurs the mask to blend the
+    join (a gradual original <-> generated transition, no hard line)."""
     if result.size != orig_size:
         result = result.resize(orig_size, Image.LANCZOS)
     if original.size != orig_size:
@@ -3078,12 +3128,13 @@ def _composite_back(result, original, mask, orig_size, feather=0):
 
 
 def reframe(image, ratio_w, ratio_h, fit, prompt, steps, seed, strength=1.0):
-    """Recadre l'image au ratio cible en bornant la sortie a la resolution optimale du
-    modele (~1 MP) -> plus d'explosion du nombre de pixels.
-      fit='contain' : l'image entiere rentre dans le canevas (sans l'agrandir), les bords
-                      ajoutes sont remplis par Z-Image (outpaint).
-      fit='cover'   : l'image remplit le canevas au ratio puis est recadree au centre
-                      (pas d'outpaint, simple reframe/crop)."""
+    """Crops the image to the target ratio while bounding the output to the model's sweet
+    spot (~1 MP) -> no more pixel-count explosion.
+      fit='contain' : the whole image fits inside the canvas (without enlarging it), and the
+                      added edges are filled by Z-Image (outpaint).
+      fit='cover'   : the image fills the canvas at the ratio then is center-cropped (no
+                      outpaint, a plain reframe/crop).
+"""
     from PIL import ImageDraw
     img = image.convert("RGB")
     w, h = img.size
@@ -3096,14 +3147,16 @@ def reframe(image, ratio_w, ratio_h, fit, prompt, steps, seed, strength=1.0):
         out = resized.crop((left, top, left + nw, top + nh))
         _log(f"reframe cover: {w}x{h} -> {nw}x{nh} (crop, no fill)")
         return out
-    # contain -> on adapte l'original sans l'agrandir, puis on outpaint les bords.
+    # contain -> the original is fitted without being enlarged, then the edges are
+    # outpainted.
     from PIL import ImageFilter
     scale = min(nw / w, nh / h, 1.0)
     rw2, rh2 = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
     resized = img.resize((rw2, rh2), Image.LANCZOS) if (rw2, rh2) != (w, h) else img
     ox, oy = (nw - rw2) // 2, (nh - rh2) // 2
-    # Bords = extension floue des couleurs du bord (blurred edge fill, comme l'outpaint)
-    # plutot qu'un gris -> continuite d'exposition; transparait si strength < 1.0.
+    # Edges = a blurred extension of the edge colours (blurred edge fill, like the
+    # outpaint) rather than a grey -> exposure continuity; it shows through when
+    # strength < 1.0.
     arr = np.pad(np.array(resized), [[oy, nh - rh2 - oy], [ox, nw - rw2 - ox], [0, 0]],
                  mode="edge")
     canvas = Image.fromarray(np.ascontiguousarray(arr))
@@ -3133,18 +3186,17 @@ def reframe(image, ratio_w, ratio_h, fit, prompt, steps, seed, strength=1.0):
 
 @_gpu_serial
 def outpaint(image, ratio_w, ratio_h, prompt, steps, seed):
-    """Compat (CLI --reframe et appels existants): reframe en mode 'contain' (outpaint),
-    borne a la resolution optimale du modele."""
+    """Compat (CLI --reframe and existing calls): a reframe in 'contain' mode (outpaint),
+    bounded to the model's sweet spot."""
     return reframe(image, ratio_w, ratio_h, "contain", prompt, steps, seed)
 
 
 def outpaint_directions(image, mask, directions, prompt, steps, seed, strength=1.0, expand=0.3):
-    """Outpaint directionnel (facon Fooocus): agrandit l'image dans les directions
-    choisies parmi left/right/top/bottom, chacune de `expand` (fraction de la dimension
-    d'origine), en repliquant les pixels du bord (mode 'edge'), puis fait remplir les
-    bandes ajoutees par Z-Image (ZImageInpaintPipeline). Un `mask` peint (L, blanc = a
-    changer) est optionnel: il est conserve dans la zone d'origine et combine avec les
-    bandes ajoutees (blanches)."""
+    """Directional outpaint (Fooocus-style): enlarges the image in the chosen directions
+    among left/right/top/bottom, each by `expand` (a fraction of the original dimension), by
+    replicating the edge pixels (mode 'edge'), then has the added bands filled by Z-Image
+    (ZImageInpaintPipeline). A painted `mask` (L, white = to change) is optional: it is kept
+    over the original area and combined with the added bands (white)."""
     img = np.array(image.convert("RGB"))
     H, W = img.shape[:2]
     m = np.array(mask.convert("L")) if mask is not None else np.zeros((H, W), dtype=np.uint8)
@@ -3168,19 +3220,19 @@ def outpaint_directions(image, mask, directions, prompt, steps, seed, strength=1
     canvas = Image.fromarray(np.ascontiguousarray(img))
     mask_img = Image.fromarray(np.ascontiguousarray(m))
     full_size = canvas.size
-    # Dilate un peu la zone a generer vers l'interieur -> le modele regenere une fine
-    # bande de transition qui se raccorde a l'original (evite la jointure franche).
+    # Dilate the area to generate a little towards the inside -> the model regenerates
+    # a thin transition band that joins up with the original (avoids a hard seam).
     from PIL import ImageFilter
     k = max(3, (int(min(full_size) * 0.02) // 2) * 2 + 1)
     mask_img = mask_img.filter(ImageFilter.MaxFilter(min(k, 15)))
-    # "Blurred edge fill": on remplit la zone a generer avec une version FLOUE de
-    # l'extension du bord (memes couleurs/tonalite que l'original) au lieu d'un bord
-    # replique net. Avec strength < 1.0 ce flou transparait -> continuite d'exposition
-    # (plus de bande plus claire) et le modele ajoute le detail par-dessus.
+    # "Blurred edge fill": the area to generate is filled with a BLURRED version of
+    # the edge extension (the same colours/tone as the original) instead of a sharp
+    # replicated edge. With strength < 1.0 that blur shows through -> exposure continuity
+    # (no lighter band any more) and the model adds the detail on top.
     blur_r = max(8, int(min(full_size) * 0.03))
     canvas = Image.composite(canvas.filter(ImageFilter.GaussianBlur(blur_r)), canvas, mask_img)
-    # Diffusion bornee a ~1 MP (zone optimale), puis recomposition: le centre (image
-    # d'origine) garde sa pleine resolution, seuls les bords ajoutes sont generes.
+    # Diffusion bounded to ~1 MP (the sweet spot), then recomposed: the centre (the
+    # original image) keeps its full resolution, only the added edges are generated.
     work_img, work_mask, _ = _cap_work_res(canvas, mask_img)
     w2, h2 = work_img.size
     pipe = get_pipe("inpaint")
@@ -3208,15 +3260,15 @@ def _make_generator(seed):
 
 @_gpu_serial
 def _refine_whole(pipe, image, denoise, steps, prompt, seed):
-    """Passe Qwen-Image img2img sur l'image entiere (ou une tuile). Le slicing est pose
-    selon la taille reelle traitee: tuile 1024 -> OFF (rapide), whole 2K+ -> ON.
-    IMPORTANT: on passe width/height = taille de l'image (alignee sur 16). Sinon Qwen-Image
-    img2img retombe sur son defaut (height = default_sample_size * vae_scale_factor = 1024)
-    et REDIMENSIONNE l'entree en 1024x1024 -> le ratio est ecrase (bug). En forcant les
-    dimensions de l'entree, le ratio d'origine est preserve en upscale/img2img."""
+    """A Qwen-Image img2img pass over the whole image (or over one tile). The slicing is
+    set according to the size really processed: a 1024 tile -> OFF (fast), whole 2K+ -> ON.
+    IMPORTANT: width/height = the image's size (aligned on 16) are passed. Otherwise
+    Qwen-Image img2img falls back to its default (height = default_sample_size *
+    vae_scale_factor = 1024) and RESIZES the input to 1024x1024 -> the ratio is crushed (a
+    bug). Forcing the input's dimensions preserves the original ratio in upscale/img2img."""
     w = round_to_multiple(image.width, 16)
     h = round_to_multiple(image.height, 16)
-    # Deux tentatives maxi: garde VRAM au 1er step (cf. generate), puis retry en 'model'.
+    # Two attempts at most: the VRAM guard at the first step (see generate), then a retry in 'model'.
     for _attempt in (0, 1):
         _set_slicing(pipe, max(image.size))   # a reposer sur le pipe recharge du retry
         out = _qwen_call(
@@ -3232,12 +3284,12 @@ def _refine_whole(pipe, image, denoise, steps, prompt, seed):
         ).images[0]
         if not _consume_vram_downgrade():
             return out
-        pipe = get_pipe("img2img")   # recharge avec l'offload retrograde
+        pipe = get_pipe("img2img")   # reload with the downgraded offload
     return out
 
 
 def _feather_mask_np(th, tw, overlap, left, right, top, bottom):
-    """Masque (th, tw, 1) a rampe lineaire sur les bords qui jouxtent une autre tuile."""
+    """A (th, tw, 1) mask with a linear ramp on the edges that adjoin another tile."""
     mask = np.ones((th, tw, 1), dtype=np.float32)
     f = int(overlap)
     if f > 0:
@@ -3254,20 +3306,22 @@ def _feather_mask_np(th, tw, overlap, left, right, top, bottom):
 
 
 def _refine_tiled(pipe, image, denoise, steps, prompt, seed, tile, overlap):
-    """Passe Z-Image en tuiles avec recomposition feather (facon Ultimate SD Upscale).
-    Plafonne le pic VRAM (une tuile a la fois) et permet le 4K+ sans coutures.
-    Memes rampe lineaire + overlap-add que esrgan_upscale, mais a scale 1 sur PIL."""
+    """A Z-Image pass in tiles with feathered recomposition (Ultimate SD Upscale style).
+    Caps the VRAM peak (one tile at a time) and makes 4K+ possible without seams.
+    The same linear ramp + overlap-add as esrgan_upscale, but at scale 1 on PIL."""
     w, h = image.size
-    tile = round_to_multiple(tile)                       # multiple de 16 pour le VAE
+    tile = round_to_multiple(tile)                       # a multiple of 16 for the VAE
     overlap = max(0, min(int(overlap), tile - 16))
     if w <= tile and h <= tile:
-        # Une seule tuile = image entiere -> pas de duplication possible: denoise demande.
+        # A single tile = the whole image -> no duplication possible: the requested
+        # denoise.
         return _refine_whole(pipe, image, denoise, steps, prompt, seed)
-    # Anti-duplication 1: prompt vide par tuile (le prompt global decrit toute la compo).
+    # Anti-duplication 1: an empty prompt per tile (the global prompt describes the
+    # whole composition).
     prompt = _tile_prompt(prompt)
     if not (prompt or "").strip():
         _log("refine tiled: empty prompt per tile (anti-duplication; rule refine_tile_prompt).")
-    # Anti-duplication 2 (filet): a fort denoise chaque tuile peut encore deriver.
+    # Anti-duplication 2 (a safety net): at a high denoise each tile can still drift.
     denoise = float(denoise)
     if _TILE_DENOISE_CAP > 0 and denoise > _TILE_DENOISE_CAP:
         _log(f"refine tiled: denoise {denoise:.2f} > plafond {_TILE_DENOISE_CAP:.2f} -> "
@@ -3309,20 +3363,21 @@ def _refine_tiled(pipe, image, denoise, steps, prompt, seed, tile, overlap):
 
 
 # ----------------------------------------------------------------------------
-# Orchestration : process_one, batch txt2img (run/_gen_meta restent dans app.py
-# car run emet des gr.Error pour l'UI).
+# Orchestration: process_one, the txt2img batch (run/_gen_meta stay in app.py because
+# run emits gr.Error for the UI).
 # ----------------------------------------------------------------------------
 @_gpu_serial
 def process_one(image, esrgan_model, factor, denoise, steps, prompt, seed, tile, overlap,
                 refine_tile=DEFAULT_REFINE_TILE, refine_overlap=DEFAULT_REFINE_OVERLAP,
                 do_esrgan=True, refine_first=False, apply_force_ratio=False):
-    """Pipeline sur une PIL Image, renvoie (image, timings_dict).
-    do_esrgan=False -> img2img pur (saute l'etage ESRGAN, refine sur l'image native).
-    refine_first=True -> refine PUIS ESRGAN (la diffusion tourne a la resolution
-    native = bien plus rapide), au lieu de ESRGAN PUIS refine (detail en haute-def).
-    apply_force_ratio=True + FORCE_RATIO defini -> amene l'ENTREE au ratio choisi avant
-    traitement: FORCE_RATIO_MODE 'crop' = recadrage centre (facon Fooocus), 'extend' =
-    outpaint des bandes manquantes (rien n'est perdu). Sinon: ratio natif preserve."""
+    """Pipeline over one PIL Image, returns (image, timings_dict).
+    do_esrgan=False -> pure img2img (skips the ESRGAN stage, refines the native image).
+    refine_first=True -> refine THEN ESRGAN (the diffusion runs at the native resolution =
+    far faster), instead of ESRGAN THEN refine (detail at high resolution).
+    apply_force_ratio=True + FORCE_RATIO set -> brings the INPUT to the chosen ratio before
+    processing: FORCE_RATIO_MODE 'crop' = a center crop (Fooocus-style), 'extend' =
+    outpaints the missing bands (nothing is lost). Otherwise: the native ratio is preserved.
+"""
     timings = {"esrgan": 0.0, "refine": 0.0}
     image = image.convert("RGB")
     if apply_force_ratio and FORCE_RATIO:
@@ -3330,8 +3385,8 @@ def process_one(image, esrgan_model, factor, denoise, steps, prompt, seed, tile,
         if r:
             _before = image.size
             if FORCE_RATIO_MODE == "extend":
-                # max(6, steps): l'outpaint des bandes reste correct meme si l'upscale
-                # tourne en pur ESRGAN (steps/denoise a ~0).
+                # max(6, steps): outpainting the bands stays correct even when the
+                # upscale runs as pure ESRGAN (steps/denoise at ~0).
                 image = _extend_to_ratio(image, r[0], r[1], prompt, max(6, int(steps)), seed)
                 _verb = "extend (outpaint)"
             else:
@@ -3353,7 +3408,7 @@ def process_one(image, esrgan_model, factor, denoise, steps, prompt, seed, tile,
         model = load_esrgan(esrgan_model)
         _log(f"ESRGAN upscale: {iw}x{ih} (tile {int(tile)}) ...")
         up = esrgan_upscale(img, model, int(tile), int(overlap))
-        # Cible = facteur applique a la taille d'origine (independant de l'ordre).
+        # The target = the factor applied to the original size (order-independent).
         target_w = round_to_multiple(w0 * factor)
         target_h = round_to_multiple(h0 * factor)
         up = up.resize((target_w, target_h), Image.LANCZOS)
@@ -3366,7 +3421,7 @@ def process_one(image, esrgan_model, factor, denoise, steps, prompt, seed, tile,
         pipe = load_pipe()
         rw, rh = img.size
         rt = int(refine_tile)
-        # Garde-fou anti-crash: refine whole-image trop grand (4K+) -> auto-tuilage.
+        # Anti-crash guard rail: a whole-image refine that is too large (4K+) -> auto-tiling.
         if rt <= 0 and max(rw, rh) > _AUTO_TILE_ABOVE:
             rt = _pick_refine_tile(rw, rh, int(refine_overlap) or 64)
             _log(f"refine: image {rw}x{rh} > {_AUTO_TILE_ABOVE}px -> auto-tiling (tile {rt}) "
@@ -3384,13 +3439,13 @@ def process_one(image, esrgan_model, factor, denoise, steps, prompt, seed, tile,
 
     result = image
     if refine_first:
-        # refine sur l'image native (rapide) puis agrandissement ESRGAN.
+        # refine on the native image (fast) then the ESRGAN enlargement.
         if do_refine:
             result = _refine_stage(result)
         if use_esrgan:
             result = _esrgan_stage(result)
     else:
-        # ordre classique: ESRGAN (detailleur) puis refine a la resolution agrandie.
+        # the classic order: ESRGAN (the detailer) then refine at the enlarged resolution.
         if use_esrgan:
             result = _esrgan_stage(result)
         if do_refine:
@@ -3414,8 +3469,8 @@ def txt2img_run(prompt, width, height, gen_steps, seed, negative_prompt="",
                 tile=DEFAULT_TILE, overlap=DEFAULT_OVERLAP,
                 refine_tile=DEFAULT_REFINE_TILE, refine_overlap=DEFAULT_REFINE_OVERLAP,
                 refine_first=False):
-    """Genere une image (txt2img Z-Image) puis, si upscale=True, la passe dans le
-    pipeline ESRGAN + refine. Renvoie (image, timings_dict)."""
+    """Generates an image (Z-Image txt2img) then, when upscale=True, runs it through the
+    ESRGAN + refine pipeline. Returns (image, timings_dict)."""
     timings = {"txt2img": 0.0, "esrgan": 0.0, "refine": 0.0}
     t0 = time.time()
     base = generate(prompt, width, height, gen_steps, seed, negative_prompt)
@@ -3432,7 +3487,7 @@ def txt2img_run(prompt, width, height, gen_steps, seed, negative_prompt="",
 
 def _gen_meta(mode, prompt, negative="", seed=None, steps=None, guidance=None,
               size=None, model=None, styles=None, extra=None):
-    """Construit le dict de metadonnees de generation (pour sidecar/PNG)."""
+    """Builds the generation metadata dict (for the sidecar/PNG)."""
     m = {"app": "crispz-qwen-edit", "mode": mode, "prompt": prompt or "",
          "negative": negative or "", "date": _now_stamp()}
     if seed is not None and int(seed) >= 0:
@@ -3443,16 +3498,17 @@ def _gen_meta(mode, prompt, negative="", seed=None, steps=None, guidance=None,
         m["guidance"] = float(guidance)
     if size:
         m["size"] = f"{size[0]}x{size[1]}"
-    # Noms de styles appliques (en plus des mots-cles deja injectes dans le prompt).
+    # Names of the applied styles (on top of the keywords already injected into the
+    # prompt).
     _styles = [s for s in (styles or []) if s and s not in ("None", "none")]
     if _styles:
         m["styles"] = _styles
     m["sampler"] = f"{SAMPLER}/{SCHEDULE}"
     m["model"] = model or (ZIMAGE_TRANSFORMER or BASE_REPO)
-    # Encodeur de remplacement: celui qui a REELLEMENT tourne, par son nom de dossier.
-    # Une edition ('omni') sort du pipe d'edition, charge a part: il a son propre etat.
-    # Demande mais ecarte au chargement = l'image vient de l'encodeur du repo, et on
-    # nomme a part celui qui n'a pas servi.
+    # A replacement encoder: the one that REALLY ran, by its folder name.
+    # An edit ('omni') comes out of the edit pipe, which is loaded separately: it has its own
+    # state. Requested but dropped at load time = the image comes from the repo's encoder,
+    # and the one that did not serve is named separately.
     _te = _TEXT_ENCODER_ACTIVE_EDIT if mode == "omni" else _TEXT_ENCODER_ACTIVE
     if _te:
         m["text_encoder"] = _encoder_label(_te)
