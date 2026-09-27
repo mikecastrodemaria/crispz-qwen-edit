@@ -1,21 +1,22 @@
-"""Une edition doit etre encodee AVEC son image.
+"""An edit must be encoded WITH its image.
 
-QwenImageEditPlusPipeline.encode_prompt(prompt, image) prefixe le prompt des jetons de
-vision de l'image ('Picture 1: <|vision_start|><|image_pad|><|vision_end|>') et
-l'encodeur Qwen2.5-VL lit l'image avec l'instruction. __call__ saute son propre
-encodage des qu'on lui passe prompt_embeds. Or le cache d'embeddings (736e0ce)
-appelait encode_prompt SANS image: chaque edition tournait sur un embedding texte
-seul -- le transformer recevait bien les latents de l'image, l'encodeur jamais.
+QwenImageEditPlusPipeline.encode_prompt(prompt, image) prefixes the prompt with the image's
+vision tokens ('Picture 1: <|vision_start|><|image_pad|><|vision_end|>') and
+the Qwen2.5-VL encoder reads the image along with the instruction. __call__ skips its own
+encoding as soon as it is passed prompt_embeds. And yet the embeddings cache (736e0ce)
+called encode_prompt WITHOUT the image: every edit ran on a text-only
+embedding -- the transformer did receive the image's latents, the encoder never did.
 
-Regle: le cache est court-circuite quand l'appel porte une image ET que encode_prompt
-du pipeline a un parametre `image`. img2img / inpaint recoivent aussi `image` (image de
-depart) mais leur encode_prompt n'en a pas: ils gardent le cache, et le detailer son
+The rule: the cache is short-circuited when the call carries an image AND the pipeline's
+encode_prompt has an `image` parameter. img2img / inpaint also receive `image` (the
+starting image) but their encode_prompt has none: they keep the cache, and the detailer its
 gain.
 
-Pipelines factices; les signatures des vraies classes diffusers sont lues sans charger
-le moindre poids.
+Dummy pipelines; the signatures of the real diffusers classes are read without loading
+a single weight.
 
 Run:  .venv/Scripts/python tests/test_edit_prompt_image.py
+
 """
 import os
 import sys
@@ -28,7 +29,7 @@ import cz_pipeline as P
 
 
 class _Pipe:
-    """Compte les encodages et retient ce que __call__ a recu."""
+    """Counts the encodings and remembers what __call__ received."""
 
     _execution_device = "cpu"
 
@@ -43,7 +44,7 @@ class _Pipe:
 
 
 class EditPipe(_Pipe):
-    """encode_prompt prend l'image, comme QwenImageEdit(Plus)Pipeline."""
+    """encode_prompt takes the image, like QwenImageEdit(Plus)Pipeline."""
 
     def encode_prompt(self, prompt, image=None, device=None):
         self.encodes.append(image)
@@ -51,7 +52,7 @@ class EditPipe(_Pipe):
 
 
 class Img2ImgPipe(_Pipe):
-    """encode_prompt sans image, comme QwenImageImg2Img / QwenImageInpaint."""
+    """encode_prompt with no image, like QwenImageImg2Img / QwenImageInpaint."""
 
     def encode_prompt(self, prompt, device=None):
         self.encodes.append(None)
@@ -60,7 +61,7 @@ class Img2ImgPipe(_Pipe):
 
 def _fresh():
     P._embed_cache_clear()
-    P._EMBED_CACHE_MAX = 8                      # config.txt peut l'avoir coupe
+    P._EMBED_CACHE_MAX = 8                      # config.txt may have cut it down
 
 
 def test_an_edit_is_encoded_with_its_image():
@@ -86,7 +87,7 @@ def test_a_multi_reference_edit_too():
 
 
 def test_img2img_and_inpaint_keep_the_cache():
-    """Leur `image` est l'image de depart, pas une entree de l'encodeur."""
+    """Their `image` is the starting image, not an input of the encoder."""
     _fresh()
     pipe = Img2ImgPipe()
     for _ in range(3):
@@ -99,7 +100,7 @@ def test_img2img_and_inpaint_keep_the_cache():
 
 
 def test_without_an_image_the_edit_pipe_may_use_the_cache():
-    """Sans image, l'encodage EST texte seul: le reutiliser est juste."""
+    """With no image, the encoding IS text-only: reusing it is right."""
     _fresh()
     pipe = EditPipe()
     P._qwen_call(pipe, prompt="p")
@@ -109,7 +110,7 @@ def test_without_an_image_the_edit_pipe_may_use_the_cache():
 
 
 def test_the_installed_diffusers_signatures():
-    """La regle repose sur la signature: on la verifie sur les vraies classes."""
+    """The rule rests on the signature: we check it on the real classes."""
     from diffusers import (QwenImageEditPipeline, QwenImageEditPlusPipeline,
                            QwenImageImg2ImgPipeline, QwenImageInpaintPipeline,
                            QwenImagePipeline)

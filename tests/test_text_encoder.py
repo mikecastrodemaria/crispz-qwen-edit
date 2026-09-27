@@ -1,28 +1,29 @@
-"""Encodeur texte de remplacement (Models > Checkpoints > Text encoder).
+"""A replacement text encoder (Models > Checkpoints > Text encoder).
 
-Qwen-Image lit le DERNIER etat cache de l'encodeur Qwen2.5-VL-7B dans txt_norm +
-txt_in, larges de 3584: un autre encodeur ne se branche que s'il a la meme famille
-(qwen2_5_vl -- le pipe d'edition lui montre l'image), la meme largeur et le meme
-nombre de couches. Un Qwen2.5-VL-7B "abliterated" convient; un 3B (2048 de large) ne
-peut pas marcher, et le refus doit le dire AVANT de lire 16 Go.
+Qwen-Image reads the LAST hidden state of the Qwen2.5-VL-7B encoder in txt_norm +
+txt_in, 3584 wide: another encoder only plugs in when it has the same family
+(qwen2_5_vl -- the edit pipe shows it the image), the same width and the same
+number of layers. A Qwen2.5-VL-7B "abliterated" suits; a 3B (2048 wide) cannot
+work, and the refusal must say so BEFORE reading 16 GB.
 
-L'option vaut pour les DEUX pipes: le base (QwenImagePipeline, partage par img2img et
-inpaint via from_pipe) et le pipe d'edition (_load_omni), compare a SON propre repo.
+The option holds for BOTH pipes: the base one (QwenImagePipeline, shared by img2img and
+inpaint through from_pipe) and the edit pipe (_load_omni), compared with ITS own repo.
 
-Ces tests verrouillent aussi ce qui rendrait l'option dangereuse en silence:
-  - un changement d'encodeur libere les deux pipes et vide le cache d'embeddings, et
-    l'encodeur fait partie de la CLE du cache -- id(enc) seul ne suffit pas, CPython
-    recycle les id d'objets liberes;
-  - un encodeur qui ne convient pas, ou qui plante au chargement, est ecarte: le pipe
-    tourne avec celui de son repo, la generation ne tombe jamais;
-  - les metadonnees nomment l'encodeur qui a REELLEMENT tourne (celui du pipe
-    d'edition pour une edition), par son nom de dossier et jamais par son chemin;
-  - la file garde l'encodeur du job.
+These tests also lock down what would make the option silently dangerous:
+  - a change of encoder frees both pipes and empties the embeddings cache, and
+    the encoder is part of the cache KEY -- id(enc) alone is not enough, CPython
+    recycles the ids of freed objects;
+  - an encoder that does not suit, or that crashes at load time, is discarded: the pipe
+    runs with its repo's, the generation never falls;
+  - the metadata names the encoder that REALLY ran (the edit pipe's
+    for an edit), by its folder name and never by its path;
+  - the queue keeps the job's encoder.
 
-Aucun modele n'est charge: configs ecrites en dossier temporaire, pipelines factices,
-lecteur de config du repo de base remplace (pas de reseau).
+No model is loaded: configs written into a temporary folder, dummy pipelines,
+the base repo's config reader stubbed (no network).
 
 Run:  .venv/Scripts/python tests/test_text_encoder.py
+
 """
 import json
 import os
@@ -37,8 +38,8 @@ import torch
 import cz_imageio
 import cz_pipeline as P
 
-# Qwen2.5-VL-7B tel que range dans Qwen/Qwen-Image/text_encoder: largeur et couches au
-# premier niveau ET sous text_config (transformers >= 4.53).
+# A Qwen2.5-VL-7B as kept in Qwen/Qwen-Image/text_encoder: the width and the layers at the
+# first level AND under text_config (transformers >= 4.53).
 QWEN_VL_7B = {"model_type": "qwen2_5_vl", "hidden_size": 3584, "num_hidden_layers": 28,
               "architectures": ["Qwen2_5_VLForConditionalGeneration"],
               "text_config": {"model_type": "qwen2_5_vl_text", "hidden_size": 3584,
@@ -58,8 +59,8 @@ def _folder(cfg, sub=None, name="enc"):
 
 
 class _Base:
-    """Remplace la config de l'encodeur du repo de base (pas de reseau, pas de HF) et
-    retient pour quel repo elle a ete demandee."""
+    """Replaces the base repo's encoder config (no network, no HF) and
+    remembers which repo it was asked for."""
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -79,8 +80,8 @@ class _Base:
 
 
 class _Patch:
-    """Pose des attributs le temps d'un test puis remet les anciens (ou les retire
-    s'ils n'existaient pas: modules diffusers / huggingface_hub a import paresseux)."""
+    """Sets attributes for the length of a test then puts the old ones back (or removes
+    them when they did not exist: diffusers / huggingface_hub modules with a lazy import)."""
 
     def __init__(self, *triples):
         self.triples = triples
@@ -102,8 +103,8 @@ class _Patch:
 
 
 class _FakePipe:
-    """Pipeline diffusers factice: retient ce que from_pretrained / le constructeur ont
-    recu. scheduler=None: _ensure_base n'a aucune config de scheduler a capturer."""
+    """A dummy diffusers pipeline: it remembers what from_pretrained / the constructor
+    received. scheduler=None: _ensure_base has no scheduler config to capture."""
 
     def __init__(self, **kw):
         self.kw = kw
@@ -127,9 +128,9 @@ def _boom(src, base=None):
 def test_same_architecture_is_accepted():
     with _Base(QWEN_VL_7B):
         assert P._text_encoder_problem(_folder(QWEN_VL_7B)) is None
-        # poids dans un sous-dossier text_encoder/ (copie d'un repo diffusers)
+        # weights in a text_encoder/ subfolder (a copy of a diffusers repo)
         assert P._text_encoder_problem(_folder(QWEN_VL_7B, "text_encoder")) is None
-        # config recente: la partie texte seulement sous text_config
+        # a recent config: the text part only, under text_config
         nested = {"model_type": "qwen2_5_vl",
                   "text_config": {"hidden_size": 3584, "num_hidden_layers": 28}}
         assert P._text_encoder_problem(_folder(nested)) is None
@@ -151,13 +152,13 @@ def test_a_narrower_encoder_is_refused_with_both_widths():
     with _Base(QWEN_VL_7B):
         why = P._text_encoder_problem(_folder(QWEN_VL_3B))
     assert why and "2048" in why and "3584" in why, why
-    assert "FLUX" not in why, why                     # pas d'indice herite de klein
+    assert "FLUX" not in why, why                     # no index inherited from klein
     print("OK test_a_narrower_encoder_is_refused_with_both_widths")
 
 
 def test_other_family_and_layer_count_are_refused():
     with _Base(QWEN_VL_7B):
-        # Qwen2.5-7B texte seul: meme largeur, meme profondeur, mais aucune vision
+        # a text-only Qwen2.5-7B: the same width, the same depth, but no vision at all
         why = P._text_encoder_problem(_folder({"model_type": "qwen2", "hidden_size": 3584,
                                                "num_hidden_layers": 28}))
         assert why and "'qwen2'" in why and "'qwen2_5_vl'" in why, why
@@ -207,7 +208,7 @@ def test_changing_the_encoder_frees_both_pipes_and_the_cache():
         assert "omni" not in P._DERIVED, "le pipe d'edition garderait l'ancien encodeur"
         assert not P._EMBED_CACHE, "les anciens encodages resteraient servis"
         assert P._TEXT_ENCODER_ACTIVE == "" and P._TEXT_ENCODER_ACTIVE_EDIT == ""
-        # meme valeur: rien ne bouge, pas de rechargement inutile
+        # the same value: nothing moves, no pointless reload
         sentinel = P._BASE_PIPE = object()
         P.set_text_encoder(r"D:\enc\qwen25vl-abl")
         assert P._BASE_PIPE is sentinel
@@ -230,11 +231,11 @@ class _EncPipe:
 
 
 def test_the_embed_key_carries_the_encoder():
-    """Meme prompt, meme objet pipe, deux encodeurs: deux encodages."""
+    """The same prompt, the same pipe object, two encoders: two encodings."""
     P._embed_cache_clear()
     old = (P._TEXT_ENCODER_ACTIVE, P._EMBED_CACHE_MAX)
     try:
-        P._EMBED_CACHE_MAX = 8                 # config.txt peut l'avoir coupe
+        P._EMBED_CACHE_MAX = 8                 # config.txt may have cut it down
         pipe = _EncPipe()
         P._TEXT_ENCODER_ACTIVE = ""
         P._cached_prompt_embeds(pipe, "p", {})
@@ -259,15 +260,15 @@ def test_metadata_names_the_encoder_that_ran_and_never_its_path():
         m = P._gen_meta("txt2img", "p")
         assert m["text_encoder"] == name, m
         assert "someone" not in json.dumps(m), "chemin local dans les metadonnees"
-        # une edition vient du pipe d'edition, charge a part: lui l'a ecarte
+        # an edit comes from the edit pipe, loaded apart: that one discarded it
         m = P._gen_meta("omni", "p")
         assert "text_encoder" not in m and m["text_encoder_not_applied"] == name, m
-        # l'inverse: onglet Edit seul, le base n'a jamais tourne avec
+        # the other way round: the Edit tab alone, the base never ran with it
         P._TEXT_ENCODER_ACTIVE, P._TEXT_ENCODER_ACTIVE_EDIT = "", path
         assert P._gen_meta("omni", "p")["text_encoder"] == name
         m = P._gen_meta("txt2img", "p")
         assert "text_encoder" not in m and m["text_encoder_not_applied"] == name, m
-        # rien de demande: rien d'ecrit
+        # nothing asked for: nothing written
         P.TEXT_ENCODER = P._TEXT_ENCODER_ACTIVE_EDIT = ""
         for mode in ("txt2img", "omni"):
             m = P._gen_meta(mode, "p")
@@ -310,8 +311,8 @@ def test_the_base_pipe_gets_the_encoder_or_falls_back():
         return "ENC"
     P.free_vram()
     try:
-        # DEVICE force a cpu: sous Windows, CUDA_VISIBLE_DEVICES vide ne cache pas le GPU
-        # (-1 le fait) -- ce test ne doit prendre aucun chemin CUDA quoi qu'il arrive.
+        # DEVICE forced to cpu: under Windows, an empty CUDA_VISIBLE_DEVICES does not hide the GPU
+        # (-1 does) -- this test must take no CUDA path whatever happens.
         with _Patch((diffusers, "QwenImagePipeline", _FakePipe), (P, "DEVICE", "cpu"),
                     (P, "BASE_REPO", "fake/qwen-image"), (P, "ZIMAGE_TRANSFORMER", None),
                     (P, "LORAS", []), (P, "_BASE_SCHED_CONFIG", None),
@@ -323,12 +324,12 @@ def test_the_base_pipe_gets_the_encoder_or_falls_back():
             assert P._TEXT_ENCODER_ACTIVE == enc
             assert base.asked == ["fake/qwen-image"], base.asked
             assert loads == [(enc, "fake/qwen-image")], loads
-            # ne convient plus au repo: ecarte, l'encodeur du repo tourne
+            # it no longer suits the repo: discarded, the repo's encoder runs
             P.free_vram()
             base.cfg = QWEN_VL_3B
             pipe = P._ensure_base()
             assert "text_encoder" not in pipe.kw and P._TEXT_ENCODER_ACTIVE == "", pipe.kw
-            # plante au chargement: meme repli, la generation ne tombe pas
+            # it crashes at load time: the same fallback, the generation does not fall
             P.free_vram()
             base.cfg = QWEN_VL_7B
             P._load_text_encoder = _boom
@@ -346,7 +347,7 @@ def test_the_edit_pipe_gets_it_too_checked_against_its_own_repo():
     tmp = tempfile.mkdtemp(prefix="omni_")
     gguf = os.path.join(tmp, "qwen-image-edit-2511-Q4_K_M.gguf")
     open(gguf, "wb").close()
-    # composants du repo d'edition: une classe factice qui note ce qu'on lui demande
+    # the edit repo's components: a dummy class that notes what it is asked for
     fetched = []
 
     class Comp:
@@ -375,7 +376,7 @@ def test_the_edit_pipe_gets_it_too_checked_against_its_own_repo():
                     (P, "_load_transformer", lambda path=None, base=None: "TF"),
                     (P, "_load_text_encoder", fake_load),
                     (P, "OMNI_MODEL", gguf), (P, "TEXT_ENCODER", enc)), _Base(QWEN_VL_7B) as base:
-            # 1) transformer single-file: pipe monte composant par composant
+            # 1) a single-file transformer: the pipe built component by component
             pipe = P._load_omni()
             assert pipe.kw["text_encoder"] == "ENC", pipe.kw
             assert "text_encoder" not in fetched, "l'encodeur du repo aurait ete lu pour rien"
@@ -383,14 +384,14 @@ def test_the_edit_pipe_gets_it_too_checked_against_its_own_repo():
             assert pipe.kw["processor"] == "processor@fake/edit-base", pipe.kw
             assert base.asked == ["fake/edit-base"] and loads == ["fake/edit-base"]
             assert P._TEXT_ENCODER_ACTIVE_EDIT == enc and P._TEXT_ENCODER_ACTIVE == ""
-            # ne convient pas au repo d'edition: il garde le sien
+            # it does not suit the edit repo: it keeps its own
             P.free_vram()
             fetched.clear()
             base.cfg = QWEN_VL_3B
             pipe = P._load_omni()
             assert pipe.kw["text_encoder"] == "text_encoder@fake/edit-base", pipe.kw
             assert P._TEXT_ENCODER_ACTIVE_EDIT == ""
-            # 2) repo d'edition complet: text_encoder= dans from_pretrained, compare a CE repo
+            # 2) the complete edit repo: text_encoder= in from_pretrained, compared with THAT repo
             P.free_vram()
             base.cfg, base.asked[:], loads[:] = QWEN_VL_7B, [], []
             P.OMNI_MODEL = "fake/Qwen-Image-Edit-2509"
@@ -399,7 +400,7 @@ def test_the_edit_pipe_gets_it_too_checked_against_its_own_repo():
             assert pipe.kw.get("text_encoder") == "ENC", pipe.kw
             assert base.asked == ["fake/Qwen-Image-Edit-2509"], base.asked
             assert P._TEXT_ENCODER_ACTIVE_EDIT == enc
-            # plante au chargement: le repo complet charge son propre encodeur
+            # it crashes at load time: the complete repo loads its own encoder
             P.free_vram()
             P._load_text_encoder = _boom
             pipe = P._load_omni()
@@ -432,7 +433,7 @@ def test_the_ui_saves_only_a_valid_choice():
         saves.clear()
         U._ui_set_text_encoder("")
         assert calls == [""] and saves == [{"text_encoder": ""}], (saves, calls)
-        # une valeur collee (repo HF) reste proposee dans le dropdown
+        # a pasted value (an HF repo) stays offered in the dropdown
         P.TEXT_ENCODER = "owner/qwen25vl-abl"
         assert ("owner/qwen25vl-abl", "owner/qwen25vl-abl") in U._te_choices()
     print("OK test_the_ui_saves_only_a_valid_choice")
@@ -449,7 +450,7 @@ def test_the_queue_keeps_the_encoder():
         P.set_text_encoder = lambda s: calls.append(s)
         U._q_restore_model_state(ms)
         assert calls == [r"D:\enc\qwen25vl-abl"], calls
-        # snapshot d'avant l'option: on ne touche pas a l'encodeur courant
+        # a snapshot from before the option: we do not touch the current encoder
         calls.clear()
         U._q_restore_model_state({k: v for k, v in ms.items() if k != "text_encoder"})
         assert calls == [], calls
@@ -460,8 +461,8 @@ def test_the_queue_keeps_the_encoder():
 
 
 def test_default_picked_in_the_ui_survives_a_restart():
-    """Choisir "Default" ecrit "" dans les preferences: au redemarrage, une valeur de
-    config.txt ne doit pas revenir par-dessus. L'environnement gagne toujours."""
+    """Choosing "Default" writes "" into the preferences: on a restart, a value from
+    config.txt must not come back over it. The environment always wins."""
     cfg = {"text_encoder": r"D:\enc\from-config"}
     assert P._resolve_text_encoder({}, {}, cfg) == r"D:\enc\from-config"
     assert P._resolve_text_encoder({}, {"text_encoder": ""}, cfg) == ""
@@ -472,8 +473,8 @@ def test_default_picked_in_the_ui_survives_a_restart():
 
 
 def test_compatible_encoders_in_the_hf_cache_are_listed():
-    """Un encodeur telecharge depuis HF vit dans le cache HF: la liste doit le montrer.
-    Pas un pipeline diffusers, pas une config sans poids; une autre taille est nommee a cote."""
+    """An encoder downloaded from HF lives in the HF cache: the list must show it.
+    Not a diffusers pipeline, not a config with no weights; another size is named next to it."""
     import json as _json
     import os as _os
     import tempfile as _tempfile
