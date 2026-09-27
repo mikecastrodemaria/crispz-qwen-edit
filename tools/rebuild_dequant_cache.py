@@ -1,27 +1,28 @@
-"""Pre-remplit le cache de dequantification (cache/dequant) pour TOUS les checkpoints
-FP8/INT8 des dossiers de modeles, pour ne pas payer la conversion a la premiere
-utilisation (elle bloque alors l'UI plusieurs minutes en plein travail).
+"""Pre-fills the dequantisation cache (cache/dequant) for ALL the FP8/INT8 checkpoints
+of the model folders, so as not to pay for the conversion on the first use (it then
+blocks the UI for several minutes in the middle of the work).
 
 Usage:
     .venv/Scripts/python tools/rebuild_dequant_cache.py [--list] [--cpu]
-    (ou double-clic sur rebuild_cache.bat a la racine)
+    (or double-click on rebuild_cache.bat at the root)
 
-- REPRISE GRATUITE: un checkpoint deja en cache est saute en une seconde -> relancable
-  a volonte, y compris apres une coupure.
-- --list : montre ce qui serait fait, sans rien convertir.
-- --cpu  : dequantification sans toucher au GPU (par defaut: GPU si present, cf.
-  convert_device). A preferer si un rendu tourne en meme temps.
+- RESUMING IS FREE: a checkpoint already cached is skipped in a second -> re-runnable
+  at will, including after an interruption.
+- --list : shows what would be done, without converting anything.
+- --cpu  : dequantises without touching the GPU (by default: the GPU when there is one,
+  see convert_device). To be preferred when a render is running at the same time.
 
-Ne concerne QUE les .safetensors FP8/INT8:
-  - .gguf          -> reste quantifie en VRAM, aucune dequantification a cacher;
-  - bf16/fp16      -> rien a dequantifier (un cache serait une copie bf16 -> bf16),
-                      y compris au layout ComfyUI ou seul le prefixe est retire;
-  - LoRA/SVDQuant  -> non chargeables, ignores avec leur raison.
+It concerns ONLY the FP8/INT8 .safetensors:
+  - .gguf          -> stays quantised in VRAM, no dequantisation to cache;
+  - bf16/fp16      -> nothing to dequantise (a cache would be a bf16 -> bf16 copy),
+                      including in the ComfyUI layout where only the prefix is removed;
+  - LoRA/SVDQuant  -> not loadable, skipped with their reason.
 
-Chaque entree pese autant que le build BF16 complet (~38 Go pour un transformer Qwen
-20B): verifie que dequant_cache_max_gb (config.txt) couvre le total, sinon les
-premieres conversions seraient evincees par les dernieres et le cache ne servirait
-a rien. Supprimer cache/dequant est toujours sur (il se reconstruit a la demande).
+Every entry weighs as much as the complete BF16 build (~38 GB for a Qwen 20B
+transformer): check that dequant_cache_max_gb (config.txt) covers the total, otherwise
+the first conversions would be evicted by the last ones and the cache would be of no
+use. Deleting cache/dequant is always safe (it rebuilds itself on demand).
+
 """
 import os
 import sys
@@ -62,7 +63,7 @@ import cz_pipeline as czp  # noqa: E402
 if "--cpu" in sys.argv:
     czp.CONFIG["convert_device"] = "cpu"
 
-# Taille d'une entree = le build BF16 du transformer (mesure: 38.1 Gio pour Qwen 20B).
+# The size of an entry = the transformer's BF16 build (measured: 38.1 GiB for Qwen 20B).
 ENTRY_GB = 38.0
 
 if czp._dequant_cache_dir() is None:

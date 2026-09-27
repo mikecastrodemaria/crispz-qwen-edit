@@ -1,32 +1,33 @@
-"""Registre des LoRA d'EDITION Qwen-Image-Edit (presets "fast lazy load").
+"""The registry of the Qwen-Image-Edit EDIT LoRAs (the "fast lazy load" presets).
 
-Source: github.com/PRITHIVSAKTHIUR/Qwen-Image-Edit-2511-LoRAs-Fast-Lazy-Load
-(ADAPTER_SPECS). Chaque preset = un LoRA Hugging Face entraine pour une tache
-d'edition (photo -> anime, relighting, upscale 2K, angles de camera...). Ils
-n'ont PAS de trigger word: l'instruction en langage naturel suffit
-(`prompt` ci-dessous = exemple de l'upstream).
+The source: github.com/PRITHIVSAKTHIUR/Qwen-Image-Edit-2511-LoRAs-Fast-Lazy-Load
+(ADAPTER_SPECS). Every preset = a Hugging Face LoRA trained for one editing
+task (photo -> anime, relighting, a 2K upscale, camera angles...). They have
+NO trigger word: the natural-language instruction is enough
+(`prompt` below = the upstream example).
 
-Chargement paresseux: rien n'est telecharge a l'import. `resolve(name)` rend
-le chemin local du .safetensors et le telecharge depuis le hub a la premiere
-demande, dans `<LORAS_DIR>/_hf-edit/<adapter_name>.safetensors` (nom ASCII
-stable: plusieurs fichiers upstream ont des noms chinois ou des espaces).
-Une fois sur disque, c'est un LoRA ordinaire: `--lora`, `<lora:...>`,
-`caps.loras` et le dropdown LoRA du base le voient sans code special.
+A lazy loading: nothing is downloaded at import time. `resolve(name)` gives
+the local path of the .safetensors and downloads it from the hub on the first
+request, into `<LORAS_DIR>/_hf-edit/<adapter_name>.safetensors` (a stable
+ASCII name: several upstream files have Chinese names or spaces).
+Once on disk, it is an ordinary LoRA: `--lora`, `<lora:...>`,
+`caps.loras` and the base's LoRA dropdown see it with no special code.
 
-Ces LoRA visent le pipe d'EDITION (cz_pipeline.generate_omni), pas le
-txt2img: cz_pipeline garde un jeu separe (EDIT_LORAS / set_edit_loras).
+Those LoRAs target the EDIT pipe (cz_pipeline.generate_omni), not the
+txt2img: cz_pipeline keeps a separate set (EDIT_LORAS / set_edit_loras).
 
-Surcharge possible dans config.txt:
-    "edit_loras_dir": "",          # dossier des telechargements (defaut <loras_dir>/_hf-edit)
-    "edit_loras": {"Mon-Preset": {"repo": "...", "weights": "x.safetensors",
-                                  "adapter_name": "mon-preset", "prompt": "...",
-                                  "inputs": 1}, "Anime-V2": null}   # null = retire
+Can be overridden in config.txt:
+    "edit_loras_dir": "",          # the downloads' folder (default <loras_dir>/_hf-edit)
+    "edit_loras": {"My-Preset": {"repo": "...", "weights": "x.safetensors",
+                                 "adapter_name": "my-preset", "prompt": "...",
+                                 "inputs": 1}, "Anime-V2": null}   # null = removed
+
 """
 import os
 
 from cz_core import CONFIG, _log, _dbg
 
-# Ordre = ordre du dropdown. inputs = nombre d'images attendu (2 = input + reference).
+# The order = the dropdown's order. inputs = the number of images expected (2 = the input + a reference).
 EDIT_LORA_SPECS = {
     "Multiple-Angles": {
         "repo": "dx8152/Qwen-Edit-2509-Multiple-angles",
@@ -34,7 +35,7 @@ EDIT_LORA_SPECS = {
         "adapter_name": "multiple-angles",
         "prompt": "Rotate the camera 45 degrees to the right.",
         "inputs": 1, "base": "2509",
-        # meme fichier tel que Civitai le nomme (bibliotheques existantes)
+        # the same file as Civitai names it (the existing libraries)
         "local_names": ["Qwen-Edit-2509-Multiple-angles.safetensors"]},
     "Photo-to-Anime": {
         "repo": "autoweeb/Qwen-Image-Edit-2509-Photo-to-Anime",
@@ -153,7 +154,7 @@ SUBDIR = "_hf-edit"
 
 
 def _apply_config_overrides(specs):
-    """config 'edit_loras': dict nom -> spec (ajout/remplacement) ou null (retrait)."""
+    """config 'edit_loras': a dict name -> spec (an addition/replacement) or null (a removal)."""
     extra = CONFIG.get("edit_loras")
     if not isinstance(extra, dict):
         return specs
@@ -176,12 +177,12 @@ SPECS = _apply_config_overrides(EDIT_LORA_SPECS)
 
 
 def names():
-    """Noms des presets, dans l'ordre du registre."""
+    """The presets' names, in the registry's order."""
     return list(SPECS)
 
 
 def spec(name):
-    """Spec d'un preset (None si inconnu). Tolere l'adapter_name et la casse."""
+    """A preset's spec (None when unknown). It tolerates the adapter_name and the case."""
     if not name:
         return None
     if name in SPECS:
@@ -194,7 +195,7 @@ def spec(name):
 
 
 def canonical_name(name):
-    """Nom du registre pour un nom/adapter_name (None si inconnu)."""
+    """The registry name for a name/adapter_name (None when unknown)."""
     s = spec(name)
     if s is None:
         return None
@@ -205,13 +206,13 @@ def canonical_name(name):
 
 
 def edit_loras_dir():
-    """Dossier des LoRA d'edition telecharges: config 'edit_loras_dir', sinon
-    <LORAS_DIR>/_hf-edit (LORAS_DIR lu a l'appel: l'UI peut le changer)."""
+    """The folder of the downloaded edit LoRAs: the 'edit_loras_dir' config, otherwise
+    <LORAS_DIR>/_hf-edit (LORAS_DIR read at call time: the UI can change it)."""
     d = (CONFIG.get("edit_loras_dir") or "").strip()
     if d:
         return d
-    # LORAS_DIR SANS importer cz_pipeline (torch): caps du protocole doit rester
-    # leger. Si le pipeline est deja charge (UI), sa valeur courante prime.
+    # LORAS_DIR WITHOUT importing cz_pipeline (torch): the protocol's caps must stay
+    # light. When the pipeline is already loaded (the UI), its current value wins.
     import sys
     cp = sys.modules.get("cz_pipeline")
     base = getattr(cp, "LORAS_DIR", None) if cp is not None else None
@@ -223,7 +224,7 @@ def edit_loras_dir():
 
 
 def local_path(name):
-    """Chemin local attendu du preset (existant ou non)."""
+    """The expected local path of the preset (whether it exists or not)."""
     s = spec(name)
     if s is None:
         return None
@@ -231,14 +232,14 @@ def local_path(name):
 
 
 def _candidates(s):
-    """Noms de fichier sous lesquels un preset peut deja exister dans une bibliotheque."""
+    """The file names under which a preset may already exist in a library."""
     return ([s["adapter_name"] + ".safetensors", os.path.basename(s["weights"])]
             + list(s.get("local_names") or []))
 
 
 def available_path(name, index=None):
-    """Chemin local du preset s'il est deja sur disque (dossier _hf-edit OU une
-    bibliotheque LoRA, ex. copie Civitai), sinon None. Ne telecharge jamais."""
+    """The local path of the preset when it is already on disk (the _hf-edit folder OR a
+    LoRA library, a Civitai copy say), otherwise None. It never downloads."""
     s = spec(name)
     if s is None:
         return None
@@ -253,17 +254,17 @@ def is_downloaded(name, index=None):
 
 
 def resolve(name, download=True, progress=None):
-    """Chemin local du LoRA du preset; le telecharge du hub si absent (et
-    download=True). Leve FileNotFoundError si absent et download=False,
-    RuntimeError si le telechargement echoue."""
+    """The local path of the preset's LoRA; it downloads it from the hub when absent (and
+    download=True). Raises FileNotFoundError when absent and download=False,
+    RuntimeError when the download fails."""
     s = spec(name)
     if s is None:
         raise KeyError(f"unknown edit LoRA preset: {name!r} (known: {', '.join(SPECS)})")
     dst = local_path(name)
     if os.path.isfile(dst):
         return dst
-    # Deja dans une bibliotheque LoRA (principal ou extras, ex. copie Civitai) ?
-    # -> on l'utilise sans rien telecharger.
+    # Already in a LoRA library (the main one or the extras, a Civitai copy say) ?
+    # -> we use it without downloading anything.
     found = find_local(_candidates(s))
     if found:
         _dbg(f"edit LoRA {name}: using existing file {found}")
@@ -274,8 +275,8 @@ def resolve(name, download=True, progress=None):
 
 
 def lora_dirs():
-    """Dossiers LoRA (principal + extras) SANS importer cz_pipeline si absent (torch):
-    memes priorites env > preferences > config que cz_pipeline."""
+    """The LoRA folders (the main one + the extras) WITHOUT importing cz_pipeline when it
+    is absent (torch): the same priorities env > preferences > config as cz_pipeline."""
     import sys
     cp = sys.modules.get("cz_pipeline")
     if cp is not None and hasattr(cp, "_lora_dirs"):
@@ -296,9 +297,9 @@ def lora_dirs():
 
 
 def local_index():
-    """{nom_de_fichier_minuscule: chemin} de tous les .safetensors des dossiers LoRA
-    (principal d'abord: il gagne sur un meme nom). Un seul parcours disque, a passer
-    a find_local / is_downloaded / catalog quand on interroge plusieurs presets."""
+    """{lowercase_file_name: path} of every .safetensors of the LoRA folders (the main one
+    first: it wins on an equal name). A single disk walk, to be passed to find_local /
+    is_downloaded / catalog when several presets are queried."""
     idx = {}
     for d in lora_dirs():
         if not os.path.isdir(d):
@@ -312,8 +313,8 @@ def local_index():
 
 
 def find_local(filenames, index=None):
-    """Premier fichier dont le nom (insensible a la casse) figure dans `filenames`,
-    cherche dans les dossiers LoRA (index = local_index() deja construit). None si absent."""
+    """The first file whose name (case-insensitive) is in `filenames`, looked for in the
+    LoRA folders (index = a local_index() already built). None when absent."""
     if index is None:
         index = local_index()
     for f in filenames:
@@ -324,11 +325,11 @@ def find_local(filenames, index=None):
 
 
 # ----------------------------------------------------------------------------
-# Mode rapide: LoRA Lightning (distillation) pour l'edition, 4 ou 8 steps, CFG off.
-# Le fichier depend de la revision du modele d'edition (2509 / 2511): choisi d'apres
-# le nom du modele omni. Cherche d'abord dans les dossiers LoRA (les bibliotheques
-# Civitai ont souvent deja la 8-steps), sinon telecharge (repo lightx2v, 2509 = gated:
-# un hf_token est necessaire).
+# The fast mode: a Lightning LoRA (distillation) for editing, 4 or 8 steps, CFG off.
+# The file depends on the edit model's revision (2509 / 2511): chosen from the omni
+# model's name. Looked for in the LoRA folders first (the Civitai libraries often have
+# the 8-step one already), otherwise downloaded (the lightx2v repo, 2509 = gated: an
+# hf_token is needed).
 # ----------------------------------------------------------------------------
 AUTO_SPEED = "Auto (model profile)"
 SPEED_SPECS = {
@@ -350,19 +351,19 @@ SPEED_SPECS = {
 
 
 def speed_names():
-    """Choix du dropdown 'Edit speed' (sans 'Off', ajoute par cz_pipeline)."""
+    """The choices of the 'Edit speed' dropdown (without 'Off', added by cz_pipeline)."""
     return [AUTO_SPEED] + list(SPEED_SPECS)
 
 
 def edit_base_revision(omni_model):
-    """'2511' si le modele d'edition est un 2511, sinon '2509' (Plus)."""
+    """'2511' when the edit model is a 2511, otherwise '2509' (Plus)."""
     return "2511" if "2511" in str(omni_model or "") else "2509"
 
 
 def resolve_speed(name, omni_model, download=True):
-    """{"name", "steps", "guidance", "path", "base"} pour un mode Lightning: la LoRA
-    est prise dans les dossiers LoRA si presente, sinon telechargee dans edit_loras_dir.
-    KeyError si le nom est inconnu."""
+    """{"name", "steps", "guidance", "path", "base"} for a Lightning mode: the LoRA is
+    taken from the LoRA folders when present, otherwise downloaded into edit_loras_dir.
+    KeyError when the name is unknown."""
     key = None
     for k in SPEED_SPECS:
         if k.lower() == str(name or "").strip().lower():
@@ -386,7 +387,7 @@ def resolve_speed(name, omni_model, download=True):
 
 
 def _download(s, dst, progress=None):
-    """hf_hub_download -> copie atomique vers dst (nom ASCII stable)."""
+    """hf_hub_download -> an atomic copy to dst (a stable ASCII name)."""
     import shutil
     from huggingface_hub import hf_hub_download
     from cz_core import _apply_hf_token
@@ -409,21 +410,21 @@ def _download(s, dst, progress=None):
 
 
 def status_label(name, index=None):
-    """Libelle pour l'UI: 'Nom ✓' si deja sur disque (dossier _hf-edit ou une
-    bibliotheque LoRA), 'Nom ⬇' sinon."""
+    """The label for the UI: 'Name ✓' when it is on disk already (the _hf-edit folder or a
+    LoRA library), 'Name ⬇' otherwise."""
     return f"{name} {'✓' if is_downloaded(name, index=index) else '⬇'}"
 
 
 def strip_label(label):
-    """Inverse de status_label (le dropdown renvoie le libelle)."""
+    """The inverse of status_label (the dropdown returns the label)."""
     if not label:
         return ""
     return str(label).rstrip(" ✓⬇").strip()
 
 
 def catalog():
-    """Liste legere pour caps / UI: [{name, adapter_name, repo, prompt, inputs,
-    base, downloaded}] - sans rien telecharger."""
+    """A light list for caps / the UI: [{name, adapter_name, repo, prompt, inputs,
+    base, downloaded}] - without downloading anything."""
     idx = local_index()
     return [{"name": n, "adapter_name": s["adapter_name"], "repo": s["repo"],
              "prompt": s.get("prompt", ""), "inputs": int(s.get("inputs", 1)),
