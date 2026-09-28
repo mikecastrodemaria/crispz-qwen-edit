@@ -204,9 +204,9 @@ def test_changing_the_encoder_frees_both_pipes_and_the_cache():
         P._EMBED_CACHE[("k",)] = ("v",)
         P.set_text_encoder(r"D:\enc\qwen25vl-abl")
         assert P.TEXT_ENCODER == r"D:\enc\qwen25vl-abl"
-        assert P._BASE_PIPE is None, "le pipeline doit etre libere"
-        assert "omni" not in P._DERIVED, "le pipe d'edition garderait l'ancien encodeur"
-        assert not P._EMBED_CACHE, "les anciens encodages resteraient servis"
+        assert P._BASE_PIPE is None, "the pipeline must be released"
+        assert "omni" not in P._DERIVED, "the edit pipe would keep the old encoder"
+        assert not P._EMBED_CACHE, "the old encodings would still be served"
         assert P._TEXT_ENCODER_ACTIVE == "" and P._TEXT_ENCODER_ACTIVE_EDIT == ""
         # the same value: nothing moves, no pointless reload
         sentinel = P._BASE_PIPE = object()
@@ -243,7 +243,7 @@ def test_the_embed_key_carries_the_encoder():
         assert pipe.n == 1, pipe.n
         P._TEXT_ENCODER_ACTIVE = r"D:\enc\qwen25vl-abl"
         P._cached_prompt_embeds(pipe, "p", {})
-        assert pipe.n == 2, "un encodage de l'autre encodeur a ete resservi"
+        assert pipe.n == 2, "an encoding from the other encoder was served again"
     finally:
         P._TEXT_ENCODER_ACTIVE, P._EMBED_CACHE_MAX = old
         P._embed_cache_clear()
@@ -259,7 +259,7 @@ def test_metadata_names_the_encoder_that_ran_and_never_its_path():
         P._TEXT_ENCODER_ACTIVE_EDIT = ""
         m = P._gen_meta("txt2img", "p")
         assert m["text_encoder"] == name, m
-        assert "someone" not in json.dumps(m), "chemin local dans les metadonnees"
+        assert "someone" not in json.dumps(m), "a local path in the metadata"
         # an edit comes from the edit pipe, loaded apart: that one discarded it
         m = P._gen_meta("omni", "p")
         assert "text_encoder" not in m and m["text_encoder_not_applied"] == name, m
@@ -379,7 +379,7 @@ def test_the_edit_pipe_gets_it_too_checked_against_its_own_repo():
             # 1) a single-file transformer: the pipe built component by component
             pipe = P._load_omni()
             assert pipe.kw["text_encoder"] == "ENC", pipe.kw
-            assert "text_encoder" not in fetched, "l'encodeur du repo aurait ete lu pour rien"
+            assert "text_encoder" not in fetched, "the repo's encoder would have been read for nothing"
             assert pipe.kw["tokenizer"] == "tokenizer@fake/edit-base", pipe.kw
             assert pipe.kw["processor"] == "processor@fake/edit-base", pipe.kw
             assert base.asked == ["fake/edit-base"] and loads == ["fake/edit-base"]

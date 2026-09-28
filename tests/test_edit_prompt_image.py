@@ -69,10 +69,10 @@ def test_an_edit_is_encoded_with_its_image():
     pipe = EditPipe()
     for _ in range(2):
         P._qwen_call(pipe, image="REF", prompt="make the car red")
-    assert pipe.encodes == [], "le cache a encode l'instruction sans l'image"
+    assert pipe.encodes == [], "the cache encoded the instruction without the image"
     for kw in pipe.calls:
         assert kw["prompt"] == "make the car red" and kw["image"] == "REF", kw
-        assert not any(k in kw for k in P._EMBED_OUTS), "embeddings texte seul passes"
+        assert not any(k in kw for k in P._EMBED_OUTS), "text-only embeddings were passed"
     assert not P._EMBED_CACHE, P._EMBED_CACHE
     print("OK test_an_edit_is_encoded_with_its_image")
 

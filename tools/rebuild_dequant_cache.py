@@ -67,7 +67,7 @@ if "--cpu" in sys.argv:
 ENTRY_GB = 38.0
 
 if czp._dequant_cache_dir() is None:
-    print("dequant_cache est sur 'off' dans config.txt: rien a pre-remplir.")
+    print("dequant_cache is 'off' in config.txt: nothing to pre-fill.")
     sys.exit(0)
 
 todo, done, skipped = [], [], []
@@ -86,7 +86,7 @@ for d in czp._checkpoint_dirs():
             continue
         dq = czp._safetensors_dequant(p)
         if not dq:
-            skipped.append((f, "bf16/fp16, rien a dequantifier"))
+            skipped.append((f, "bf16/fp16, nothing to dequantise"))
             continue
         cached = czp._dequant_cache_path(p)
         (done if cached and os.path.isfile(cached) else todo).append((p, dq))
@@ -94,25 +94,25 @@ for d in czp._checkpoint_dirs():
 for f, why in skipped:
     print(f"SKIP {f}: {why}")
 for p, dq in done:
-    print(f"DEJA EN CACHE {os.path.basename(p)} ({dq})")
+    print(f"ALREADY CACHED {os.path.basename(p)} ({dq})")
 for p, dq in todo:
-    print(f"A CONVERTIR   {os.path.basename(p)} ({dq})")
+    print(f"TO CONVERT     {os.path.basename(p)} ({dq})")
 
 if not todo and not done:
-    print("\nAucun checkpoint FP8/INT8 trouve dans:", czp._checkpoint_dirs(),
-          f"(filtre --only {ONLY})" if ONLY else "")
+    print("\nNo FP8/INT8 checkpoint found in:", czp._checkpoint_dirs(),
+          f"(--only {ONLY} filter)" if ONLY else "")
     sys.exit(0)
 
 cap = czp.DEQUANT_CACHE_MAX_GB
 need = (len(todo) + len(done)) * ENTRY_GB
-print(f"\n{len(todo) + len(done)} checkpoint(s) a couvrir (~{need:.0f} Go de cache; "
-      f"plafond dequant_cache_max_gb = {cap:.0f} Go"
-      + (", 0 = illimite)" if cap <= 0 else ")"))
+print(f"\n{len(todo) + len(done)} checkpoint(s) to cover (~{need:.0f} GB of cache; "
+      f"dequant_cache_max_gb ceiling = {cap:.0f} GB"
+      + (", 0 = unlimited)" if cap <= 0 else ")"))
 if 0 < cap < need:
-    print(f"ATTENTION: plafond {cap:.0f} Go < ~{need:.0f} Go necessaires -> les "
-          f"premieres conversions seraient evincees par les dernieres et le cache "
-          f"ne servirait a rien.\nMonte dequant_cache_max_gb dans config.txt "
-          f"(>= {need:.0f}) avant de continuer.")
+    print(f"WARNING: a {cap:.0f} GB ceiling < the ~{need:.0f} GB needed -> the first "
+          f"conversions would be evicted by the last ones and the cache would be of "
+          f"no use.\nRaise dequant_cache_max_gb in config.txt "
+          f"(>= {need:.0f}) before going on.")
     if "--list" not in sys.argv:
         sys.exit(1)
 
@@ -131,11 +131,11 @@ for i, (p, dq) in enumerate(todo, 1):
         del sd
         gc.collect()
         ok += 1
-        print(f"[{i}/{len(todo)}] OK {name} en {(time.time() - t0) / 60:.1f} min")
+        print(f"[{i}/{len(todo)}] OK {name} in {(time.time() - t0) / 60:.1f} min")
     except Exception as e:
         fail += 1
         print(f"[{i}/{len(todo)}] FAIL {name}: {type(e).__name__}: {e}")
 
-print(f"\nTermine en {(time.time() - t_all) / 60:.0f} min: {ok} converti(s), "
-      f"{len(done)} deja en cache, {fail} echec(s).")
-print("Relancable a volonte: tout ce qui est fait est saute.")
+print(f"\nDone in {(time.time() - t_all) / 60:.0f} min: {ok} converted, "
+      f"{len(done)} already cached, {fail} failure(s).")
+print("Re-runnable at will: everything already done is skipped.")
