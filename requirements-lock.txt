@@ -40,6 +40,11 @@ transformers==4.57.6
 accelerate==1.14.0
 safetensors==0.8.0
 huggingface-hub==0.36.2
+# hf_xet: the recent HF repos are on Xet Storage; without it, huggingface_hub falls back to
+# plain HTTP (very slow on the big files) and warns on every download. Declared in
+# requirements.txt but missing from this lock, so an ISOLATED install downloaded a 17 GB
+# GGUF the slow way. Same fix as crispz-klein.
+hf_xet==1.6.0
 peft==0.19.1
 sentencepiece==0.2.2
 spandrel==0.4.1
