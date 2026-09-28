@@ -224,7 +224,7 @@ def caps_dict():
             # their `name` in spec.loras on the edit op. `inputs` = 2 ->
             # input + 1 ref (spec.refs). Light listing, nothing is downloaded.
             "edit_loras": _edit_lora_catalog(),
-            # Modes rapides acceptes par spec.fast sur l'op edit.
+            # The fast modes spec.fast accepts on the edit op.
             "edit_fast": ["off", "auto", "lightning-4", "lightning-8"]}
 
 
