@@ -35,23 +35,23 @@ def test_label():
 
 
 def test_move():
-    # _q_move mute la liste IN-PLACE (voulu): _ui_queue_run tient une reference sur
-    # cet objet d'etat, donc un reordonnancement doit lui etre visible. On repart
-    # d'une liste neuve a chaque cas plutot que d'attendre une fonction pure.
+    # _q_move mutates the list IN PLACE (on purpose): _ui_queue_run holds a reference
+    # to that state object, so a reordering has to be visible to it. A fresh list per
+    # case rather than expecting a pure function.
     def fresh():
         return [{"label": "a"}, {"label": "b"}, {"label": "c"}]
 
     items = fresh()
     out, sel = cz_ui._q_move(items, 2, -1)
     assert [i["label"] for i in out] == ["a", "c", "b"] and sel == 1
-    assert out is items, "doit muter l'objet partage, pas en renvoyer une copie"
+    assert out is items, "it must mutate the shared object, not hand back a copy"
 
     items = fresh()
-    out, sel = cz_ui._q_move(items, 0, -1)          # bord haut: inchange
+    out, sel = cz_ui._q_move(items, 0, -1)          # top edge: unchanged
     assert [i["label"] for i in out] == ["a", "b", "c"] and sel == 0
 
     items = fresh()
-    out, sel = cz_ui._q_move(items, None, 1)         # pas de selection
+    out, sel = cz_ui._q_move(items, None, 1)         # no selection
     assert sel is None and len(out) == 3
     assert [i["label"] for i in out] == ["a", "b", "c"]
 
@@ -75,7 +75,7 @@ def test_render():
     upd, md, btn = cz_ui._q_render(items, 1)
     assert "1. j1" in md and "2. j2" in md
     assert btn["value"] == "+ Queue (2)" and upd["value"] == 1
-    upd, _, _ = cz_ui._q_render(items, 99)           # selection hors bornes -> None
+    upd, _, _ = cz_ui._q_render(items, 99)           # selection out of bounds -> None
     assert upd["value"] is None
 
 
@@ -92,8 +92,8 @@ def _fake_jobs(n):
 
 
 def _run_with(stub_generate):
-    """Execute _ui_queue_run avec un _ui_generate stub, sans toucher au modele
-    NI au queue.json sur disque (l'instance de l'utilisateur s'en sert)."""
+    """Runs _ui_queue_run with a stubbed _ui_generate, touching neither the model
+    NOR the queue.json on disk (the user's own instance uses it)."""
     import cz_pipeline
     saved = (cz_ui._ui_generate, cz_ui._q_restore_model_state, cz_ui._q_persist,
              cz_pipeline._STOP, cz_ui._QUEUE_PAUSE)
@@ -116,7 +116,7 @@ def test_pause_finishes_current_job_then_halts():
 
     def gen(*vals, progress=None):
         calls.append(1)
-        if len(calls) == 1:                       # pause demandee PENDANT le job 1
+        if len(calls) == 1:                       # pause asked for DURING job 1
             cz_ui._QUEUE_PAUSE = True
         return [], "ok", [], []
 
@@ -133,7 +133,7 @@ def test_stop_keeps_the_interrupted_job_queued():
 
     def gen(*vals, progress=None):
         calls.append(1)
-        if len(calls) == 1:                       # Stop en plein job 1
+        if len(calls) == 1:                       # Stop in the middle of job 1
             cz_pipeline._STOP = True
         return [], "interrupted", [], []
 
