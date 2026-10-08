@@ -40,7 +40,7 @@ from cz_core import (
 )
 
 # The base Qwen model (txt2img/img2img/inpaint). Overridable through env ZIMAGE_MODEL (compat)
-# ou QWEN_MODEL, ou prefs. Repo public.
+# or QWEN_MODEL, or prefs. A public repo.
 DEFAULT_BASE_REPO = (os.environ.get("QWEN_MODEL") or "Qwen/Qwen-Image")
 # The instruction-based edit model (the Omni/Edit tab), loaded separately. 2509 = revision
 # recente, multi-images. Surcharge via env ZIMAGE_OMNI_MODEL / QWEN_EDIT_MODEL ou config.
@@ -3428,7 +3428,7 @@ def _refine_whole(pipe, image, denoise, steps, prompt, seed):
     h = round_to_multiple(image.height, 16)
     # Two attempts at most: the VRAM guard at the first step (see generate), then a retry in 'model'.
     for _attempt in (0, 1):
-        _set_slicing(pipe, max(image.size))   # a reposer sur le pipe recharge du retry
+        _set_slicing(pipe, max(image.size))   # to set again on the pipe the retry reloaded
         out = _qwen_call(
             pipe,
             prompt=prompt or "",
