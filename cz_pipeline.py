@@ -151,8 +151,9 @@ def resolve_lora_path(name):
     name = str(name or "")
     if os.path.isabs(name):
         return name
+    rel = name.replace("\\", "/").strip("/")
     for d in _lora_dirs():
-        p = os.path.join(d, name)
+        p = os.path.join(d, *rel.split("/")) if rel else d
         if os.path.isfile(p):
             return p
     return os.path.join(LORAS_DIR, name)
@@ -1689,83 +1690,142 @@ def _checkpoint_dirs():
     return dirs
 
 
+# Folders never scanned for checkpoints (and LoRAs): tool caches and the Asset Browser's
+# own index. Mirrors _scan_catalog in cz_assetbrowser.
+_SKIP_MODEL_SUBDIRS = ("_index", ".cache", "recipes")
+_CHECKPOINT_EXTS = (".safetensors", ".ckpt", ".pt", ".sft", ".gguf")
+
+
+def _walk_model_files(d, exts):
+    """Yields (relative path with '/', absolute path) of every file under `d` whose name
+    ends with `exts`, RECURSIVELY, skipping _SKIP_MODEL_SUBDIRS and hidden folders. The
+    relative path is what the dropdowns show ('ZIB/model.safetensors')."""
+    if not d or not os.path.isdir(d):
+        return
+    for root, dirs, files in os.walk(d):
+        dirs[:] = sorted(x for x in dirs
+                         if x not in _SKIP_MODEL_SUBDIRS and not x.startswith("."))
+        for f in sorted(files):
+            if f.lower().endswith(exts):
+                fp = os.path.join(root, f)
+                yield os.path.relpath(fp, d).replace(os.sep, "/"), fp
+
+
 def list_checkpoints():
     """Single-file Qwen-Image models (.safetensors / .gguf) from the checkpoints folders
     (main + extra, merged into a single list). ComfyUI 'scaled' FP8/INT8 are accepted (the
     dequant loader, see _safetensors_dequant); only these stay discarded, with their reason:
     stray LoRAs, SVDQuant/Nunchaku INT4, GGUFs of another architecture or in the sd.cpp
-    layout. On a duplicate file name, the main folder wins.
+    layout. SUBFOLDERS INCLUDED: an entry is the path
+    relative to its folder with '/' ('ZIB/model.safetensors'), a root file keeps its
+    bare name, resolve_checkpoint turns it back into the absolute path. Caches, hidden
+    folders and _index are skipped. On a duplicate relative path, the main folder wins.
 """
     out = []
     seen = set()
     for d in _checkpoint_dirs():
-        if not os.path.isdir(d):
-            continue
-        for f in os.listdir(d):
-            if f in seen:
+        for rel, fp in _walk_model_files(d, _CHECKPOINT_EXTS):
+            if rel.lower() in seen:
                 continue
-            if not f.lower().endswith((".safetensors", ".ckpt", ".pt", ".sft", ".gguf")):
-                continue
+            f = os.path.basename(fp)
             if f.lower().endswith(".safetensors"):
-                reason = _safetensors_unsupported(os.path.join(d, f))
+                reason = _safetensors_unsupported(fp)
                 if reason:
-                    _log(f"checkpoint skipped ({reason}): {f}")
+                    _log(f"checkpoint skipped ({reason}): {rel}")
                     continue
             if f.lower().endswith(".gguf"):
-                fp = os.path.join(d, f)
                 lay, a = _gguf_layout(fp), _gguf_arch(fp)
                 # The LAYOUT beats the declared architecture: tensor names are proof,
                 # the 'general.architecture' KV a mere label -- and conversion tools stamp
                 # it wrong (Qwen-Image files published as 'wan').
                 if lay == "foreign":
-                    _log(f"checkpoint skipped ({_gguf_layout_unsupported(fp)}): {f}")
+                    _log(f"checkpoint skipped ({_gguf_layout_unsupported(fp)}): {rel}")
                     continue
                 if lay == "qwen":
                     if a and a != GGUF_ARCH:
                         _log(f"GGUF declares architecture '{a}' but its tensors ARE a "
                              f"Qwen-Image transformer (mislabelled by the conversion "
-                             f"tool) -> loaded anyway: {f}")
+                             f"tool) -> loaded anyway: {rel}")
                 # layout undetermined -> the declared architecture stays the judge.
                 elif a and a != GGUF_ARCH:
                     _log(f"checkpoint skipped (GGUF architecture '{a}', this build only "
                          f"loads '{GGUF_ARCH}'; that model needs its own pipeline and "
-                         f"text encoder/VAE): {f}")
+                         f"text encoder/VAE): {rel}")
                     continue
-            seen.add(f)
-            out.append(f)
+            seen.add(rel.lower())
+            out.append(rel)
     return sorted(out)
 
 
 def resolve_checkpoint(name):
-    """Absolute path of a single-file checkpoint from its file name, looked up in the
-    checkpoints folders (main then extra). Returns name as is when it is already absolute;
-    falls back to the main folder when not found."""
+    """Absolute path of a single-file checkpoint from a list_checkpoints entry (a path
+    relative to its folder, '/' or '\', subfolders included), looked up in the checkpoints
+    folders (main then extra). Returns name as is when it is already absolute. An entry that is
+    not at that path any more is then searched by its FILE NAME in every subfolder (a
+    preset, a queued job or an image's metadata saved before the model was filed away
+    keeps working); falls back to the main folder when not found."""
     if not name or os.path.isabs(name):
         return name
+    rel = str(name).replace("\\", "/").strip("/")
     for d in _checkpoint_dirs():
-        p = os.path.join(d, name)
+        p = os.path.join(d, *rel.split("/"))
         if os.path.isfile(p):
             return p
+    # Not at that path: a preset, a queued job or an image's metadata holds the name the
+    # model had when it was written, and the library may have been tidied since. Find it
+    # by its file name rather than answering 'not found' for a model that is right there.
+    found = checkpoint_by_basename(rel.rsplit("/", 1)[-1])
+    if found:
+        return found
     return os.path.join(CHECKPOINTS_DIR, name)
 
 
+def checkpoint_by_basename(fname):
+    """Absolute path of the checkpoint file named `fname` (case-insensitive) anywhere under
+    the checkpoints folders, or None. Several matches: the first one in listing order
+    (main folder first), with a log line."""
+    want = str(fname or "").lower()
+    hits = []
+    for d in _checkpoint_dirs():
+        for _rel, fp in _walk_model_files(d, _CHECKPOINT_EXTS):
+            if os.path.basename(fp).lower() == want:
+                hits.append(fp)
+    if len(hits) > 1:
+        _log(f"checkpoint '{fname}': {len(hits)} files share this name, using {hits[0]}")
+    return hits[0] if hits else None
+
+
+def checkpoint_relname(path):
+    """The list_checkpoints entry of an absolute checkpoint path (relative to the
+    checkpoints folder that holds it, '/'), or the bare file name when it lies outside
+    every folder. Used by the UI where a name has to match the catalogue."""
+    path = str(path or "")
+    if not path:
+        return ""
+    if not os.path.isabs(path):
+        path = resolve_checkpoint(path)
+    ap = os.path.normcase(os.path.abspath(path))
+    for d in _checkpoint_dirs():
+        if not d:
+            continue
+        base = os.path.normcase(os.path.abspath(d))
+        if ap.startswith(base.rstrip(os.sep) + os.sep):
+            return os.path.relpath(os.path.abspath(path), os.path.abspath(d)).replace(os.sep, "/")
+    return os.path.basename(path)
+
+
 def list_loras():
-    """LoRAs (.safetensors / .ckpt / .pt) from the loras folder, RECURSIVELY (subfolders
-    included). Returns paths RELATIVE to LORAS_DIR with '/' (e.g.
-    'subfolder/my_lora.safetensors') -> set_loras / resolve resolve them through
-    os.path.join(LORAS_DIR, name)."""
+    """LoRAs (.safetensors / .ckpt / .pt) from the loras folders (main + extras),
+    RECURSIVELY (subfolders included, caches and hidden folders skipped). Returns paths
+    RELATIVE to their folder with '/' (e.g. 'subfolder/my_lora.safetensors') -> set_loras /
+    resolve_lora_path resolve them through os.path.join(<folder>, name)."""
     exts = (".safetensors", ".ckpt", ".pt")
     out, seen = [], set()
     for d in _lora_dirs():          # main then extras: same name -> the main one wins
-        if not os.path.isdir(d):
-            continue
-        for root, _dirs, files in os.walk(d):
-            for f in files:
-                if f.lower().endswith(exts):
-                    rel = os.path.relpath(os.path.join(root, f), d).replace(os.sep, "/")
-                    if rel.lower() not in seen:
-                        seen.add(rel.lower())
-                        out.append(rel)
+        for rel, _fp in _walk_model_files(d, exts):
+            if rel.lower() not in seen:
+                seen.add(rel.lower())
+                out.append(rel)
     return sorted(out)
 
 

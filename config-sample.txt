@@ -133,7 +133,7 @@
     "refine_tile_prompt": "",
 
     "checkpoints_dir": "",
-    "_checkpoints_extra_dir_help": "Optional SECOND checkpoints folder, merged into the same model list (e.g. a shared drive alongside your local one). Empty = only checkpoints_dir.",
+    "_checkpoints_extra_dir_help": "Optional SECOND checkpoints folder, merged into the same model list (e.g. a shared drive alongside your local one). Both folders are scanned recursively: a model in a subfolder is listed as 'ZIB/model.safetensors'. Empty = only checkpoints_dir.",
     "checkpoints_extra_dir": "",
     "_text_encoder_help": "Replace the text encoder (Qwen2.5-VL-7B) on BOTH pipes, base and edit: a transformers FOLDER (config.json + .safetensors) or a Hugging Face repo id ('owner/repo', or 'owner/repo/subfolder' when the weights sit in a sub-folder). Empty = each repo's own. It must match the repo it replaces - same model type (qwen2_5_vl), hidden size 3584, 28 layers - and each pipe checks it against its own repo (zimage_omni_base or the edit repo for the edit pipe); anything else is refused with the reason, and a pipe whose check or load fails keeps its own encoder. GGUF and single files are refused: give the folder. Tokenizer and processor stay the repo's. Also in Models > Checkpoints > Text encoder. Changing it reloads both pipes and clears the prompt-embedding cache. Env QWEN_TEXT_ENCODER.",
     "text_encoder": "",
