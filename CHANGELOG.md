@@ -5,6 +5,14 @@ The app version lives in `cz_core.py` (`APP_VERSION`) and is shown in the browse
 
 
 
+## Unreleased : cli_faces answered an ImportError
+
+The family face service (`cli_faces`: boxes, mouth, ArcFace embedding, used by
+comics2crispz and crispz-dataset-studio) imported `detect_faces_full` from `cz_face`,
+which only crispz-studio had: every call failed. Ported on 2026-10-30, as in crispz-klein
+the day before. Test: `tests/test_cli_faces.py` (fake insightface app, no model).
+
+
 ## Unreleased — A card that refuses an offload mode no longer ends in a traceback
 
 In offload `none` the whole model is copied onto the card at once. With a big model that
