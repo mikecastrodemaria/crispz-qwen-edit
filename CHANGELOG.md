@@ -5,6 +5,31 @@ The app version lives in `cz_core.py` (`APP_VERSION`) and is shown in the browse
 
 
 
+## Unreleased : Qwen-Image 2.1 Turbo in native NVFP4
+
+A `.safetensors` holding NVFP4 weights now loads as a `QwenImage21Pipeline` whose transformer
+keeps its packed weights and runs on the Blackwell tensor cores through comfy-kitchen, without
+ComfyUI. Measured on an RTX 5090 at 1024x1024: one transformer pass in 0.28 s and 6.1 GB
+natively against 0.46 s and 14.0 GB for the same weights in bf16; a whole image in about 2.3 s
+(about 29 GB peak, most of it the text encoder, dequantized to bf16). That measure comes from
+the standalone test of the loader. With the encoder resident, `cz_pipeline.generate` took
+3.4-6.1 s and `generate_omni` 33.6 s with a 31 GB peak, probably spilling out of the card's
+32 GB next to the desktop's usage. The encoder now stays in RAM and visits the GPU for each
+encoding: a new prompt takes about 9-10 s and generate_omni 10.6-10.8 s, with peaks of 22.4 and
+23.3 GB. The last 8 text-only prompts are remembered, so repeating one (a new seed, say) skips
+the encoder: 2.6 s and a 12.6 GB peak, with a pixel-identical image at the same seed.
+
+It needs its own environment (`requirements-nvfp4.txt`, Python 3.11, `CRISPZ_VENV=.venv-nvfp4`
+for `run.bat`). In the regular venv such a file is refused with that instruction.
+
+Txt2img and the Edit tab share one pipe. On this path CFG is off and the saved 8-step schedule
+overrides the steps slider. The offload setting is ignored. Base LoRAs are ignored with a log line,
+edit LoRAs and the fast mode are refused, and img2img/inpaint (so refine, upscale, detailer)
+raise a clear error. Files come from `BennyDaBall/Qwen-Image-2.1-Turbo-NVFP4`; the license is
+the Qwen Research License, non-commercial.
+
+Tests: `tests/test_nvfp4.py`.
+
 ## Unreleased : cli_faces answered an ImportError
 
 The family face service (`cli_faces`: boxes, mouth, ArcFace embedding, used by

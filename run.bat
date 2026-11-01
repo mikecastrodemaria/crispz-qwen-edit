@@ -26,6 +26,7 @@ if errorlevel 1 (
 
 set RUNPY=!PYCMD!
 if "!USE_VENV!"=="1" if exist ".venv\Scripts\python.exe" set RUNPY=.venv\Scripts\python.exe
+if "!USE_VENV!"=="1" if defined CRISPZ_VENV if exist "!CRISPZ_VENV!\Scripts\python.exe" set RUNPY=!CRISPZ_VENV!\Scripts\python.exe
 
 REM ESRGAN_DIR: an existing variable wins, otherwise the sdlibs folder when it exists, otherwise the local one
 if "%ESRGAN_DIR%"=="" (

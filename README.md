@@ -617,6 +617,29 @@ Both apply to txt2img / img2img / inpaint (not Omni). CLI: `--sampler`, `--sched
 For a **Z-Image Base** checkpoint (e.g. Civitai), the typical recipe is CFG ~4-5,
 ~30 steps (Performance "Base CFG"), sampler `euler`, schedule `sgm_uniform` or `beta`.
 
+## Qwen-Image 2.1 Turbo in native NVFP4 (RTX 50 series)
+
+Runs [BennyDaBall/Qwen-Image-2.1-Turbo-NVFP4](https://huggingface.co/BennyDaBall/Qwen-Image-2.1-Turbo-NVFP4)
+on the card's tensor cores, in a dedicated environment:
+
+```bat
+py -3.11 -m venv .venv-nvfp4
+.venv-nvfp4\Scripts\python -m pip install -r requirements-nvfp4.txt
+set CRISPZ_VENV=.venv-nvfp4
+run.bat
+```
+
+Put `diffusion_models/qwen_image_2.1_turbo_nvfp4.safetensors` in `checkpoints/` and select it.
+The text encoder (9.3 GB) and the VAE (0.7 GB) download on first use. `nvfp4_text_encoder` in
+`config.txt` (env `QWEN_NVFP4_ENCODER`) points to a local encoder file, `nvfp4_base_repo`
+(env `QWEN_NVFP4_BASE`) replaces the repo that provides the VAE, processor and scheduler.
+
+Limits: txt2img and Edit only (no img2img, inpaint, refine, upscale or detailer), no LoRA, and
+the offload, steps and guidance settings are ignored. The text encoder stays in RAM and visits
+the GPU for each encoding: about 10 s per image at 1024x1024 and 23 GB of VRAM at peak. Repeating
+one of the last 8 text prompts skips the encoder: about 2.6 s and 12.6 GB.
+The weights are under the Qwen Research License: non-commercial use only.
+
 ## Switching models in the UI (Advanced → Models)
 
 The **Z-Image checkpoint** dropdown is the single place to switch model. It merges,

@@ -1,0 +1,15 @@
+{
+  "prompt": "",
+  "negative": "",
+  "styles": [],
+  "width": 1024,
+  "height": 1024,
+  "steps": 8,
+  "guidance": 1.0,
+  "sampler": "euler",
+  "schedule": "sgm_uniform",
+  "image_number": 1,
+  "checkpoint": "qwen_image_2.1_turbo_nvfp4.safetensors",
+  "transformer": "",
+  "loras": []
+}

@@ -33,6 +33,7 @@ import torch
 from PIL import Image
 
 import cz_core
+import cz_nvfp4
 from cz_core import (
     CONFIG, HERE, DEVICE, DTYPE,
     DEFAULT_TILE, DEFAULT_OVERLAP, DEFAULT_REFINE_TILE, DEFAULT_REFINE_OVERLAP,
@@ -492,6 +493,14 @@ def _qwen_call(pipe, **kw):
     """Calls a Qwen pipeline, tolerating diffusers API variations: when the installed
     version does not know `true_cfg_scale` / `negative_prompt`, those kwargs are dropped and
     the call is retried rather than crashing the generation."""
+    if _is_nvfp4_pipe(pipe):
+        # Turbo is distilled: CFG off, and its saved 8-step schedule overrides the steps.
+        # Its encode_prompt returns three values, so the embedding cache does not apply.
+        # No VRAM guard: there is no lighter offload to fall back to.
+        kw.update(true_cfg_scale=1.0, negative_prompt=None)
+        kw.pop("callback_on_step_end", None)
+        kw.pop("callback_on_step_end_tensor_inputs", None)
+        return pipe(**kw)
     # Reuse the embeddings if this prompt has already been encoded (see _EMBED_CACHE).
     # Passing them skips the text encoder: that is the whole win.
     # Except when the encoding depends on the image (the edit pipe): __call__ never
@@ -556,8 +565,8 @@ def _apply_sampler(pipe):
     """Applies the current scheduler (SAMPLER x SCHEDULE) to a pipe. Checks compatibility
     (custom sigmas) and falls back to Euler/sgm_uniform when it fails -> never a crash at
     generation time."""
-    if _BASE_SCHED_CONFIG is None:
-        return
+    if _BASE_SCHED_CONFIG is None or _is_nvfp4_pipe(pipe):
+        return      # NVFP4 Turbo keeps its own scheduler and saved schedule
     from diffusers import FlowMatchEulerDiscreteScheduler
     try:
         sched = _build_scheduler(SAMPLER, SCHEDULE, _BASE_SCHED_CONFIG)
@@ -2423,6 +2432,49 @@ def _is_gguf_path(p):
     return bool(p) and str(p).lower().endswith(".gguf")
 
 
+def _is_nvfp4_path(p):
+    """True for a .safetensors holding NVFP4 weights. Only reads the header."""
+    if not p or not str(p).lower().endswith(".safetensors") or not os.path.isfile(p):
+        return False
+    try:
+        return cz_nvfp4.header_is_nvfp4(_safetensors_header(p))
+    except Exception as e:
+        _dbg(f"NVFP4 check failed on {p}: {e}")
+        return False
+
+
+def _is_nvfp4_pipe(pipe):
+    return bool(getattr(pipe, "_cz_nvfp4_path", None))
+
+
+def _load_nvfp4_pipe(path):
+    """QwenImage21Pipeline on a native NVFP4 transformer. Only the repo's VAE, processor and
+    scheduler are read: passing the other two components skips their weights."""
+    problem = cz_nvfp4.runtime_problem()
+    if problem:
+        raise RuntimeError(f"{os.path.basename(path)}: {problem}.")
+    from diffusers import QwenImage21Pipeline
+    base = (os.environ.get("QWEN_NVFP4_BASE") or CONFIG.get("nvfp4_base_repo")
+            or cz_nvfp4.DEFAULT_BASE_REPO).strip()
+    encoder = (os.environ.get("QWEN_NVFP4_ENCODER") or CONFIG.get("nvfp4_text_encoder") or "").strip()
+    t0 = time.time()
+    _log(f"loading Qwen-Image 2.1 NVFP4 (native): {path} + base {base}; offload forced to "
+         "'none', LoRAs not available on this path ...")
+
+    def _build():
+        tf = cz_nvfp4.load_transformer(path, base, DTYPE, DEVICE)
+        te = cz_nvfp4.load_text_encoder(cz_nvfp4.resolve_encoder(encoder), base, DTYPE, DEVICE)
+        pipe = QwenImage21Pipeline.from_pretrained(base, transformer=tf, text_encoder=te, dtype=DTYPE)
+        pipe.vae.to(DEVICE)
+        cz_nvfp4.encoder_on_demand(pipe, DEVICE)
+        return pipe
+
+    pipe = _load_monitor(f"Qwen-Image 2.1 NVFP4 {os.path.basename(path)}", _build)
+    pipe._cz_nvfp4_path = path
+    _log(f"Qwen-Image 2.1 NVFP4 ready in {time.time() - t0:.1f}s")
+    return pipe
+
+
 def _effective_offload(tpath=None):
     """The offload REALLY applied. A quantized GGUF transformer does not move onto the GPU
     through .to(cuda) nor in sequential -> only enable_model_cpu_offload places it on the GPU
@@ -2431,6 +2483,8 @@ def _effective_offload(tpath=None):
     if off == "auto":
         off = _resolve_auto()   # test VRAM (memoise + profil cache) -> mode concret
     t = ZIMAGE_TRANSFORMER if tpath is None else tpath
+    if _is_nvfp4_path(t):
+        return "none"   # packed weights are placed at load time, accelerate hooks not validated
     if DEVICE == "cuda" and _is_gguf_path(t) and off != "model":
         off = "model"
     return off
@@ -2673,6 +2727,11 @@ def _apply_loras(pipe, force=False):
     _sync_adapters. Returns True when applied, False on a failure (the caller falls back to
     a full reload)."""
     global _APPLIED_LORAS
+    if _is_nvfp4_pipe(pipe):
+        if LORAS:
+            _log(f"{len(LORAS)} LoRA(s) ignored: the native NVFP4 path cannot apply them")
+        _APPLIED_LORAS = []
+        return True
     ok, _APPLIED_LORAS = _sync_adapters(pipe, LORAS, _APPLIED_LORAS, force=force)
     if not ok:
         _log("falling back to a full reload")
@@ -2689,6 +2748,11 @@ def _apply_edit_loras(pipe):
     # 'Edit LoRAs' box, which only concerns the task presets).
     if EDIT_SPEED and EDIT_SPEED.get("path"):
         wanted.append((EDIT_SPEED["path"], 1.0))
+    if _is_nvfp4_pipe(pipe):
+        if wanted:
+            raise RuntimeError("edit LoRAs and the fast mode are not available on the native "
+                               "NVFP4 path; turn them off (nothing was generated)")
+        return
     ok, _APPLIED_EDIT_LORAS = _sync_adapters(pipe, wanted, _APPLIED_EDIT_LORAS,
                                              tag="edit LoRA")
     if not ok:
@@ -2706,6 +2770,10 @@ def _swap_transformer(pipe):
     global _APPLIED_LORAS, _DERIVED
     t0 = time.time()
     old_t = _LOADED_KEY[1] if _LOADED_KEY else None
+    # NVFP4 has its own pipeline class and encoder: nothing can be kept across the switch.
+    if _is_nvfp4_path(old_t) or _is_nvfp4_path(ZIMAGE_TRANSFORMER):
+        _log("transformer swap skipped (NVFP4 uses another pipeline) -> full reload")
+        return False
     # Switching to/from a GGUF changes the EFFECTIVE offload (a GGUF forces 'model')
     # -> the accelerate hooks and the placement differ: no tinkering, we reload.
     if _effective_offload(old_t) != _effective_offload(ZIMAGE_TRANSFORMER):
@@ -2847,6 +2915,18 @@ def _ensure_base():
             return _BASE_PIPE
         _dbg("base pipeline: key changed -> free + reload")
         free_vram()
+    if _is_nvfp4_path(ZIMAGE_TRANSFORMER):
+        # The edit tab may already hold this very pipe: 2.1 does both from one pipeline.
+        omni = _DERIVED.get("omni")
+        same = _is_nvfp4_pipe(omni) and omni._cz_nvfp4_path == ZIMAGE_TRANSFORMER
+        pipe = omni if same else _load_nvfp4_pipe(ZIMAGE_TRANSFORMER)
+        _APPLIED_LORAS = []
+        _TEXT_ENCODER_ACTIVE = ""
+        _BASE_PIPE = pipe
+        _DERIVED = {"txt2img": pipe, **({"omni": pipe} if same else {})}
+        _LOADED_KEY = key
+        _apply_loras(pipe)
+        return pipe
     from diffusers import QwenImagePipeline
     t0 = time.time()
     kwargs = {}
@@ -2956,6 +3036,9 @@ def get_pipe(kind="img2img"):
     if kind in _DERIVED:
         _dbg(f"get_pipe('{kind}'): reuse derived")
         return _DERIVED[kind]
+    if _is_nvfp4_pipe(base) and kind in ("img2img", "inpaint"):
+        raise RuntimeError(f"{kind} is not available on the Qwen-Image 2.1 NVFP4 path yet "
+                           "(refine, upscale and detailer need it); use another checkpoint")
     from diffusers import QwenImageImg2ImgPipeline, QwenImageInpaintPipeline
     cls = {"img2img": QwenImageImg2ImgPipeline, "inpaint": QwenImageInpaintPipeline}.get(kind)
     if cls is None:
@@ -3015,6 +3098,11 @@ def _load_omni():
             or CONFIG.get("zimage_omni_model") or DEFAULT_OMNI_REPO).strip()
     if not repo:
         raise RuntimeError("No Qwen-Image-Edit model set (config.txt 'zimage_omni_model').")
+    if _is_nvfp4_path(repo):
+        same = _is_nvfp4_pipe(_BASE_PIPE) and _BASE_PIPE._cz_nvfp4_path == repo
+        pipe = _BASE_PIPE if same else _load_nvfp4_pipe(repo)
+        _DERIVED["omni"] = pipe
+        return pipe
     EditPlus = getattr(diffusers, "QwenImageEditPlusPipeline", None)
     t0 = time.time()
     if _is_single_file(repo):

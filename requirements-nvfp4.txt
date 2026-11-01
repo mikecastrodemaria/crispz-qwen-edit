@@ -1,0 +1,28 @@
+# crispz-qwen-edit: the environment for Qwen-Image 2.1 Turbo in native NVFP4 (RTX 50 series).
+# It stays separate from .venv: transformers 5 and this diffusers are not validated on the
+# Qwen-Image / Edit models of requirements.txt.
+#
+#   py -3.11 -m venv .venv-nvfp4
+#   .venv-nvfp4\Scripts\python -m pip install -r requirements-nvfp4.txt
+#   set CRISPZ_VENV=.venv-nvfp4
+#   run.bat
+--extra-index-url https://download.pytorch.org/whl/cu130
+torch==2.14.1+cu130
+torchvision==0.29.1+cu130
+diffusers @ git+https://github.com/huggingface/diffusers@86ef420b17363c28e36ebad6b58555e9aa8feda2
+transformers==5.22.1
+huggingface_hub==2.4.0
+accelerate==1.15.0
+safetensors==0.8.0
+comfy-kitchen==0.2.40
+sentencepiece
+spandrel
+peft
+gguf
+hf_xet
+gradio>=4.44,<6
+pillow
+numpy
+scipy
+fastapi
+uvicorn
