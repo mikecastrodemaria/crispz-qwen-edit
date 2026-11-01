@@ -5,6 +5,7 @@ The app version lives in `cz_core.py` (`APP_VERSION`) and is shown in the browse
 
 
 
+<<<<<<< HEAD
 ## Unreleased : Qwen-Image 2.1 Turbo in native NVFP4
 
 A `.safetensors` holding NVFP4 weights now loads as a `QwenImage21Pipeline` whose transformer
@@ -29,6 +30,12 @@ raise a clear error. Files come from `BennyDaBall/Qwen-Image-2.1-Turbo-NVFP4`; t
 the Qwen Research License, non-commercial.
 
 Tests: `tests/test_nvfp4.py`.
+=======
+## Unreleased : protocol v1, `switch_model` lets a caller switch the model on `cli_gen`
+
+`switch_model` (protocol v1): on the remote route the gen op ignores `spec.model` so a script never swaps the model of the user's running instance. A caller that asks explicitly (`"switch_model": true` next to `"model"`, crispz-dataset-studio scoring a LoRA on its checkpoint) now gets the switch, said in the result's warnings and in the log; the model stays loaded after the call. Without the flag nothing changes (the warning names the flag). `cli_caps` announces `supports.switch_model`, the same field as crispz-klein. Tests in `tests/test_protocol.py`.
+
+>>>>>>> 018d24055a533412aa43aaac22ad972d1933e7cb
 
 ## Unreleased : cli_faces answered an ImportError
 
