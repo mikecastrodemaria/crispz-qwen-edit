@@ -25,6 +25,7 @@ Can be overridden in config.txt:
 """
 import os
 
+from cz_core import split_dir_spec  # noqa: E402
 from cz_core import CONFIG, _log, _dbg
 
 # The order = the dropdown's order. inputs = the number of images expected (2 = the input + a reference).
@@ -287,7 +288,7 @@ def lora_dirs():
     extra = (os.environ["LORAS_EXTRA_DIRS"] if "LORAS_EXTRA_DIRS" in os.environ
              else (_prefs.get("loras_extra_dirs") or CONFIG.get("loras_extra_dirs") or []))
     if isinstance(extra, str):
-        extra = [p for chunk in extra.split(os.pathsep) for p in chunk.split(";")]
+        extra = split_dir_spec(extra)
     dirs = [main]
     for d in extra:
         d = str(d or "").strip()
