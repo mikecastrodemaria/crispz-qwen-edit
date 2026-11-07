@@ -6,6 +6,15 @@ The app version lives in `cz_core.py` (`APP_VERSION`) and is shown in the browse
 
 
 <<<<<<< HEAD
+## Unreleased : performance presets and config.txt
+
+- A `performance_presets` list copied into config.txt used to replace the app's list
+  entirely, hiding every preset added since (seen on crispz-moss, 2026-11-07, fixed
+  across the family). Now the config's entries come first (they win on a name) and the
+  app's missing presets are appended, said in the log at start;
+  `performance_presets_merge: false` keeps the config's list alone. The built-in list in `cz_ui.py` was a stale one (Turbo 8 / Quality 20 / Base CFG
+  28), masked by the sample: it is now the sample's step counts, with a test.
+
 ## Unreleased : Qwen-Image 2.1 Turbo in native NVFP4
 
 A `.safetensors` holding NVFP4 weights now loads as a `QwenImage21Pipeline` whose transformer
